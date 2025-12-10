@@ -12,6 +12,7 @@
 #define EXTENSION_USERS_H
 
 #include "postgres.h"
+#include "utils/string_view.h"
 
 enum DocumentDB_BuiltInRoles
 {
@@ -19,7 +20,6 @@ enum DocumentDB_BuiltInRoles
 	DocumentDB_Role_ReadWrite_AnyDatabase = 0x2,
 	DocumentDB_Role_Cluster_Admin = 0x4,
 };
-
 
 typedef struct
 {
@@ -54,13 +54,24 @@ typedef struct
 	const char *pwd;
 } UpdateUserSpec;
 
-/* GUC that controls the blocked role prefix list */
-extern char *BlockedRolePrefixList;
+typedef struct
+{
+	StringView user;
+	bool showAllUsers;
+	bool showPrivileges;
+} GetUserSpec;
 
-/* Method to validate and obtain user role */
-char * ValidateAndObtainUserRole(const bson_value_t *rolesDocument);
+/*
+ * Hash entry structure for user roles.
+ */
+typedef struct UserRoleHashEntry
+{
+	char *user;
+	HTAB *roles;
+	bool isExternal;
+} UserRoleHashEntry;
 
-/* Method to verify if username is valid */
-bool IsUserNameInvalid(const char *userName);
+/* Method to call Connection Status command */
+Datum connection_status(pgbson *showPrivilegesSpec);
 
 #endif

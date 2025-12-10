@@ -48,7 +48,7 @@ typedef bool (*CompareMatchValueFunc)(const pgbsonelement *element,
 /* To store the Regex pattern strings and its options used for matching */
 typedef struct RegexData
 {
-	/* Regular expression pattern string */
+	/* Regex pattern */
 	char *regex;
 
 	/* Options that can be used for regex pattern matching */
@@ -101,6 +101,7 @@ bool CompareArrayForBitsAnySet(bson_iter_t *sourceArrayIter,
 							   bson_iter_t *filterArrayIter,
 							   bool isSignExtended);
 
-Datum BsonOrderby(pgbson *leftBson, pgbson *rightBson, bool validateSort);
+Datum BsonOrderby(pgbson *leftBson, pgbson *rightBson, bool validateSort,
+				  const char *collationString);
 
 #endif

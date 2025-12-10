@@ -127,7 +127,6 @@ typedef struct DollarExistsQueryData
 
 extern bool EnableGenerateNonExistsTerm;
 extern bool EnableCollation;
-extern bool EnableRumInOperatorFastPath;
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
@@ -304,7 +303,7 @@ HandleConsistentGreaterLessEquals(Datum *queryKeys, bool *check, bool *recheck,
 	 */
 	BsonIndexTerm equalityTerm;
 	InitializeBsonIndexTerm(DatumGetByteaPP(queryKeys[1]), &equalityTerm);
-	*recheck = !check[0] && equalityTerm.isIndexTermTruncated;
+	*recheck = !check[0] && IsIndexTermTruncated(&equalityTerm);
 
 	/* A row matches if it's $gt/$lt OR $eq */
 	return check[0] || check[1];
@@ -540,6 +539,12 @@ GinBsonConsistentCore(BsonIndexStrategy strategy,
 		case BSON_INDEX_STRATEGY_DOLLAR_RANGE:
 		{
 			*recheck = false;
+			DollarRangeValues *rangeValues = (DollarRangeValues *) extra_data[0];
+			if (rangeValues->params.isFullScan)
+			{
+				return check[0] || check[1];
+			}
+
 			if (numKeys == 2)
 			{
 				/* no truncation - recheck if it *only* matched the array term. This case we can't tell if it's
@@ -699,8 +704,7 @@ GinBsonConsistentCore(BsonIndexStrategy strategy,
 				(DollarArrayOpQueryData *) (extra_data[numKeys]);
 
 			*recheck = false;
-			if (EnableRumInOperatorFastPath &&
-				!isPreconsistent &&
+			if (!isPreconsistent &&
 				!queryData->arrayHasNull &&
 				!queryData->arrayHasRegex &&
 				!queryData->arrayHasTruncation)
@@ -777,7 +781,7 @@ GinBsonConsistentCore(BsonIndexStrategy strategy,
 			}
 			else
 			{
-				if (indexTerm.isIndexTermTruncated)
+				if (IsIndexTermTruncated(&indexTerm))
 				{
 					/* If the $ne is on a truncated term, we can't be totally
 					 * sure.
@@ -1111,6 +1115,21 @@ GenerateTerms(pgbson *bson, GenerateTermsContext *context, bool addRootTerm)
 		AddTerm(context, GeneratePathUndefinedTerm(context->options));
 	}
 
+	if (context->generatePathBasedUndefinedTerms)
+	{
+		if (hasNoTerms)
+		{
+			/* Add the path not exists value term */
+			AddTerm(context, GenerateValueUndefinedTerm(&context->termMetadata));
+		}
+
+		if (context->hasArrayPartialTermExistence)
+		{
+			/* Add the path not exists value term for array ancestors */
+			AddTerm(context, GenerateValueMaybeUndefinedTerm(&context->termMetadata));
+		}
+	}
+
 	if (addRootTerm)
 	{
 		/* GUC to preserve back-compat behavior. */
@@ -1147,7 +1166,7 @@ GenerateArrayPath(bson_iter_t *bsonIter, const char *pathToInsert,
 				  uint32_t pathtoInsertLength, bool inArrayContext,
 				  bool isArrayTerm, GenerateTermsContext *context,
 				  bool isCheckForArrayTermsWithNestedDocument,
-				  bool generateOnlyArrayPathTerms)
+				  bool isPathMatchedRecursively)
 {
 	check_stack_depth();
 	CHECK_FOR_INTERRUPTS();
@@ -1166,12 +1185,15 @@ GenerateArrayPath(bson_iter_t *bsonIter, const char *pathToInsert,
 	initStringInfo(&pathBuilderBuffer);
 	EnsureTermCapacity(context, arrayCapacityEstimate);
 
+	bool someArrayPathsHaveTerms = false;
+	bool someArrayPathsHaveNoTerms = false;
 	while (bson_iter_next(&containerIter))
 	{
 		bson_iter_t containerCopy = containerIter;
 		bool inArrayContextInner = true;
 		bool isArrayTermInner = false;
 		bool isCheckForArrayTermsWithNestedDocumentInner = false;
+		int32_t termCount = context->index;
 
 		/* For wildcard indexes if there's a match, any path that is a.0, a.2 etc
 		 * can also be reached from 'a'.
@@ -1181,8 +1203,7 @@ GenerateArrayPath(bson_iter_t *bsonIter, const char *pathToInsert,
 		 * i.e. for a [ [ { b: 10 } ] ] we need to generate a.0.b
 		 */
 		if (context->useReducedWildcardTerms &&
-			generateOnlyArrayPathTerms &&
-			!inArrayContext)
+			isPathMatchedRecursively && !inArrayContext)
 		{
 			if (BSON_ITER_HOLDS_ARRAY(&containerIter))
 			{
@@ -1209,11 +1230,29 @@ GenerateArrayPath(bson_iter_t *bsonIter, const char *pathToInsert,
 		 */
 		inArrayContextInner = true;
 		isArrayTermInner = true;
-		isCheckForArrayTermsWithNestedDocumentInner = inArrayContext;
+		isCheckForArrayTermsWithNestedDocumentInner = inArrayContext &&
+													  !context->
+													  skipGenerateTopLevelArrayTerm;
 		GenerateTermPath(&containerCopy, pathToInsert, pathtoInsertLength,
 						 inArrayContextInner, isArrayTermInner, context,
 						 isCheckForArrayTermsWithNestedDocumentInner,
 						 &pathBuilderBuffer);
+		if (context->index > termCount)
+		{
+			someArrayPathsHaveTerms = true;
+		}
+		else
+		{
+			someArrayPathsHaveNoTerms = true;
+		}
+	}
+
+	context->hasArrayValues = true;
+
+	/* Track that these arrays have partial term existence */
+	if (someArrayPathsHaveTerms && someArrayPathsHaveNoTerms)
+	{
+		context->hasArrayPartialTermExistence = true;
 	}
 
 	if (pathBuilderBuffer.data != NULL)
@@ -1243,7 +1282,7 @@ GenerateTermPath(bson_iter_t *bsonIter, const char *basePath,
 	{
 		/* if isArrayTerm is true (because we're inside an array context and we're generating */
 		/* and we're building the non array-index based terms, then just use the base path) */
-		/* this is because mongo can filter on array entries based on the array index (a.b.0 / a.b.1) */
+		/* this is because we can filter on array entries based on the array index (a.b.0 / a.b.1) */
 		/* or simply on the array path itself (a.b) */
 		pathToInsert = basePath;
 		pathtoInsertLength = basePathLength;
@@ -1257,7 +1296,7 @@ GenerateTermPath(bson_iter_t *bsonIter, const char *basePath,
 	else
 	{
 		/* otherwise build the path to insert. We use 'base.field' for the path */
-		/* since dot paths are illegal in mongo for field names. */
+		/* since dot paths are illegal in field names. */
 		uint32_t fieldPathLength = bson_iter_key_len(bsonIter);
 		uint32_t pathToInsertAllocLength;
 
@@ -1336,6 +1375,25 @@ GenerateTermPath(bson_iter_t *bsonIter, const char *basePath,
 			element.path = pathToInsert;
 			element.pathLength = pathtoInsertLength;
 			element.bsonValue = *bson_iter_value(bsonIter);
+
+			if (context->skipGenerateTopLevelArrayTerm &&
+				element.bsonValue.value_type == BSON_TYPE_ARRAY && !isArrayTerm)
+			{
+				/*
+				 * If this is an empty array, mark it as *literal* undefined so
+				 * it doesn't show up as a non-exists term. Otherwise skip it.
+				 */
+				if (IsBsonValueEmptyArray(&element.bsonValue))
+				{
+					element.bsonValue.value_type = BSON_TYPE_UNDEFINED;
+				}
+				else
+				{
+					/* Skip the top level array term */
+					break;
+				}
+			}
+
 			BsonCompressableIndexTermSerialized serializedTerm =
 				SerializeBsonIndexTermWithCompression(
 					&element, &context->termMetadata);
@@ -1418,11 +1476,11 @@ GenerateTermPath(bson_iter_t *bsonIter, const char *basePath,
 				context->hasArrayAncestors = true;
 			}
 
-			bool generateOnlyArrayPathTerms = option == IndexTraverse_MatchAndRecurse;
+			bool isPathMatchedRecursively = option == IndexTraverse_MatchAndRecurse;
 			GenerateArrayPath(bsonIter, pathToInsert, pathtoInsertLength,
 							  inArrayContext, isArrayTerm, context,
 							  isCheckForArrayTermsWithNestedDocument,
-							  generateOnlyArrayPathTerms);
+							  isPathMatchedRecursively);
 		}
 	}
 }
@@ -1751,6 +1809,30 @@ GinBsonExtractQueryDollarRange(BsonExtractQueryArgs *args)
 	DollarRangeParams *params = ParseQueryDollarRange(&filterElement);
 	rangeValues->params = *params;
 
+
+	*nentries = 2;
+	*partialmatch = (bool *) palloc(sizeof(bool) * 4);
+	*extra_data = (Pointer *) palloc(sizeof(Pointer) * 4);
+	Pointer *extraDataArray = *extra_data;
+
+	Datum *entries = (Datum *) palloc(sizeof(Datum) * 4);
+
+	/* Special case, handle full scan of the index here */
+	if (params->isFullScan)
+	{
+		/* We generate 2 terms here - root exists term + root non-exists term */
+		*nentries = 2;
+		entries[0] = GenerateRootExistsTerm(&args->termMetadata);
+		(*partialmatch)[0] = false;
+		extraDataArray[0] = (Pointer) rangeValues;
+
+		entries[1] = GenerateRootNonExistsTerm(&args->termMetadata);
+		(*partialmatch)[1] = false;
+		extraDataArray[1] = (Pointer) rangeValues;
+		return entries;
+	}
+
+
 	pgbsonelement maxElement =
 	{
 		.path = filterElement.path,
@@ -1770,13 +1852,6 @@ GinBsonExtractQueryDollarRange(BsonExtractQueryArgs *args)
 	BsonIndexTermSerialized minSerialized = SerializeBsonIndexTerm(&minElement,
 																   &args->termMetadata);
 	rangeValues->minValueIndexTerm = minSerialized.indexTermVal;
-
-	*nentries = 2;
-	*partialmatch = (bool *) palloc(sizeof(bool) * 4);
-	*extra_data = (Pointer *) palloc(sizeof(Pointer) * 4);
-	Pointer *extraDataArray = *extra_data;
-
-	Datum *entries = (Datum *) palloc(sizeof(Datum) * 4);
 
 	/* The first index term is a range scan from "MINVALUE" to "MAXVALUE"
 	 * We use the same ComparePartial for LessThan so we generate the terms identically.
@@ -2185,7 +2260,7 @@ GinBsonExtractQueryIn(BsonExtractQueryArgs *args)
 	if (queryElement.bsonValue.value_type != BSON_TYPE_ARRAY)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"$in should have an array of values")));
+							"$in must contain an array of values")));
 	}
 
 	bson_iter_t arrayIter;
@@ -2313,7 +2388,8 @@ GinBsonExtractQueryNotIn(BsonExtractQueryArgs *args)
 	if (queryElement.bsonValue.value_type != BSON_TYPE_ARRAY)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"$in needs an array")));
+							"Expected 'array' type for $in but found '%s' type",
+							BsonTypeName(queryElement.bsonValue.value_type))));
 	}
 
 	bson_iter_t arrayIter;
@@ -2455,7 +2531,7 @@ GinBsonExtractQueryRegex(BsonExtractQueryArgs *args)
 		(queryElement.bsonValue.value_type != BSON_TYPE_REGEX))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"$regex has to be a string")));
+							"$regex must be provided with a string value")));
 	}
 
 	int32_t numEntries = 2;
@@ -2744,6 +2820,7 @@ GinBsonExtractQueryDollarType(BsonExtractQueryArgs *args)
 	/* and int32, int64 etc are ordered together by value. */
 	/* We can optimize this further, but for now we just use minValue. */
 	*partialmatch = (bool *) palloc(sizeof(bool));
+	*extra_data = (Pointer *) palloc(sizeof(Pointer) * 1);
 	*nentries = 1;
 	**partialmatch = true;
 
@@ -2772,12 +2849,11 @@ GinBsonExtractQueryDollarType(BsonExtractQueryArgs *args)
 
 	/* now allocate the structure containing the integer type codes */
 	Datum *extraDataPtr = (Datum *) palloc(sizeof(Datum) * (numTerms + 1));
-
-	*extra_data = (Pointer *) &extraDataPtr;
+	**extra_data = (Pointer) extraDataPtr;
 
 	/* The array is represented as a length N followed by N type values */
 	/*  <int32_t length> <int32_t type> <int32_t type> ... */
-	*extraDataPtr = Int32GetDatum(numTerms);
+	extraDataPtr[0] = Int32GetDatum(numTerms);
 
 	/* add the type codes as extra data. */
 	int index = 1;
@@ -3324,7 +3400,7 @@ GinBsonComparePartialBitsWiseOperator(BsonIndexTerm *queryValue,
 	}
 	else
 	{
-		if (compareValue->isIndexTermTruncated)
+		if (IsIndexTermTruncated(compareValue))
 		{
 			/* If it's truncated, mark it as a match and let the runtime deal with it */
 			return 0;
@@ -3474,7 +3550,7 @@ GinBsonComparePartialDollarRange(DollarRangeValues *rangeValues,
 
 			/* The min may also be met if the min term is truncated for a > Min */
 			if (!rangeValues->params.isMinInclusive && minCmp == 0 &&
-				minValueIndexTerm.isIndexTermTruncated)
+				IsIndexTermTruncated(&minValueIndexTerm))
 			{
 				isMinConditionMet = true;
 			}
@@ -3502,7 +3578,7 @@ GinBsonComparePartialDollarRange(DollarRangeValues *rangeValues,
 
 			/* The max may also be met if the max term is truncated for a < Max */
 			if (!rangeValues->params.isMaxInclusive && maxCmp == 0 &&
-				maxValueIndexTerm.isIndexTermTruncated)
+				IsIndexTermTruncated(&maxValueIndexTerm))
 			{
 				isMaxConditionMet = true;
 			}
@@ -3627,7 +3703,7 @@ GinBsonComparePartialRegex(BsonIndexTerm *queryValue, BsonIndexTerm *compareValu
 		/* we can stop iterating more. */
 		return 1;
 	}
-	else if (compareValue->isIndexTermTruncated)
+	else if (IsIndexTermTruncated(compareValue))
 	{
 		/* Don't compare truncated terms in the index */
 		return -1;
@@ -3756,7 +3832,7 @@ GinBsonComparePartialSize(BsonIndexTerm *queryValue, BsonIndexTerm *compareValue
 		}
 
 		/* If it's truncated: */
-		if (compareValue->isIndexTermTruncated)
+		if (IsIndexTermTruncated(compareValue))
 		{
 			/* If we're already greater than the required size, we don't need to go
 			 * to the runtime. e.g. if { $size: 1} and we counted 2 elements in the
@@ -3790,7 +3866,7 @@ GinBsonComparePartialType(BsonIndexTerm *queryValue, BsonIndexTerm *compareValue
 	{
 		/* The array is represented as a length N followed by N type values */
 		/*  <int32_t length> <int32_t type> <int32_t type> ... */
-		int32_t arrayLength = DatumGetInt32(*typeArray);
+		int32_t arrayLength = DatumGetInt32(typeArray[0]);
 		typeArray++;
 		for (int i = 0; i < arrayLength; i++)
 		{

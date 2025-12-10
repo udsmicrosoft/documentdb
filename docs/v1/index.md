@@ -20,6 +20,7 @@ A curated collection of guides to help you understand what DocumentDB is, why it
 - [Aggregation](v1/aggregation.md)
 - [Joins](v1/joins.md)
 - [Packaging](v1/packaging.md)
+- [Data Initialization](v1/data-initialization.md)
 
 ---
 
@@ -56,7 +57,7 @@ docker exec -it <container-id> bash
 ### Prebuild Image For DocumentDB with Gateway
 To run the prebuild image with the DocumentDB Gateway, use the following command:
 ```bash
-docker run -dt -p 10260:10260 -e USERNAME=<username> -e PASSWORD=<password> ghcr.io/microsoft/documentdb/preview:test
+docker run -dt -p 10260:10260 -e USERNAME=<username> -e PASSWORD=<password> ghcr.io/microsoft/documentdb/documentdb-local:latest
 
 mongosh localhost:10260 -u <username> -p <password> \
         --authenticationMechanism SCRAM-SHA-256 \

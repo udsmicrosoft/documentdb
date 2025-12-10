@@ -1,15 +1,62 @@
-CREATE SCHEMA documentdb_test_helpers;
+CREATE SCHEMA IF NOT EXISTS documentdb_test_helpers;
 
-SELECT datname, datcollate, datctype, pg_encoding_to_char(encoding), datlocprovider FROM pg_database;
-
--- Check if recreating the extension works
-DROP EXTENSION IF EXISTS documentdb;
-
--- Install the latest available documentdb_api version
-CREATE EXTENSION documentdb CASCADE;
+SELECT MIN(datcollate), MIN(datctype), MIN(pg_encoding_to_char(encoding)), MIN(datlocprovider) FROM pg_database;
+SELECT MAX(datcollate), MAX(datctype), MAX(pg_encoding_to_char(encoding)), MAX(datlocprovider) FROM pg_database;
 
 -- binary version should return the installed version after recreating the extension
 SELECT documentdb_api.binary_version() = (SELECT REPLACE(extversion, '-', '.') FROM pg_extension where extname = 'documentdb_core');
+
+-- Wait for the background worker to be launched in the `regression` database
+-- When the extension is loaded, this isn't created yet. 
+CREATE OR REPLACE PROCEDURE documentdb_test_helpers.wait_for_background_worker()
+AS $$
+DECLARE 
+  v_bg_worker_app_name text := NULL;
+BEGIN
+  LOOP
+    SELECT application_name INTO v_bg_worker_app_name FROM pg_stat_activity WHERE application_name = 'documentdb_bg_worker_leader';
+    IF v_bg_worker_app_name IS NOT NULL THEN
+      RETURN;
+    END IF;
+
+    COMMIT; -- This is needed so that we grab a fresh snapshot of pg_stat_activity
+    PERFORM pg_sleep_for('100 ms');
+  END LOOP;
+END
+$$
+LANGUAGE plpgsql;
+
+CALL documentdb_test_helpers.wait_for_background_worker();
+
+-- validate background worker is launched
+SELECT application_name FROM pg_stat_activity WHERE application_name = 'documentdb_bg_worker_leader';
+
+
+CREATE OR REPLACE FUNCTION documentdb_test_helpers.run_explain_and_trim(p_query text)
+RETURNS SETOF text
+AS $$
+DECLARE
+  v_explain_row text;
+BEGIN
+  FOR v_explain_row IN EXECUTE p_query
+  LOOP
+    IF v_explain_row ~ '^\s+Disabled: true\s*$' THEN
+      CONTINUE;
+    ELSIF v_explain_row ~ '^\s+Index Searches: [0-9]+\s*$' THEN
+      CONTINUE;
+    ELSIF v_explain_row ~ 'Parallel Index Scan using .+ on documents_[0-9]+ collection \(actual rows=[0-9\.]+ loops=[0-9]+\)' THEN
+      SELECT regexp_replace(v_explain_row, 'Parallel Index Scan using (.+) on documents_([0-9]+) collection \(actual rows=[0-9\.]+ loops=([0-9]+)\)',
+                                           'Parallel Index Scan using \1 on documents_\2 collection (actual rows=xyz loops=\3)') INTO v_explain_row;
+    ELSIF v_explain_row ~ 'actual rows=[0-9]+\.00' THEN
+      SELECT regexp_replace(v_explain_row, 'actual rows=([0-9]+)\.00', 'actual rows=\1') INTO v_explain_row;
+    ELSIF v_explain_row ~ 'Sort Method: quicksort  Memory: [0-9]+kB' THEN
+      SELECT regexp_replace(v_explain_row, 'Sort Method: quicksort  Memory: [0-9]+kB', 'Sort Method: quicksort  Memory: xxxkB') INTO v_explain_row;
+    END IF;
+    RETURN NEXT v_explain_row;
+  END LOOP;
+END
+$$
+LANGUAGE plpgsql;
 
 -- query documentdb_api_catalog.collection_indexes for given collection
 CREATE OR REPLACE FUNCTION documentdb_test_helpers.get_collection_indexes(
@@ -24,7 +71,7 @@ AS $$
 BEGIN
   RETURN QUERY
   SELECT ci.collection_id, ci.index_id,
-         documentdb_api_internal.index_spec_as_bson(ci.index_spec),
+         documentdb_api_internal.index_spec_as_bson(ci.index_spec, for_get_indexes=>true),
          ci.index_is_valid
   FROM documentdb_api_catalog.collection_indexes AS ci
   WHERE ci.collection_id = (SELECT hc.collection_id FROM documentdb_api_catalog.collections AS hc
@@ -58,7 +105,7 @@ $$ LANGUAGE plpgsql;
 
 -- Returns the command (without "CONCURRENTLY" option) used to create given
 -- index on a collection.
-CREATE FUNCTION documentdb_test_helpers.documentdb_index_get_pg_def(
+CREATE OR REPLACE FUNCTION documentdb_test_helpers.documentdb_index_get_pg_def(
     p_database_name text,
     p_collection_name text,
     p_index_name text)

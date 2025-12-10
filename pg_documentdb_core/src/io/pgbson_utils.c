@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
  *
- * src/bson/io/pgbson_utils.c
+ * src/io/pgbson_utils.c
  *
  * Implementation of internal helpers for the BSON type.
  *
@@ -37,6 +37,8 @@
 /* Forward declaration */
 /* --------------------------------------------------------- */
 
+extern bool SkipBsonArrayTraverseOptimization;
+
 PGDLLEXPORT const StringView IdFieldStringView = { .string = "_id", .length = 3 };
 
 /* arithmetic functions */
@@ -68,7 +70,8 @@ BsonValueHoldsNumberArray(const bson_value_t *currentValue, int32_t *numElements
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 						errmsg(
-							"value must be of type array")));
+							"Invalid type: expected an array type field, but received %s instead",
+							BsonTypeName(currentValue->value_type))));
 	}
 	bson_iter_t arrayIter;
 	BsonValueInitIterator(currentValue, &arrayIter);
@@ -89,20 +92,20 @@ BsonValueHoldsNumberArray(const bson_value_t *currentValue, int32_t *numElements
 }
 
 
-/*
- * PgbsonDecomposeFields takes a bson object and splits its fields into
- * individual (single-element) bson objects.
- *
- * .e.g.: {"a": [1,2,3], "b": {"x": 1, "y": 1}} ->
- *        List[{"a": [1,2,3]}, {"b": {"x": 1, "y": 1}}]
- */
 List *
-PgbsonDecomposeFields(const pgbson *document)
+BsonValueDocumentDecomposeFields(const bson_value_t *document)
 {
+	if (document->value_type != BSON_TYPE_DOCUMENT)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("BsonValueDocumentDecomposeFields expects a document"
+							   " not %s", BsonTypeName(document->value_type))));
+	}
+
 	List *documents = NIL;
 
 	bson_iter_t iter;
-	PgbsonInitIterator(document, &iter);
+	BsonValueInitIterator(document, &iter);
 	while (bson_iter_next(&iter))
 	{
 		pgbsonelement element;
@@ -115,13 +118,28 @@ PgbsonDecomposeFields(const pgbson *document)
 
 
 /*
+ * PgbsonDecomposeFields takes a bson object and splits its fields into
+ * individual (single-element) bson objects.
+ *
+ * .e.g.: {"a": [1,2,3], "b": {"x": 1, "y": 1}} ->
+ *        List[{"a": [1,2,3]}, {"b": {"x": 1, "y": 1}}]
+ */
+List *
+PgbsonDecomposeFields(const pgbson *document)
+{
+	bson_value_t docValue = ConvertPgbsonToBsonValue(document);
+	return BsonValueDocumentDecomposeFields(&docValue);
+}
+
+
+/*
  * Adds the number stored in number to state and modifies state.
  * returns true if addition happened (type was supported)
  * @state: The augend
  * @number: The addend
  * @overflowedFromInt64: Used for AddInt64ToValue(); set if overflow from Int64 occurs, unset otherwise.
  */
-bool
+pg_attribute_no_sanitize_alignment() bool
 AddNumberToBsonValue(bson_value_t *state, const bson_value_t *number,
 					 bool *overflowedFromInt64)
 {
@@ -166,9 +184,9 @@ AddNumberToBsonValue(bson_value_t *state, const bson_value_t *number,
 
 /*
  * Subtracts the number stored in subtrahend to state and modifies state.
- * returns true if substraction happened (type was supported)
+ * returns true if subtraction happened (type was supported)
  */
-bool
+pg_attribute_no_sanitize_alignment() bool
 SubtractNumberFromBsonValue(bson_value_t *state, const bson_value_t *subtrahend,
 							bool *overflowedFromInt64)
 {
@@ -242,7 +260,7 @@ DivideBsonValueNumbers(bson_value_t *dividend, const bson_value_t *divisor)
 		if (IsDecimal128Zero(&divisor128))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-							errmsg("can't $divide by zero")));
+							errmsg("$divide by zero is not allowed")));
 		}
 
 		dividend->value_type = BSON_TYPE_DECIMAL128;
@@ -256,7 +274,7 @@ DivideBsonValueNumbers(bson_value_t *dividend, const bson_value_t *divisor)
 		if (divisorDouble == 0.0)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-							errmsg("can't $divide by zero")));
+							errmsg("$divide by zero is not allowed")));
 		}
 
 		dividend->value_type = BSON_TYPE_DOUBLE;
@@ -535,7 +553,7 @@ BsonTypeFromName(const char *name)
 	}
 
 	ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-					errmsg("Unknown type name alias: %s", name)));
+					errmsg("Unrecognized data type alias: %s", name)));
 }
 
 
@@ -682,9 +700,24 @@ BsonTypeName(bson_type_t type)
 		default:
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("unknown BSON type code %d", type)));
+							errmsg("Unrecognized BSON data type code %d", type)));
 		}
 	}
+}
+
+
+/*
+ * Extended version of BsonTypeName that returns "missing" for EOD type.
+ */
+char *
+BsonTypeNameExtended(bson_type_t type)
+{
+	if (type == BSON_TYPE_EOD)
+	{
+		return "missing";
+	}
+
+	return BsonTypeName(type);
 }
 
 
@@ -729,7 +762,7 @@ TraverseBsonPathStringView(bson_iter_t *documentIterator,
  * the sum as an int64
  * @overflowedFromInt64: Used for AddInt64ToValue(); Set if overflow from Int64 occurs, unset otherwise.
  */
-static void
+pg_attribute_no_sanitize_alignment() static void
 AddInt32ToValue(bson_value_t *current, int32_t value, bool *overflowedFromInt64)
 {
 	if (current->value_type == BSON_TYPE_DOUBLE)
@@ -781,7 +814,7 @@ AddInt32ToValue(bson_value_t *current, int32_t value, bool *overflowedFromInt64)
  * the sum as a double
  * @overflowedFromInt64: Set if overflow from Int64 occurs, unset otherwise.
  */
-static void
+pg_attribute_no_sanitize_alignment() static void
 AddInt64ToValue(bson_value_t *current, int64_t value, bool *overflowedFromInt64)
 {
 	if (current->value_type == BSON_TYPE_DOUBLE)
@@ -834,7 +867,7 @@ AddInt64ToValue(bson_value_t *current, int64_t value, bool *overflowedFromInt64)
  * Adds a double to the current value.
  *
  */
-static void
+pg_attribute_no_sanitize_alignment() static void
 AddDoubleToValue(bson_value_t *current, double value)
 {
 	/* If existing value is decimal128, then needs to convert the value to decimal128 */
@@ -844,7 +877,7 @@ AddDoubleToValue(bson_value_t *current, double value)
 		valueBson.value.v_double = value;
 		valueBson.value_type = BSON_TYPE_DOUBLE;
 
-		/* Convert value to decimal128 */
+		/* Transform value into decimal128 format */
 		valueBson.value.v_decimal128 = GetBsonValueAsDecimal128Quantized(&valueBson);
 		valueBson.value_type = BSON_TYPE_DECIMAL128;
 
@@ -852,7 +885,7 @@ AddDoubleToValue(bson_value_t *current, double value)
 	}
 	else
 	{
-		/* We match native mongo behavior, which doesn't coerce to decimal128
+		/* We match protocol behavior, which doesn't coerce to decimal128
 		 * in case of overflow and just returns infinity which is the same
 		 * behavior in C in case of double overflow. */
 		double currentValue = BsonValueAsDouble(current);
@@ -865,7 +898,7 @@ AddDoubleToValue(bson_value_t *current, double value)
 /**
  *  Adds a decimal128 to the current value.
  */
-static void
+pg_attribute_no_sanitize_alignment() static void
 AddDecimal128ToValue(bson_value_t *current, const bson_value_t *value)
 {
 	bson_decimal128_t currentValue = GetBsonValueAsDecimal128Quantized(current);
@@ -880,7 +913,7 @@ AddDecimal128ToValue(bson_value_t *current, const bson_value_t *value)
 /*
  *  Subtract a decimal128 from the current value.
  */
-static void
+pg_attribute_no_sanitize_alignment() static void
 SubtractDecimal128FromValue(bson_value_t *current, const bson_value_t *value)
 {
 	bson_decimal128_t currentValue = GetBsonValueAsDecimal128Quantized(current);
@@ -943,7 +976,7 @@ TraverseBsonCore(bson_iter_t *documentIterator, const StringView *traversePath,
 		}
 
 		/* if the last field is an array, compare the value against the elements in the array as well.
-		 * Note that mongo does not traverse arrays of arrays, so if the caller is an array, skip this
+		 * Note that protocol does not traverse arrays of arrays, so if the caller is an array, skip this
 		 * recursion.
 		 */
 		if (BSON_ITER_HOLDS_ARRAY(documentIterator) &&
@@ -997,23 +1030,40 @@ TraverseBsonCore(bson_iter_t *documentIterator, const StringView *traversePath,
 	}
 	else if (BSON_ITER_HOLDS_ARRAY(documentIterator))
 	{
-		/* if the field is an array, there's 2 possibilities, it could be an array index so try finding it as is. */
 		bson_iter_t nestedIterator;
-		bson_iter_recurse(documentIterator, &nestedIterator);
 		bool inArrayContextInner = true;
-		bool hasPathNotFound = TraverseBsonCore(&nestedIterator,
-												&remainingPath, state,
-												executionFunctions,
-												inArrayContextInner);
-		if (!executionFunctions->ContinueProcessIntermediateArray(state, bson_iter_value(
-																	  documentIterator)))
+		bool hasPathNotFound = true;
+
+		/* if the field is an array, there's 2 possibilities, it could be an array index so try finding it as is.
+		 * Don't bother looking at it as an array index if the first character is not a digit.
+		 */
+		if (SkipBsonArrayTraverseOptimization ||
+			(remainingPath.string[0] >= '0' && remainingPath.string[0] <= '9'))
 		{
-			return false;
+			bson_iter_recurse(documentIterator, &nestedIterator);
+			hasPathNotFound = TraverseBsonCore(&nestedIterator,
+											   &remainingPath, state,
+											   executionFunctions,
+											   inArrayContextInner);
+			bool isArrayIndexSearch = true;
+			if (!executionFunctions->ContinueProcessIntermediateArray(state,
+																	  bson_iter_value(
+																		  documentIterator),
+																	  isArrayIndexSearch))
+			{
+				return false;
+			}
 		}
 
 		/* or it could be a nested object in the array. Reinitialize and scan the array. */
 		bson_iter_recurse(documentIterator, &nestedIterator);
 		bool arrayElementsHasPathNotFound = false;
+
+		if (executionFunctions->SetIntermediateArrayStartEnd != NULL)
+		{
+			const bool isStart = true;
+			executionFunctions->SetIntermediateArrayStartEnd(state, isStart);
+		}
 
 		int32_t intermediateIndex = 0;
 		while (bson_iter_next(&nestedIterator))
@@ -1037,17 +1087,37 @@ TraverseBsonCore(bson_iter_t *documentIterator, const StringView *traversePath,
 																 inArrayContextInner);
 
 				const bson_value_t *nestedValue = bson_iter_value(&nestedIterator);
+				bool isArrayIndexSearch = false;
 				if (!executionFunctions->ContinueProcessIntermediateArray(state,
-																		  nestedValue))
+																		  nestedValue,
+																		  isArrayIndexSearch))
 				{
 					return false;
+				}
+
+				if (arrayElementPathNotFound &&
+					executionFunctions->HandleIntermediateArrayPathNotFound != NULL)
+				{
+					executionFunctions->HandleIntermediateArrayPathNotFound(
+						state, intermediateIndex, &remainingPath);
 				}
 
 				arrayElementsHasPathNotFound = arrayElementsHasPathNotFound ||
 											   arrayElementPathNotFound;
 			}
+			else if (executionFunctions->HandleIntermediateArrayPathNotFound != NULL)
+			{
+				executionFunctions->HandleIntermediateArrayPathNotFound(
+					state, intermediateIndex, &remainingPath);
+			}
 
 			intermediateIndex++;
+		}
+
+		if (executionFunctions->SetIntermediateArrayStartEnd != NULL)
+		{
+			const bool isStart = false;
+			executionFunctions->SetIntermediateArrayStartEnd(state, isStart);
 		}
 
 		/*

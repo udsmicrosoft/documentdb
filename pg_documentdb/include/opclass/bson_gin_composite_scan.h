@@ -13,6 +13,15 @@
 
  #include <access/skey.h>
 
-void ModifyScanKeysForCompositeScan(ScanKey scankey, int nscankeys, ScanKey
-									targetScanKey, bool hasArrayKeys);
+struct IndexPath;
+bool GetEqualityRangePredicatesForIndexPath(struct IndexPath *indexPath, void *options,
+											bool equalityPrefixes[INDEX_MAX_KEYS], bool
+											nonEqualityPrefixes[INDEX_MAX_KEYS]);
+bool CompositePathHasFirstColumnSpecified(IndexPath *indexPath);
+char *SerializeBoundsStringForExplain(bytea * entry, void *extraData, PG_FUNCTION_ARGS);
+bool ModifyScanKeysForCompositeScan(ScanKey scankey, int nscankeys, ScanKey
+									targetScanKey, bool hasArrayKeys, bool hasOrderBys,
+									ScanDirection scanDirection);
+ScanDirection DetermineCompositeScanDirection(bytea *compositeScanOptions,
+											  ScanKey orderbys, int norderbys);
  #endif

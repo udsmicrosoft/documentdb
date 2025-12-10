@@ -6,7 +6,9 @@
  *-------------------------------------------------------------------------
  */
 
-pub mod compute_request_tracker;
+pub mod read_concern;
+pub mod read_preference;
+pub mod request_tracker;
 
 use std::{
     fmt::{self, Debug},
@@ -14,6 +16,8 @@ use std::{
 };
 
 use bson::{spec::ElementType, Document, RawBsonRef, RawDocument, RawDocumentBuf};
+use read_concern::ReadConcern;
+use read_preference::ReadPreference;
 use tokio_postgres::IsolationLevel;
 
 use crate::{
@@ -23,7 +27,7 @@ use crate::{
     protocol::opcode::OpCode,
 };
 
-pub use compute_request_tracker::ComputeRequestInterval;
+pub use request_tracker::RequestIntervalKind;
 
 /// The RequestMessage holds ownership to the whole client message
 /// Other objects, like the Request will only hold references to it
@@ -47,18 +51,36 @@ pub struct RequestInfo<'a> {
     db: Option<&'a str>,
     collection: Option<&'a str>,
     pub session_id: Option<&'a [u8]>,
+    read_concern: ReadConcern,
 }
 
 impl RequestInfo<'_> {
+    pub fn new() -> Self {
+        RequestInfo {
+            max_time_ms: None,
+            transaction_info: None,
+            db: None,
+            collection: None,
+            session_id: None,
+            read_concern: ReadConcern::default(),
+        }
+    }
+
     pub fn collection(&self) -> Result<&str> {
         self.collection.ok_or(DocumentDBError::documentdb_error(
             ErrorCode::InvalidNamespace,
             "Invalid namespace".to_string(),
         ))
     }
+
     pub fn db(&self) -> Result<&str> {
-        self.db
-            .ok_or(DocumentDBError::bad_value("$db value missing".to_string()))
+        self.db.ok_or(DocumentDBError::bad_value(
+            "Expected $db to be present".to_string(),
+        ))
+    }
+
+    pub fn read_concern(&self) -> &ReadConcern {
+        &self.read_concern
     }
 }
 
@@ -70,10 +92,13 @@ pub enum RequestType {
     CollMod,
     CollStats,
     CommitTransaction,
+    Compact,
     ConnectionStatus,
     Count,
     Create,
+    CreateIndex,
     CreateIndexes,
+    CreateRole,
     CreateUser,
     CurrentOp,
     DbStats,
@@ -82,6 +107,7 @@ pub enum RequestType {
     Drop,
     DropDatabase,
     DropIndexes,
+    DropRole,
     DropUser,
     EndSessions,
     Explain,
@@ -98,6 +124,7 @@ pub enum RequestType {
     IsDBGrid,
     IsMaster,
     KillCursors,
+    KillOp,
     ListCollections,
     ListCommands,
     ListDatabases,
@@ -108,10 +135,13 @@ pub enum RequestType {
     ReIndex,
     RenameCollection,
     ReshardCollection,
+    RolesInfo,
     SaslContinue,
     SaslStart,
     ShardCollection,
+    UnshardCollection,
     Update,
+    UpdateRole,
     UpdateUser,
     UsersInfo,
     Validate,
@@ -146,10 +176,13 @@ impl FromStr for RequestType {
             "collMod" => Ok(RequestType::CollMod),
             "collStats" => Ok(RequestType::CollStats),
             "commitTransaction" => Ok(RequestType::CommitTransaction),
+            "compact" => Ok(RequestType::Compact),
             "connectionStatus" => Ok(RequestType::ConnectionStatus),
             "count" => Ok(RequestType::Count),
             "create" => Ok(RequestType::Create),
+            "createIndex" => Ok(RequestType::CreateIndex),
             "createIndexes" => Ok(RequestType::CreateIndexes),
+            "createRole" => Ok(RequestType::CreateRole),
             "createUser" => Ok(RequestType::CreateUser),
             "currentOp" => Ok(RequestType::CurrentOp),
             "dbstats" => Ok(RequestType::DbStats),
@@ -159,6 +192,7 @@ impl FromStr for RequestType {
             "drop" => Ok(RequestType::Drop),
             "dropDatabase" => Ok(RequestType::DropDatabase),
             "dropIndexes" => Ok(RequestType::DropIndexes),
+            "dropRole" => Ok(RequestType::DropRole),
             "dropUser" => Ok(RequestType::DropUser),
             "endSessions" => Ok(RequestType::EndSessions),
             "explain" => Ok(RequestType::Explain),
@@ -177,6 +211,7 @@ impl FromStr for RequestType {
             "ismaster" => Ok(RequestType::IsMaster),
             "isMaster" => Ok(RequestType::IsMaster),
             "killCursors" => Ok(RequestType::KillCursors),
+            "killOp" => Ok(RequestType::KillOp),
             "listCollections" => Ok(RequestType::ListCollections),
             "listCommands" => Ok(RequestType::ListCommands),
             "listDatabases" => Ok(RequestType::ListDatabases),
@@ -188,17 +223,20 @@ impl FromStr for RequestType {
             "reIndex" => Ok(RequestType::ReIndex),
             "renameCollection" => Ok(RequestType::RenameCollection),
             "reshardCollection" => Ok(RequestType::ReshardCollection),
+            "rolesInfo" => Ok(RequestType::RolesInfo),
             "saslContinue" => Ok(RequestType::SaslContinue),
             "saslStart" => Ok(RequestType::SaslStart),
             "shardCollection" => Ok(RequestType::ShardCollection),
+            "unshardCollection" => Ok(RequestType::UnshardCollection),
             "update" => Ok(RequestType::Update),
+            "updateRole" => Ok(RequestType::UpdateRole),
             "updateUser" => Ok(RequestType::UpdateUser),
             "usersInfo" => Ok(RequestType::UsersInfo),
             "validate" => Ok(RequestType::Validate),
             "whatsmyuri" => Ok(RequestType::WhatsMyUri),
             _ => Err(DocumentDBError::documentdb_error(
                 ErrorCode::CommandNotSupported,
-                format!("Unknown command recieved: {}", cmd_name),
+                format!("Unknown request received: {cmd_name}"),
             )),
         }
     }
@@ -206,7 +244,7 @@ impl FromStr for RequestType {
 
 impl fmt::Display for RequestType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -268,11 +306,14 @@ impl<'a> Request<'a> {
         }
     }
 
-    pub fn extract_common(&self) -> Result<RequestInfo> {
+    pub fn extract_common(&'a self) -> Result<RequestInfo<'a>> {
         self.extract_fields_and_common(|_, _| Ok(()))
     }
 
-    pub fn extract_coll_and_common(&self, collection_key: &str) -> Result<(String, RequestInfo)> {
+    pub fn extract_coll_and_common(
+        &'a self,
+        collection_key: &str,
+    ) -> Result<(String, RequestInfo<'a>)> {
         let mut collection = None;
         let request_info = self.extract_fields_and_common(|k, v| {
             if k == collection_key {
@@ -289,14 +330,13 @@ impl<'a> Request<'a> {
         })?;
         Ok((
             collection.ok_or(DocumentDBError::bad_value(format!(
-                "{} should be present",
-                collection_key
+                "{collection_key} should be present"
             )))?,
             request_info,
         ))
     }
 
-    pub fn extract_fields_and_common<F>(&self, mut f: F) -> Result<RequestInfo>
+    pub fn extract_fields_and_common<F>(&'a self, mut coll_extractor: F) -> Result<RequestInfo<'a>>
     where
         F: FnMut(&str, RawBsonRef) -> Result<()>,
     {
@@ -308,70 +348,81 @@ impl<'a> Request<'a> {
         let mut start_transaction = false;
         let mut isolation_level = None;
         let mut collection = None;
+        let mut read_concern = ReadConcern::default();
 
         let collection_field = self.collection_field();
         for entry in self.document() {
             let (k, v) = entry?;
             match k {
                 "$db" => {
-                    db = Some(v.as_str().ok_or(DocumentDBError::bad_value(
-                        "$db should be a string".to_string(),
-                    ))?)
+                    db = Some(v.as_str().ok_or(DocumentDBError::bad_value(format!(
+                        "Expected $db to be a string but got {:?}",
+                        v.element_type()
+                    )))?)
                 }
                 "maxTimeMS" => max_time_ms = Some(Self::to_i64(v)?),
                 "lsid" => {
                     session_id = Some(
                         v.as_document()
-                            .ok_or(DocumentDBError::bad_value(
-                                "lsid was not a document.".to_string(),
-                            ))?
+                            .ok_or(DocumentDBError::bad_value(format!(
+                                "Expected lsid to be a document but got {:?}",
+                                v.element_type()
+                            )))?
                             .get_binary("id")
                             .map_err(DocumentDBError::parse_failure())?
                             .bytes,
                     );
                 }
                 "txnNumber" => {
-                    transaction_number = Some(v.as_i64().ok_or(DocumentDBError::bad_value(
-                        "txnNumber was not an i64".to_string(),
-                    ))?);
+                    transaction_number =
+                        Some(v.as_i64().ok_or(DocumentDBError::bad_value(format!(
+                            "Expected txnNumber to be an i64 but got {:?}",
+                            v.element_type()
+                        )))?);
                 }
                 "autocommit" => {
-                    auto_commit = v.as_bool().ok_or(DocumentDBError::bad_value(
-                        "autoCommit was not a bool".to_string(),
-                    ))?;
+                    auto_commit = v.as_bool().ok_or(DocumentDBError::bad_value(format!(
+                        "Expected autocommit to be a bool but got {:?}",
+                        v.element_type()
+                    )))?;
                 }
                 "startTransaction" => {
-                    start_transaction = v.as_bool().ok_or(DocumentDBError::bad_value(
-                        "startTransaction was not a bool".to_string(),
-                    ))?;
+                    start_transaction = v.as_bool().ok_or(DocumentDBError::bad_value(format!(
+                        "Expected startTransaction to be a bool but got {:?}",
+                        v.element_type()
+                    )))?;
                 }
                 "readConcern" => {
-                    if v.as_document()
-                        .ok_or(DocumentDBError::bad_value(
-                            "readConcern was not a document".to_string(),
-                        ))?
+                    let level = v
+                        .as_document()
+                        .ok_or(DocumentDBError::bad_value(format!(
+                            "Expected readConcern to be a document but got {:?}",
+                            v.element_type()
+                        )))?
                         .get_str("level")
-                        .unwrap_or("")
-                        == "snapshot"
-                    {
+                        .unwrap_or("");
+                    read_concern = ReadConcern::from_str(level).unwrap_or(ReadConcern::default());
+                    if let ReadConcern::Snapshot = read_concern {
                         isolation_level = Some(IsolationLevel::RepeatableRead)
                     }
                 }
+                "$readPreference" => ReadPreference::parse(v.as_document())?,
                 key if collection_field.contains(&key) => {
                     // Aggregate needs special handling because having '1' as a collection is valid
                     collection = if collection_field[0] == "aggregate" {
                         Some(
                             convert_to_f64(v)
                                 .map_or_else(|| v.as_str(), |_| Some(""))
-                                .ok_or(DocumentDBError::bad_value(
-                                    "Failed to parse, aggregate key invalid".to_string(),
-                                ))?,
+                                .ok_or(DocumentDBError::bad_value(format!(
+                                    "Failed to parse aggregate key; expected string or numeric but got {:?}",
+                                    v.element_type()
+                                )))?,
                         )
                     } else {
                         v.as_str()
                     }
                 }
-                _ => f(k, v)?,
+                _ => coll_extractor(k, v)?,
             }
         }
         let transaction_info = match (&session_id, transaction_number) {
@@ -391,6 +442,7 @@ impl<'a> Request<'a> {
             session_id,
             transaction_info,
             db,
+            read_concern,
         })
     }
 
@@ -399,8 +451,10 @@ impl<'a> Request<'a> {
             RequestType::Aggregate => &["aggregate"],
             RequestType::CollMod => &["collMod"],
             RequestType::CollStats => &["collStats"],
+            RequestType::Compact => &["compact"],
             RequestType::Count => &["count"],
             RequestType::Create => &["create"],
+            RequestType::CreateIndex => &["createIndex"],
             RequestType::CreateIndexes => &["createIndexes"],
             RequestType::Delete => &["delete"],
             RequestType::Distinct => &["distinct"],
@@ -414,6 +468,7 @@ impl<'a> Request<'a> {
             RequestType::RenameCollection => &["renameCollection"],
             RequestType::ReshardCollection => &["reshardCollection"],
             RequestType::ShardCollection => &["shardCollection"],
+            RequestType::UnshardCollection => &["unshardCollection"],
             RequestType::Update => &["update"],
             _ => &[],
         }

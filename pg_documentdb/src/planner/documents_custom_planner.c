@@ -114,7 +114,12 @@ TryCreatePointReadPlan(Query *query)
 	if (indexScan->indexid == InvalidOid)
 	{
 		/* Load the index */
+#if PG_VERSION_NUM >= 180000
+		bool deferrableOk = false;
+		indexScan->indexid = RelationGetPrimaryKeyIndex(relation, deferrableOk);
+#else
 		indexScan->indexid = RelationGetPrimaryKeyIndex(relation);
+#endif
 	}
 
 	RelationClose(relation);
@@ -271,13 +276,13 @@ SetPointReadQualsOnIndexScan(IndexScan *indexScan, Expr *queryQuals)
 			}
 			else
 			{
-				/* Cannot push to index */
+				/* Unable to push data into the specified index */
 				runtimeClauses = lappend(runtimeClauses, expr);
 			}
 		}
 		else
 		{
-			/* Cannot push to index */
+			/* Unable to push data into the specified index */
 			if (IsA(expr, FuncExpr))
 			{
 				FuncExpr *funcExpr = (FuncExpr *) expr;
@@ -285,6 +290,15 @@ SetPointReadQualsOnIndexScan(IndexScan *indexScan, Expr *queryQuals)
 				{
 					/* Text search does not qualify here */
 					return false;
+				}
+				else if (funcExpr->funcid == BsonIndexHintFunctionOid())
+				{
+					return false;
+				}
+				else if (funcExpr->funcid == BsonFullScanFunctionOid())
+				{
+					/* Strip full scan */
+					continue;
 				}
 			}
 

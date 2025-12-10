@@ -6,88 +6,59 @@
  *-------------------------------------------------------------------------
  */
 
-use tokio_postgres::types::Type;
-
 use crate::{
-    context::ConnectionContext,
+    context::{ConnectionContext, RequestContext},
     error::DocumentDBError,
-    postgres::{PgDocument, Timeout},
-    requests::Request,
-    responses::{PgResponse, Response},
+    postgres::PgDataClient,
+    responses::Response,
 };
 
-pub(crate) async fn process_create_user(
-    request: &Request<'_>,
-    context: &mut ConnectionContext,
+pub async fn process_create_user(
+    request_context: &mut RequestContext<'_>,
+    connection_context: &mut ConnectionContext,
+    pg_data_client: &impl PgDataClient,
 ) -> Result<Response, DocumentDBError> {
-    let request_info = request.extract_common()?;
-
-    let results = context
-        .pg()
-        .await?
-        .query(
-            context.service_context.query_catalog().create_user(),
-            &[Type::BYTEA],
-            &[&PgDocument(request.document())],
-            Timeout::transaction(request_info.max_time_ms),
-        )
-        .await?;
-    Ok(Response::Pg(PgResponse::new(results)))
+    pg_data_client
+        .execute_create_user(request_context, connection_context)
+        .await
 }
 
-pub(crate) async fn process_drop_user(
-    request: &Request<'_>,
-    context: &mut ConnectionContext,
+pub async fn process_drop_user(
+    request_context: &mut RequestContext<'_>,
+    connection_context: &mut ConnectionContext,
+    pg_data_client: &impl PgDataClient,
 ) -> Result<Response, DocumentDBError> {
-    let request_info = request.extract_common()?;
-
-    let results = context
-        .pg()
-        .await?
-        .query(
-            context.service_context.query_catalog().drop_user(),
-            &[Type::BYTEA],
-            &[&PgDocument(request.document())],
-            Timeout::transaction(request_info.max_time_ms),
-        )
-        .await?;
-    Ok(Response::Pg(PgResponse::new(results)))
+    pg_data_client
+        .execute_drop_user(request_context, connection_context)
+        .await
 }
 
-pub(crate) async fn process_update_user(
-    request: &Request<'_>,
-    context: &mut ConnectionContext,
+pub async fn process_update_user(
+    request_context: &mut RequestContext<'_>,
+    connection_context: &mut ConnectionContext,
+    pg_data_client: &impl PgDataClient,
 ) -> Result<Response, DocumentDBError> {
-    let request_info = request.extract_common()?;
-
-    let results = context
-        .pg()
-        .await?
-        .query(
-            context.service_context.query_catalog().update_user(),
-            &[Type::BYTEA],
-            &[&PgDocument(request.document())],
-            Timeout::transaction(request_info.max_time_ms),
-        )
-        .await?;
-    Ok(Response::Pg(PgResponse::new(results)))
+    pg_data_client
+        .execute_update_user(request_context, connection_context)
+        .await
 }
 
-pub(crate) async fn process_users_info(
-    request: &Request<'_>,
-    context: &mut ConnectionContext,
+pub async fn process_users_info(
+    request_context: &mut RequestContext<'_>,
+    connection_context: &mut ConnectionContext,
+    pg_data_client: &impl PgDataClient,
 ) -> Result<Response, DocumentDBError> {
-    let request_info = request.extract_common()?;
+    pg_data_client
+        .execute_users_info(request_context, connection_context)
+        .await
+}
 
-    let results = context
-        .pg()
-        .await?
-        .query(
-            context.service_context.query_catalog().users_info(),
-            &[Type::BYTEA],
-            &[&PgDocument(request.document())],
-            Timeout::transaction(request_info.max_time_ms),
-        )
-        .await?;
-    Ok(Response::Pg(PgResponse::new(results)))
+pub async fn process_connection_status(
+    request_context: &mut RequestContext<'_>,
+    connection_context: &mut ConnectionContext,
+    pg_data_client: &impl PgDataClient,
+) -> Result<Response, DocumentDBError> {
+    pg_data_client
+        .execute_connection_status(request_context, connection_context)
+        .await
 }

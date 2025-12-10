@@ -22,6 +22,8 @@
 #include "utils/documentdb_errors.h"
 #include "vector/vector_spec.h"
 
+extern bool DefaultUseCompositeOpClass;
+
 
 IsMetadataCoordinator_HookType is_metadata_coordinator_hook = NULL;
 RunCommandOnMetadataCoordinator_HookType run_command_on_metadata_coordinator_hook = NULL;
@@ -33,7 +35,7 @@ ModifyTableColumnNames_HookType modify_table_column_names_hook = NULL;
 RunQueryWithNestedDistribution_HookType run_query_with_nested_distribution_hook = NULL;
 AllowNestedDistributionInCurrentTransaction_HookType
 	allow_nested_distribution_in_current_transaction_hook = NULL;
-IsShardTableForMongoTable_HookType is_shard_table_for_mongo_table_hook = NULL;
+IsShardTableForDocumentDbTable_HookType is_shard_table_for_documentdb_table_hook = NULL;
 HandleColocation_HookType handle_colocation_hook = NULL;
 RewriteListCollectionsQueryForDistribution_HookType rewrite_list_collections_query_hook =
 	NULL;
@@ -46,11 +48,8 @@ IsChangeStreamEnabledAndCompatible is_changestream_enabled_and_compatible_hook =
 IsNtoReturnSupported_HookType is_n_to_return_supported_hook = NULL;
 EnsureMetadataTableReplicated_HookType ensure_metadata_table_replicated_hook = NULL;
 PostSetupCluster_HookType post_setup_cluster_hook = NULL;
-GetIndexAmRoutine_HookType get_index_amroutine_hook = NULL;
-GetMultiAndBitmapIndexFunc_HookType get_multi_and_bitmap_func_hook = NULL;
 TryCustomParseAndValidateVectorQuerySpec_HookType
 	try_custom_parse_and_validate_vector_query_spec_hook = NULL;
-TryOptimizePathForBitmapAndHookType try_optimize_path_for_bitmap_and_hook = NULL;
 TryGetExtendedVersionRefreshQuery_HookType try_get_extended_version_refresh_query_hook =
 	NULL;
 GetShardIdsAndNamesForCollection_HookType get_shard_ids_and_names_for_collection_hook =
@@ -69,10 +68,18 @@ TryGetIndexBuildJobOpIdQuery_HookType try_get_index_build_job_op_id_query_hook =
 TryGetCancelIndexBuildQuery_HookType try_get_cancel_index_build_query_hook =
 	NULL;
 ShouldScheduleIndexBuilds_HookType should_schedule_index_builds_hook = NULL;
+
+GettShardIndexOids_HookType get_shard_index_oids_hook = NULL;
+UpdatePostgresIndex_HookType update_postgres_index_hook = NULL;
+GetOperationCancellationQuery_HookType get_operation_cancellation_query_hook = NULL;
+
 UserNameValidation_HookType
 	username_validation_hook = NULL;
 PasswordValidation_HookType
 	password_validation_hook = NULL;
+
+DefaultEnableCompositeOpClass_HookType
+	default_enable_composite_op_class_hook = NULL;
 
 /*
  * Single node scenario is always a metadata coordinator
@@ -196,11 +203,11 @@ RunQueryWithSequentialModification(const char *query, int expectedSPIOK, bool *i
  * the documents table name and the substring where the collectionId was found is provided as an input.
  */
 bool
-IsShardTableForMongoTable(const char *relName, const char *numEndPointer)
+IsShardTableForDocumentDbTable(const char *relName, const char *numEndPointer)
 {
-	if (is_shard_table_for_mongo_table_hook != NULL)
+	if (is_shard_table_for_documentdb_table_hook != NULL)
 	{
-		return is_shard_table_for_mongo_table_hook(relName, numEndPointer);
+		return is_shard_table_for_documentdb_table_hook(relName, numEndPointer);
 	}
 
 	/* Without distribution all documents_ tables are shard tables */
@@ -292,7 +299,7 @@ GetUserInfoFromExternalIdentityProvider(const char *userName)
 
 
 /*
- * Check if the user is external
+ * Is user external
  */
 bool
 IsUserExternal(const char *userName)
@@ -472,36 +479,6 @@ PostSetupClusterHook(bool isInitialize, bool (shouldUpgradeFunc(void *, int, int
 }
 
 
-/* This function returns the rum handler index routine, if the hook to get it is implemented it just calls into it. */
-IndexAmRoutine *
-GetDocumentDBIndexAmRoutine(PG_FUNCTION_ARGS)
-{
-	if (get_index_amroutine_hook != NULL)
-	{
-		return get_index_amroutine_hook(fcinfo);
-	}
-
-	return GetRumIndexHandler(fcinfo);
-}
-
-
-/* This function loads and returns the multiandgetbitmap function implementation from the default index handler.
- * If the hook is implemented to return it, it just calls into it.
- */
-void *
-GetMultiAndBitmapIndexFunc(bool missingOk)
-{
-	if (get_multi_and_bitmap_func_hook != NULL)
-	{
-		return get_multi_and_bitmap_func_hook();
-	}
-
-	void **ignoreLibFileHandle = NULL;
-	return load_external_function("$libdir/rum", "multiandgetbitmap", !missingOk,
-								  ignoreLibFileHandle);
-}
-
-
 /*
  * Try to validate vector query spec by customized logic.
  */
@@ -516,19 +493,6 @@ TryCustomParseAndValidateVectorQuerySpec(const char *key,
 															 value,
 															 vectorSearchOptions);
 	}
-}
-
-
-Path *
-TryOptimizePathForBitmapAnd(PlannerInfo *root, RelOptInfo *rel,
-							RangeTblEntry *rte, BitmapHeapPath *heapPath)
-{
-	if (try_optimize_path_for_bitmap_and_hook != NULL)
-	{
-		return try_optimize_path_for_bitmap_and_hook(root, rel, rte, heapPath);
-	}
-
-	return NULL;
 }
 
 
@@ -612,4 +576,64 @@ ShouldScheduleIndexBuildJobs(void)
 	}
 
 	return true;
+}
+
+
+List *
+GetShardIndexOids(uint64_t collectionId, int indexId, bool ignoreMissing)
+{
+	if (get_shard_index_oids_hook != NULL)
+	{
+		return get_shard_index_oids_hook(collectionId, indexId, ignoreMissing);
+	}
+
+	return NIL;
+}
+
+
+void
+UpdatePostgresIndexWithOverride(uint64_t collectionId, int indexId, int operation, bool
+								value,
+								void (*default_update)(uint64_t, int, int, bool))
+{
+	if (update_postgres_index_hook != NULL)
+	{
+		update_postgres_index_hook(collectionId, indexId, operation, value);
+	}
+	else
+	{
+		default_update(collectionId, indexId, operation, value);
+	}
+}
+
+
+const char *
+GetOperationCancellationQuery(int64 shardId, StringView *opIdView, int *nargs,
+							  Oid **argTypes,
+							  Datum **argValues, char **argNulls,
+							  const char *(*default_get_query)(int64, StringView *, int *,
+															   Oid **, Datum **, char **))
+{
+	if (get_operation_cancellation_query_hook != NULL)
+	{
+		return get_operation_cancellation_query_hook(shardId, opIdView, nargs, argTypes,
+													 argValues, argNulls);
+	}
+	else if (default_get_query == NULL)
+	{
+		return NULL;
+	}
+	return default_get_query(shardId, opIdView, nargs, argTypes, argValues, argNulls);
+}
+
+
+bool
+ShouldUseCompositeOpClassByDefault()
+{
+	if (default_enable_composite_op_class_hook != NULL)
+	{
+		return default_enable_composite_op_class_hook();
+	}
+
+	return DefaultUseCompositeOpClass;
 }

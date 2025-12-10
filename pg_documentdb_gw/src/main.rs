@@ -6,20 +6,24 @@
  *-------------------------------------------------------------------------
  */
 
-use log::info;
 use simple_logger::SimpleLogger;
 use std::{env, path::PathBuf, sync::Arc};
 
 use documentdb_gateway::{
     configuration::{DocumentDBSetupConfiguration, PgConfiguration, SetupConfiguration},
-    get_service_context, populate_ssl_certificates,
-    postgres::{create_query_catalog, Pool},
-    run_server,
+    postgres::{create_query_catalog, DocumentDBDataClient},
+    run_gateway,
+    service::TlsProvider,
+    shutdown_controller::SHUTDOWN_CONTROLLER,
+    startup::{
+        create_postgres_object, get_service_context, get_system_connection_pool,
+        AUTHENTICATION_MAX_CONNECTIONS, SYSTEM_REQUESTS_MAX_CONNECTIONS,
+    },
 };
-use tokio_util::sync::CancellationToken;
 
-#[ntex::main]
-async fn main() {
+use tokio::signal;
+
+fn main() {
     // Takes the configuration file as an argument
     let cfg_file = if let Some(arg1) = env::args().nth(1) {
         PathBuf::from(arg1)
@@ -28,16 +32,9 @@ async fn main() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("SetupConfiguration.json")
     };
 
-    let token = CancellationToken::new();
-
-    let setup_configuration = DocumentDBSetupConfiguration::new(&cfg_file)
-        .await
-        .expect("Failed to load configuration.");
-
-    info!(
-        "Starting server with configuration: {:?}",
-        setup_configuration
-    );
+    // Load configuration
+    let setup_configuration =
+        DocumentDBSetupConfiguration::new(&cfg_file).expect("Failed to load configuration.");
 
     SimpleLogger::new()
         .with_level(log::LevelFilter::Info)
@@ -45,47 +42,85 @@ async fn main() {
         .init()
         .expect("Failed to start logger");
 
-    let query_catalog = create_query_catalog();
+    log::info!("Starting server with configuration: {setup_configuration:?}");
 
-    let postgres_system_user = setup_configuration.postgres_system_user();
-    let system_pool = Arc::new(
-        Pool::new_with_user(
-            &setup_configuration,
-            &query_catalog,
-            &postgres_system_user,
-            None,
-            format!("{}-SystemRequests", setup_configuration.application_name()),
-            5,
-        )
-        .expect("Failed to create system pool"),
-    );
-    log::trace!("Pool initialized");
+    // Create Tokio runtime with configured worker threads
+    let async_runtime_worker_threads = setup_configuration.async_runtime_worker_threads();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(async_runtime_worker_threads)
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
 
-    let dynamic_configuration = PgConfiguration::new(
-        &query_catalog,
-        &setup_configuration,
-        &system_pool,
-        "documentdb.",
+    log::info!("Created Tokio runtime with {async_runtime_worker_threads} worker threads");
+
+    // Run the async main logic
+    runtime.block_on(start_gateway(setup_configuration));
+}
+
+async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
+    let shutdown_token = SHUTDOWN_CONTROLLER.token();
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        log::info!("Ctrl+C received. Shutting down Rust gateway.");
+        SHUTDOWN_CONTROLLER.shutdown();
+    });
+
+    let tls_provider = TlsProvider::new(
+        SetupConfiguration::certificate_options(&setup_configuration),
+        None,
+        None,
     )
     .await
-    .unwrap();
+    .expect("Failed to create TLS provider.");
 
-    let certificate_options = if let Some(co) = setup_configuration.certificate_options() {
-        co
-    } else {
-        populate_ssl_certificates().await.unwrap()
-    };
+    let query_catalog = create_query_catalog();
+
+    let system_requests_pool = Arc::new(
+        get_system_connection_pool(
+            &setup_configuration,
+            &query_catalog,
+            "SystemRequests",
+            SYSTEM_REQUESTS_MAX_CONNECTIONS,
+        )
+        .await,
+    );
+    log::info!("System requests pool initialized");
+
+    let dynamic_configuration = create_postgres_object(
+        || async {
+            PgConfiguration::new(
+                &query_catalog,
+                &setup_configuration,
+                &system_requests_pool,
+                vec!["documentdb.".to_string()],
+            )
+            .await
+        },
+        &setup_configuration,
+    )
+    .await;
+
+    let authentication_pool = get_system_connection_pool(
+        &setup_configuration,
+        &query_catalog,
+        "PreAuthRequests",
+        AUTHENTICATION_MAX_CONNECTIONS,
+    )
+    .await;
+    log::info!("Authentication pool initialized");
 
     let service_context = get_service_context(
         Box::new(setup_configuration),
         dynamic_configuration,
         query_catalog,
-        system_pool.clone(),
-    )
-    .await
-    .unwrap();
+        system_requests_pool,
+        authentication_pool,
+        tls_provider,
+    );
 
-    run_server(service_context, certificate_options, None, token.clone(), None)
+    run_gateway::<DocumentDBDataClient>(service_context, None, shutdown_token)
         .await
         .unwrap();
 }

@@ -6,44 +6,25 @@
  *-------------------------------------------------------------------------
  */
 
-use core::str;
-
 use bson::{Bson, Document, RawDocument, RawDocumentBuf};
 
 use documentdb_macros::documentdb_int_error_mapping;
-use regex::Regex;
 use tokio_postgres::{error::SqlState, Row};
 
 use crate::{
     context::{ConnectionContext, Cursor},
     error::{DocumentDBError, ErrorCode, Result},
     postgres::PgDocument,
+    responses::constant::{duplicate_key_violation_message, pg_returned_invalid_response_message},
 };
 
 use super::{raw::RawResponse, Response};
-use once_cell::sync::Lazy;
 
-/// A server response from PG - holds ownership of the whole response from the backend
+/// Response from PG. This holds ownership of the response from the backend
 #[derive(Debug)]
 pub struct PgResponse {
     rows: Vec<Row>,
 }
-
-static VECTOR_INDEX_LENGTH_CONTRAINT_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"column cannot have more than (?<dimension>\d+) dimensions for")
-        .expect("Static input")
-});
-
-static VECTOR_DIMENSIONS_EXCEEDED_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"vector cannot have more than (?<dimension>\d+) dimensions").expect("Static input")
-});
-
-static VECTOR_DISKANN_INDEX_LENGTH_CONTRAINT_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r"vector dimension cannot be larger than (?<dimension>\d+) dimensions for diskann index",
-    )
-    .expect("Static input")
-});
 
 impl PgResponse {
     pub fn new(rows: Vec<Row>) -> Self {
@@ -94,17 +75,21 @@ impl PgResponse {
         }
     }
 
-    /// In certain cases, write errors need to be walked through to convert PG error codes to Gatway ones.
-    pub async fn transform_write_errors(self, context: &ConnectionContext) -> Result<Response> {
+    /// If 'writeErrors' is present, it transforms each error by potentially mapping them to the known DocumentDB error codes.
+    pub async fn transform_write_errors(
+        self,
+        context: &ConnectionContext,
+        activity_id: &str,
+    ) -> Result<Response> {
         if let Ok(Some(_)) = self.as_raw_document()?.get("writeErrors") {
             // TODO: Conceivably faster without conversion to document
             let mut response = Document::try_from(self.as_raw_document()?)?;
             let write_errors = response.get_array_mut("writeErrors").map_err(|e| {
-                DocumentDBError::internal_error(format!("PG returned invalid response: {}", e))
+                DocumentDBError::internal_error(pg_returned_invalid_response_message(e))
             })?;
 
             for value in write_errors {
-                self.transform_error(context, value).await?;
+                self.transform_error(context, value, activity_id).await?;
             }
             let raw = RawDocumentBuf::from_document(&response)?;
             return Ok(Response::Raw(RawResponse(raw)));
@@ -112,20 +97,29 @@ impl PgResponse {
         Ok(Response::Pg(self))
     }
 
-    async fn transform_error(&self, context: &ConnectionContext, bson: &mut Bson) -> Result<()> {
+    async fn transform_error(
+        &self,
+        context: &ConnectionContext,
+        bson: &mut Bson,
+        activity_id: &str,
+    ) -> Result<()> {
         let doc = bson
             .as_document_mut()
             .ok_or(DocumentDBError::internal_error(
-                "Write error was not a document".to_string(),
+                "Failed to convert BSON write error into BSON document.".to_string(),
             ))?;
         let msg = doc.get_str("errmsg").unwrap_or("").to_owned();
         let code = doc.get_i32_mut("code").map_err(|e| {
-            DocumentDBError::internal_error(format!("PG returned invalid response: {}", e))
+            DocumentDBError::internal_error(pg_returned_invalid_response_message(e))
         })?;
 
-        if let Some((known, opt, error_code)) =
-            PgResponse::known_pg_error(context, &PgResponse::i32_to_postgres_sqlstate(code)?, &msg)
-                .await
+        if let Some((known, opt, error_code)) = PgResponse::known_pg_error(
+            context,
+            &PgResponse::i32_to_postgres_sqlstate(code)?,
+            &msg,
+            activity_id,
+        )
+        .await
         {
             if known == ErrorCode::WriteConflict as i32
                 || known == ErrorCode::InternalError as i32
@@ -134,16 +128,14 @@ impl PgResponse {
             {
                 return Err(DocumentDBError::UntypedDocumentDBError(
                     known,
-                    opt.unwrap_or("".to_string()),
-                    error_code.unwrap_or("DocumentDB Error".to_string()),
+                    opt.unwrap_or_default().to_string(),
+                    error_code.to_string(),
                     std::backtrace::Backtrace::capture(),
                 ));
             }
 
             *code = known;
-            if let Some(m) = opt {
-                doc.insert("errmsg", m);
-            }
+            doc.insert("errmsg", error_code);
         }
         Ok(())
     }
@@ -158,9 +150,9 @@ impl PgResponse {
 
         Ok(SqlState::from_code(str::from_utf8(&chars).map_err(
             |_| {
-                DocumentDBError::internal_error(
-                    "Failed to convert error code to state string".to_string(),
-                )
+                DocumentDBError::internal_error(format!(
+                    "Failed to map command error code '{chars:?}' to SQL state."
+                ))
             },
         )?))
     }
@@ -177,136 +169,217 @@ impl PgResponse {
 
     documentdb_int_error_mapping!();
 
-    pub async fn known_pg_error(
-        connection_context: &ConnectionContext,
-        state: &SqlState,
-        msg: &str,
-    ) -> Option<(i32, Option<String>, Option<String>)> {
-        if let Some(known) = PgResponse::known_error_code(state) {
-            return Some((known, None, None));
+    pub async fn known_pg_error<'a>(
+        connection_context: &'a ConnectionContext,
+        state: &'a SqlState,
+        msg: &'a str,
+        activity_id: &str,
+    ) -> Option<(i32, Option<String>, &'a str)> {
+        if let Some((known, code_name)) = PgResponse::from_known_external_error_code(state) {
+            if known == ErrorCode::NotWritablePrimary as i32 {
+                return Some((
+                    known,
+                    Some(msg.to_string()),
+                    "This may be due to the database disk being full",
+                ));
+            }
+
+            return Some((known, Some(code_name.to_string()), msg));
         }
 
         let code = PgResponse::postgres_sqlstate_to_i32(state);
         if (PgResponse::API_ERROR_CODE_MIN..PgResponse::API_ERROR_CODE_MAX).contains(&code) {
-            return Some((code - PgResponse::API_ERROR_CODE_MIN, None, None));
+            return Some((code - PgResponse::API_ERROR_CODE_MIN, None, msg));
         }
 
+        // Handle specific pg states and map them to DocumentDB error codes
         match *state {
-            SqlState::UNIQUE_VIOLATION
-            | SqlState::EXCLUSION_VIOLATION
-                if connection_context.transaction.is_some() =>
-            {
-                Some((ErrorCode::WriteConflict as i32, None, None))
+            SqlState::UNIQUE_VIOLATION | SqlState::EXCLUSION_VIOLATION => {
+                if connection_context.transaction.is_some() {
+                    log::error!(activity_id = activity_id; "Duplicate key error during transaction.");
+                    Some((
+                        ErrorCode::WriteConflict as i32,
+                        Some(format!("{:?}", SqlState::UNIQUE_VIOLATION)),
+                        duplicate_key_violation_message(),
+                    ))
+                } else {
+                    log::error!(activity_id = activity_id; "Duplicate key error.");
+                    Some((
+                        ErrorCode::DuplicateKey as i32,
+                        Some(format!("{:?}", SqlState::UNIQUE_VIOLATION)),
+                        duplicate_key_violation_message(),
+                    ))
+                }
             }
-            SqlState::UNIQUE_VIOLATION => Some((
-                ErrorCode::DuplicateKey as i32,
-                Some("Duplicate key violation on the requested collection".to_string()), None
+            SqlState::DISK_FULL => Some((
+                ErrorCode::OutOfDiskSpace as i32,
+                Some(format!("{:?}", SqlState::DISK_FULL)),
+                "The database disk is full",
             )),
-            SqlState::EXCLUSION_VIOLATION => Some((
-                (ErrorCode::DuplicateKey as i32),
-                Some("Duplicate key violation on the requested collection".to_string()), None
+            SqlState::UNDEFINED_TABLE => Some((
+                ErrorCode::NamespaceNotFound as i32,
+                Some(format!("{:?}", SqlState::UNDEFINED_TABLE)),
+                msg,
             )),
-            SqlState::DISK_FULL => Some((ErrorCode::OutOfDiskSpace as i32, Some("The database disk is full".to_string()), None)),
-            SqlState::UNDEFINED_TABLE => Some((ErrorCode::NamespaceNotFound as i32, None, None)),
-            SqlState::QUERY_CANCELED => Some((ErrorCode::ExceededTimeLimit as i32, None, None)),
-            SqlState::LOCK_NOT_AVAILABLE if connection_context.transaction.is_some() => {
-                Some((ErrorCode::WriteConflict as i32, None, None))
+            SqlState::QUERY_CANCELED => {
+                if connection_context.transaction.is_some() {
+                    log::error!(activity_id = activity_id; "Query canceled during transaction.");
+                    Some((ErrorCode::ExceededTimeLimit as i32, Some(format!("{:?}", SqlState::QUERY_CANCELED)), "The command being executed was terminated due to a command timeout. This may be due to concurrent transactions."))
+                } else {
+                    log::error!(activity_id = activity_id; "Query canceled.");
+                    Some((ErrorCode::ExceededTimeLimit as i32, Some(format!("{:?}", SqlState::QUERY_CANCELED)), "The command being executed was terminated due to a command timeout. This may be due to concurrent transactions. Consider increasing the maxTimeMS on the command."))
+                }
             }
-            SqlState::LOCK_NOT_AVAILABLE => Some((ErrorCode::LockTimeout as i32, None, None)),
-            SqlState::FEATURE_NOT_SUPPORTED => {
-                Some((ErrorCode::CommandNotSupported as i32, None, None))
+            SqlState::LOCK_NOT_AVAILABLE => {
+                if connection_context.transaction.is_some() {
+                    log::error!(activity_id = activity_id; "Lock not available error during transaction.");
+                    Some((
+                        ErrorCode::WriteConflict as i32,
+                        Some(format!("{:?}", SqlState::LOCK_NOT_AVAILABLE)),
+                        msg,
+                    ))
+                } else {
+                    log::error!(activity_id = activity_id; "Lock not available error.");
+                    Some((
+                        ErrorCode::LockTimeout as i32,
+                        Some(format!("{:?}", SqlState::LOCK_NOT_AVAILABLE)),
+                        msg,
+                    ))
+                }
             }
-            SqlState::DATA_EXCEPTION
-                if msg.contains("dimensions, not") || msg.contains("not allowed in vector") =>
-            {
-                Some((ErrorCode::BadValue as i32, None, None))
-            }
-            SqlState::DATA_EXCEPTION => Some((
-                ErrorCode::InternalError as i32,
-                Some("An unexpected internal error has occurred".to_string()), None
+            SqlState::FEATURE_NOT_SUPPORTED => Some((
+                ErrorCode::CommandNotSupported as i32,
+                Some(format!("{:?}", SqlState::FEATURE_NOT_SUPPORTED)),
+                msg,
             )),
-            SqlState::PROGRAM_LIMIT_EXCEEDED =>
-            {
-                if msg.contains("MB, maintenance_work_mem is")
-                {
+            SqlState::DATA_EXCEPTION => {
+                if msg.contains("dimensions, not") || msg.contains("not allowed in vector") {
+                    log::error!(activity_id = activity_id; "Dimensions are not allowed in vector error.");
+                    Some((
+                        ErrorCode::BadValue as i32,
+                        Some(format!("{:?}", SqlState::DATA_EXCEPTION)),
+                        msg,
+                    ))
+                } else {
+                    Some((
+                        ErrorCode::InternalError as i32,
+                        Some(format!("{:?}", SqlState::DATA_EXCEPTION)),
+                        "An unexpected internal error has occurred",
+                    ))
+                }
+            }
+            SqlState::PROGRAM_LIMIT_EXCEEDED => {
+                if msg.contains("MB, maintenance_work_mem is") {
+                    log::error!(activity_id = activity_id; "Index creation requires resources too large to fit in the resource memory limit.");
                     Some((
                         ErrorCode::ExceededMemoryLimit as i32,
-                        Some("index creation requires resources too large to fit in the resource memory limit, please try creating index with less number of documents or creating index before inserting documents into collection".to_string()), None
+                        Some(format!("{:?}", SqlState::PROGRAM_LIMIT_EXCEEDED)),
+                        "index creation requires resources too large to fit in the resource memory limit, please try creating index with less number of documents or creating index before inserting documents into collection"
                     ))
-                }
-                else if let Some(captures) = VECTOR_INDEX_LENGTH_CONTRAINT_REGEX.captures(msg) {
-                    let dimension = captures.name("dimension").unwrap().as_str();
+                } else if msg.contains("index row size") && msg.contains("exceeds maximum") {
+                    let error_message = "Index key is too large";
+                    log::error!(activity_id = activity_id; "{error_message}");
                     Some((
-                        ErrorCode::BadValue as i32,
-                        Some(format!("field cannot have more than {} dimensions for vector index", dimension)), None
+                        ErrorCode::CannotBuildIndexKeys as i32,
+                        Some(format!("{:?}", SqlState::PROGRAM_LIMIT_EXCEEDED)),
+                        error_message,
                     ))
-                }
-                else if let Some(captures) = VECTOR_DIMENSIONS_EXCEEDED_REGEX.captures(msg) {
-                    let dimension = captures.name("dimension").unwrap().as_str();
+                } else {
                     Some((
-                        ErrorCode::BadValue as i32,
-                        Some(format!("field cannot have more than {} dimensions for vector index", dimension)), None
+                        ErrorCode::InternalError as i32,
+                        Some(format!("{:?}", SqlState::PROGRAM_LIMIT_EXCEEDED)),
+                        msg,
                     ))
                 }
-                else {
-                    Some((ErrorCode::InternalError as i32, None, None))
-                }
-            },
+            }
             SqlState::NUMERIC_VALUE_OUT_OF_RANGE
-                if msg
-                    .contains("is out of range for type halfvec") =>
+                if msg.contains("is out of range for type halfvec") =>
             {
+                let error_message =
+                    "Some values in the vector are out of range for half vector index";
+                log::error!(activity_id = activity_id; "{error_message}");
                 Some((
                     ErrorCode::BadValue as i32,
-                    Some("Some values in the vector are out of range for half vector index".to_string()), None
+                    Some(format!("{:?}", SqlState::NUMERIC_VALUE_OUT_OF_RANGE)),
+                    error_message,
                 ))
-            },
+            }
             SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE
-                if msg
-                    .contains("diskann index needs to be upgraded to version") =>
+                if msg.contains("diskann index needs to be upgraded to version") =>
             {
+                let error_message = "The diskann index needs to be upgraded to the latest version, please drop and recreate the index";
+                log::error!(activity_id = activity_id; "{error_message}");
                 Some((
                     ErrorCode::InvalidOptions as i32,
-                    Some("The diskann index needs to be upgraded to the latest version, please drop and recreate the index".to_string()), None
+                    Some(format!("{:?}", SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)),
+                    error_message,
                 ))
-            },
-            SqlState::INTERNAL_ERROR =>
-            {
-                if let Some(captures) = VECTOR_DISKANN_INDEX_LENGTH_CONTRAINT_REGEX.captures(msg)
-                {
-                    let dimension = captures.name("dimension").unwrap().as_str();
-                    Some((
-                        ErrorCode::BadValue as i32,
-                        Some(format!("field cannot have more than {} dimensions for diskann index", dimension)), None
-                    ))
-                }
-                else {
-                    Some((ErrorCode::InternalError as i32, None, None))
-                }
-            },
-            SqlState::INVALID_TEXT_REPRESENTATION
-            | SqlState::INVALID_PARAMETER_VALUE
-            | SqlState::INVALID_ARGUMENT_FOR_NTH_VALUE => {
-                Some((ErrorCode::BadValue as i32, None, None))
-            },
-            SqlState::READ_ONLY_SQL_TRANSACTION if connection_context.dynamic_configuration().is_replica_cluster().await => {
-                Some((ErrorCode::IllegalOperation as i32, Some("Cannot execute the operation on this replica cluster".to_string()), None))
-            },
-            SqlState::READ_ONLY_SQL_TRANSACTION => {
-                Some((ErrorCode::ExceededTimeLimit as i32, Some("Timed out while waiting for new primary to be elected".to_string()), Some("ExceededTimeLimit".to_string())))
-            },
-            SqlState::INSUFFICIENT_PRIVILEGE => {
-                Some((ErrorCode::Unauthorized as i32, Some("User is not authorized to perform this action".to_string()), Some("Unauthorized".to_string())))
-            },
-            SqlState::T_R_DEADLOCK_DETECTED => {
-                Some((ErrorCode::LockTimeout as i32, Some("Could not acquire lock for operation due to deadlock".to_string()), None))
             }
+            SqlState::INTERNAL_ERROR => Some((
+                ErrorCode::InternalError as i32,
+                Some(format!("{:?}", SqlState::INTERNAL_ERROR)),
+                msg,
+            )),
+            SqlState::INVALID_TEXT_REPRESENTATION => Some((
+                ErrorCode::BadValue as i32,
+                Some(format!("{:?}", SqlState::INVALID_TEXT_REPRESENTATION)),
+                msg,
+            )),
+            SqlState::INVALID_PARAMETER_VALUE => Some((
+                ErrorCode::BadValue as i32,
+                Some(format!("{:?}", SqlState::INVALID_PARAMETER_VALUE)),
+                msg,
+            )),
+            SqlState::INVALID_ARGUMENT_FOR_NTH_VALUE => Some((
+                ErrorCode::BadValue as i32,
+                Some(format!("{:?}", SqlState::INVALID_ARGUMENT_FOR_NTH_VALUE)),
+                msg,
+            )),
+            SqlState::READ_ONLY_SQL_TRANSACTION
+                if connection_context
+                    .dynamic_configuration()
+                    .is_replica_cluster()
+                    .await =>
+            {
+                let error_message = "Cannot execute the operation on this replica cluster";
+                log::error!(activity_id = activity_id; "{error_message}");
+                Some((
+                    ErrorCode::IllegalOperation as i32,
+                    Some("IllegalOperation".to_string()),
+                    error_message,
+                ))
+            }
+            SqlState::READ_ONLY_SQL_TRANSACTION => Some((
+                ErrorCode::ExceededTimeLimit as i32,
+                Some("ExceededTimeLimit".to_string()),
+                "Exceeded time limit while waiting for a new primary to be elected",
+            )),
+            SqlState::INSUFFICIENT_PRIVILEGE => Some((
+                ErrorCode::Unauthorized as i32,
+                Some("Unauthorized".to_string()),
+                "Unauthorized",
+            )),
+            SqlState::T_R_DEADLOCK_DETECTED => Some((
+                ErrorCode::WriteConflict as i32,
+                Some("Could not acquire lock for operation due to deadlock".to_string()),
+                msg,
+            )),
+            SqlState::UNDEFINED_OBJECT => Some((
+                ErrorCode::UserNotFound as i32,
+                Some("UserNotFound".to_string()),
+                msg,
+            )),
+            SqlState::DUPLICATE_OBJECT => Some((
+                ErrorCode::Location51003 as i32,
+                Some("User already exists".to_string()),
+                msg,
+            )),
             _ => None,
         }
     }
 
     /// Corresponds to the PG ErrorCode 0000Y.
-    /// Smallest value of the documentdb backend error (DocumentDBError.ok).
+    /// Smallest value of the documentdb backend error.
     pub const API_ERROR_CODE_MIN: i32 = 687865856;
 
     /// Corresponds to the PG ErrorCode 000PY.

@@ -83,6 +83,9 @@ pub struct ExplainPlan {
     #[serde(rename = "Group Key")]
     pub group_key: Option<Vec<String>>,
 
+    #[serde(rename = "Heap Fetches")]
+    pub heap_fetches: Option<i64>,
+
     #[serde(rename = "Index Cond")]
     pub index_condition: Option<String>,
 
@@ -133,6 +136,9 @@ pub struct ExplainPlan {
     #[serde(rename = "Sort Key")]
     pub sort_keys: Option<Vec<String>>,
 
+    #[serde(rename = "Presorted Key")]
+    pub presorted_key: Option<Vec<String>>,
+
     #[serde(rename = "Sort Method")]
     pub sort_method: Option<String>,
 
@@ -141,6 +147,12 @@ pub struct ExplainPlan {
 
     #[serde(rename = "Sort Space Used")]
     pub sort_space_used: Option<i64>,
+
+    #[serde(rename = "Startup Cost")]
+    pub startup_cost: Option<f64>,
+
+    #[serde(rename = "Total Cost")]
+    pub total_cost: Option<f64>,
 
     #[serde(rename = "Function Name")]
     pub function_name: Option<String>,
@@ -162,6 +174,9 @@ pub struct ExplainPlan {
 
     #[serde(rename = "Workers Launched")]
     pub workers_launched: Option<i64>,
+
+    #[serde(rename = "IndexDetails")]
+    pub index_details: Option<Vec<IndexDetails>>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -170,4 +185,16 @@ pub struct VectorSearchParams {
     pub n_probes: Option<f64>,
     pub ef_search: Option<f64>,
     pub l_search: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexDetails {
+    pub index_name: Option<String>,
+    pub is_multi_key: Option<bool>,
+    pub index_bounds: Option<Vec<String>>,
+    pub inner_scan_loops: Option<i64>,
+    pub scan_key_details: Option<Vec<String>>,
+    pub scan_type: Option<String>,
+    pub num_duplicates: Option<i64>,
 }

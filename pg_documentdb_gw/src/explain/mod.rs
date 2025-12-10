@@ -11,16 +11,14 @@ use std::{cmp::Ordering, collections::HashMap, str::FromStr};
 
 use async_recursion::async_recursion;
 use bson::{rawdoc, Document, RawArrayBuf, RawBson, RawDocument, RawDocumentBuf};
-use log::{log_enabled, warn};
 use model::*;
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use tokio_postgres::types::Type;
 
 use crate::{
-    context::ConnectionContext,
+    context::{ConnectionContext, RequestContext},
     error::{DocumentDBError, Result},
-    postgres::{PgDocument, Timeout},
+    postgres::PgDataClient,
     protocol::OK_SUCCEEDED,
     requests::{Request, RequestInfo, RequestType},
     responses::{RawResponse, Response},
@@ -87,6 +85,7 @@ static AGGREGATION_STAGE_NAME_MAP: Lazy<HashMap<&'static str, AggregationStage>>
             ("WORKER_PARTIAL_AGG", ("$group", None)),
             ("UNIONWITH", ("$unionWith", None)),
             ("DOCUMENTS_AGG", ("$documents", None)),
+            ("COLLSTATS_AGG", ("$collStats", None)),
         ])
     });
 
@@ -110,16 +109,23 @@ fn write_output_stage(
 /// A command with explain:true, or an explain command wrapping a sub command
 #[async_recursion]
 pub async fn process_explain(
-    request: &Request<'_>,
-    request_info: &RequestInfo<'_>,
+    request_context: &mut RequestContext<'_>,
     verbosity: Option<Verbosity>,
-    context: &ConnectionContext,
+    connection_context: &ConnectionContext,
+    pg_data_client: &impl PgDataClient,
 ) -> Result<Response> {
-    if let Some(result) = request.document().into_iter().next() {
+    // Extract the first command from the request document
+    let first_command = {
+        let request = request_context.payload;
+        request.document().into_iter().next()
+    };
+
+    if let Some(result) = first_command {
         let result = result?;
 
-        // db.runCommand with Explain does not provide verbosity in some JSTests - we need to default to QueryPlanner here.
+        // Default to QueryPlanner here, as Default tends to be too brief
         let verbosity = verbosity.unwrap_or_else(|| {
+            let request = request_context.payload;
             request
                 .document()
                 .get_str("verbosity")
@@ -129,13 +135,26 @@ pub async fn process_explain(
         match result.0 {
             "explain" => {
                 if let Some(explain_doc) = result.1.as_document() {
-                    // Recurse with the sub command
-                    process_explain(
-                        &Request::Raw(RequestType::Explain, explain_doc, request.extra()),
-                        request_info,
+                    let new_request = Request::Raw(
+                        RequestType::Explain,
+                        explain_doc,
+                        request_context.payload.extra(),
+                    );
+
+                    let mut new_request_context = RequestContext {
+                        activity_id: request_context.activity_id,
+                        payload: &new_request,
+                        info: request_context.info,
+                        tracker: request_context.tracker,
+                    };
+
+                    // Recursive call with the unwrapped command
+                    Box::pin(process_explain(
+                        &mut new_request_context,
                         Some(verbosity),
-                        context,
-                    )
+                        connection_context,
+                        pg_data_client,
+                    ))
                     .await
                 } else {
                     Err(DocumentDBError::bad_value(
@@ -143,10 +162,46 @@ pub async fn process_explain(
                     ))
                 }
             }
-            "aggregate" => run_explain(request, request_info, "pipeline", verbosity, context).await,
-            "find" => run_explain(request, request_info, "find", verbosity, context).await,
-            "count" => run_explain(request, request_info, "count", verbosity, context).await,
-            "distinct" => run_explain(request, request_info, "distinct", verbosity, context).await,
+            "aggregate" => {
+                run_explain(
+                    request_context,
+                    "pipeline",
+                    verbosity,
+                    connection_context,
+                    pg_data_client,
+                )
+                .await
+            }
+            "find" => {
+                run_explain(
+                    request_context,
+                    "find",
+                    verbosity,
+                    connection_context,
+                    pg_data_client,
+                )
+                .await
+            }
+            "count" => {
+                run_explain(
+                    request_context,
+                    "count",
+                    verbosity,
+                    connection_context,
+                    pg_data_client,
+                )
+                .await
+            }
+            "distinct" => {
+                run_explain(
+                    request_context,
+                    "distinct",
+                    verbosity,
+                    connection_context,
+                    pg_data_client,
+                )
+                .await
+            }
             _ => Err(DocumentDBError::bad_value(
                 "Unrecognized explain command.".to_string(),
             )),
@@ -182,68 +237,23 @@ impl Verbosity {
 }
 
 async fn run_explain(
-    request: &Request<'_>,
-    request_info: &RequestInfo<'_>,
+    request_context: &mut RequestContext<'_>,
     query_base: &str,
     verbosity: Verbosity,
     connection_context: &ConnectionContext,
+    pg_data_client: &impl PgDataClient,
 ) -> Result<Response> {
-    let analyze = if !matches!(
-        verbosity,
-        Verbosity::QueryPlanner | Verbosity::AllShardsQueryPlan
-    ) {
-        "True"
-    } else {
-        "False"
-    };
-    let query = connection_context
-        .service_context
-        .query_catalog()
-        .explain(analyze, query_base);
+    let request = request_context.payload;
+    let request_info = request_context.info;
+
+    let (explain_response, query) = pg_data_client
+        .execute_explain(request_context, query_base, verbosity, connection_context)
+        .await?;
 
     let dynamic_config = connection_context.dynamic_configuration();
-    let results = if matches!(
-        verbosity,
-        Verbosity::AllShardsQueryPlan | Verbosity::AllShardsExecution
-    ) {
-        let mut pg = connection_context.pg_without_transaction(false).await?;
-        let t = pg.get_inner().transaction().await?;
-        let explain_config_query = connection_context
-            .service_context
-            .query_catalog()
-            .set_explain_all_tasks_true();
-        if !explain_config_query.is_empty() {
-            t.batch_execute(explain_config_query).await?;
-        }
-        let stmt = t
-            .prepare_typed_cached(&query, &[Type::TEXT, Type::BYTEA])
-            .await?;
-        t.query(
-            &stmt,
-            &[&request_info.db()?, &PgDocument(request.document())],
-        )
-        .await?
-    } else {
-        connection_context
-            .pg()
-            .await?
-            .query_db_bson(
-                &query,
-                request_info.db()?,
-                &PgDocument(request.document()),
-                Timeout::transaction(request_info.max_time_ms),
-            )
-            .await?
-    };
 
-    match results.first() {
-        Some(row) => {
-            let content: serde_json::Value = row.try_get(0)?;
-
-            if log_enabled!(log::Level::Debug) {
-                log::debug!("Backend Explain result: {}", content)
-            }
-
+    match explain_response {
+        Some(content) => {
             let explain_content = if dynamic_config.enable_developer_explain().await {
                 Some(convert_to_bson(content.clone()))
             } else {
@@ -283,13 +293,6 @@ async fn run_explain(
                         request.document(),
                         request_info,
                     ),
-                )
-            }
-
-            if log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "Explain result: {}",
-                    explain.to_document().unwrap_or_default()
                 )
             }
 
@@ -343,7 +346,7 @@ async fn transform_explain(
     query_catalog: &QueryCatalog,
 ) -> Result<RawDocumentBuf> {
     let mut plans: Vec<PostgresExplain> = serde_json::from_value(explain_content).map_err(|e| {
-        DocumentDBError::internal_error(format!("Failed to parse backend explain plan: {}", e))
+        DocumentDBError::internal_error(format!("Failed to parse backend explain plan: {e}"))
     })?;
 
     let plan = plans.remove(0);
@@ -363,11 +366,11 @@ async fn transform_explain(
 
     let plan = try_simplify_plan(plan, is_unsharded, query_base, query_catalog);
 
-    let namespace = format!("{}.{}", db, collection);
+    let collection_path = format!("{db}.{collection}");
     let mut base_result = if subtype == RequestType::Aggregate {
-        aggregate_explain(plan, &namespace, verbosity, query_catalog)
+        aggregate_explain(plan, &collection_path, verbosity, query_catalog)
     } else {
-        cursor_explain(plan, &namespace, false, verbosity, query_catalog)
+        cursor_explain(plan, &collection_path, false, verbosity, query_catalog)
     };
 
     if let Some(planning_time) = planning_time {
@@ -765,6 +768,13 @@ fn get_stage_from_plan(
         .index_name
         .as_ref()
         .is_some_and(|name| name.starts_with("collection_pk") || name == "_id_")
+        && plan.index_condition.as_ref().is_some_and(|cond| {
+            !cond.as_str().contains("object_id")
+                && query_diagnostics::is_unsharded_query(
+                    plan.relation_name.as_deref().unwrap_or_default(),
+                    cond.as_str(),
+                )
+        })
     {
         return ("COLLSCAN".to_owned(), None);
     }
@@ -797,7 +807,9 @@ fn get_stage_from_plan(
                     .to_owned(),
                     Some("IXSCAN"),
                 )
-            } else if parent_stage.is_some_and(|s| s == "FETCH") {
+            } else if parent_stage.is_some_and(|s| s == "FETCH")
+                || plan.node_type.as_str() == "Bitmap Index Scan"
+            {
                 ("IXSCAN".to_owned(), None)
             } else {
                 ("FETCH".to_owned(), Some("IXSCAN"))
@@ -857,7 +869,14 @@ fn get_stage_from_plan(
         "Unique" => ("UNIQUE".to_owned(), None),
         "Nested Loop" => {
             if let Some(join) = plan.join_type.as_ref() {
-                if join == "Left" {
+                if join == "Left"
+                    || (join == "Inner"
+                        && plan
+                            .output
+                            .as_ref()
+                            .map(|o| o.len() == 1 && o[0].contains("bson_dollar_merge_documents"))
+                            .unwrap_or_default())
+                {
                     ("LOOKUP".to_owned(), None)
                 } else {
                     (join.to_uppercase() + "_JOIN", None)
@@ -912,7 +931,7 @@ fn get_stage_from_plan(
                     }
                 }
             }
-            warn!("Unknown stage aggregate found");
+            log::warn!("Unknown stage aggregate found");
             ("GENERIC_AGGREGATE".to_owned(), None)
         }
         "Gather" => ("Parallel Merge".to_owned(), None),
@@ -930,16 +949,17 @@ fn get_stage_from_plan(
                             ("SHARD_MERGE".to_owned(), None)
                         }
                     }
+                    "DocumentDBApiExplainQueryScan" => ("ExplainWrapper".to_owned(), None),
                     scan_type if query_catalog.scan_types().contains(&scan_type.to_string()) => {
                         ("FETCH".to_owned(), None)
                     }
                     _ => {
-                        warn!("Unknown scan: {}", cpp);
+                        log::warn!("Unknown scan: {cpp}");
                         ("".to_owned(), None)
                     }
                 }
             } else {
-                warn!("Custom scan without provider.");
+                log::warn!("Custom scan without provider.");
                 ("".to_owned(), None)
             }
         }
@@ -960,10 +980,17 @@ fn get_stage_from_plan(
                             return ("DOCUMENTS_AGG".to_owned(), None);
                         }
                     }
+                    "coll_stats_aggregation" => {
+                        if parent_stage.is_some_and(|x| x == "COUNT") {
+                            return ("RECORD_STORE_FAST_COUNT".to_owned(), None);
+                        } else {
+                            return ("COLLSTATS_AGG".to_owned(), None);
+                        }
+                    }
                     _ => {}
                 }
             };
-            warn!(
+            log::warn!(
                 "Unknown function found: {}",
                 plan.function_name.as_deref().unwrap_or("None")
             );
@@ -989,7 +1016,7 @@ fn get_stage_from_plan(
             }
         }
         _ => {
-            warn!("Unkown stage found: {}", plan.node_type);
+            log::warn!("Unknown stage found: {}", plan.node_type);
             ("COLLSCAN".to_owned(), None)
         }
     }
@@ -997,7 +1024,7 @@ fn get_stage_from_plan(
 
 fn aggregate_explain(
     mut plan: ExplainPlan,
-    namespace: &str,
+    collection_path: &str,
     verbosity: Verbosity,
     query_catalog: &QueryCatalog,
 ) -> RawDocumentBuf {
@@ -1019,7 +1046,7 @@ fn aggregate_explain(
     );
 
     if shard_count == 0 {
-        return aggregate_explain_core(plan, agg_type, namespace, verbosity, query_catalog);
+        return aggregate_explain_core(plan, agg_type, collection_path, verbosity, query_catalog);
     }
 
     let result = determine_pipeline_split(&mut plan);
@@ -1035,11 +1062,11 @@ fn aggregate_explain(
             for shard_plan in shard_parts.into_iter() {
                 i += 1;
                 shards_explain.append(
-                    format!("shard_{}", i),
+                    format!("shard_{i}"),
                     aggregate_explain_core(
                         shard_plan.clone(),
                         agg_type,
-                        namespace,
+                        collection_path,
                         verbosity,
                         query_catalog,
                     ),
@@ -1048,18 +1075,18 @@ fn aggregate_explain(
             for error in errors {
                 i += 1;
 
-                shards_explain.append(format!("shard_{}", i), rawdoc! {"error": error});
+                shards_explain.append(format!("shard_{i}"), rawdoc! {"error": error});
             }
 
             return rawdoc! {
                 "splitPipeline": {
-                    "mergerPart": aggregate_explain_core(plan, AggregationType::StageBasedAggregation, namespace, verbosity, query_catalog)
+                    "mergerPart": aggregate_explain_core(plan, AggregationType::StageBasedAggregation, collection_path, verbosity, query_catalog)
                 },
                 "shards":  shards_explain
             };
         }
     }
-    aggregate_explain_core(plan, agg_type, namespace, verbosity, query_catalog)
+    aggregate_explain_core(plan, agg_type, collection_path, verbosity, query_catalog)
 }
 
 fn determine_pipeline_split(
@@ -1096,7 +1123,7 @@ fn determine_pipeline_split(
 fn aggregate_explain_core(
     plan: ExplainPlan,
     agg_type: AggregationType,
-    namespace: &str,
+    collection_path: &str,
     verbosity: Verbosity,
     query_catalog: &QueryCatalog,
 ) -> RawDocumentBuf {
@@ -1104,7 +1131,7 @@ fn aggregate_explain_core(
         AggregationType::SimpleAggregation => {
             rawdoc! {
                 "stages": [
-                    { "$cursor": cursor_explain(plan, namespace, false, verbosity, query_catalog) }
+                    { "$cursor": cursor_explain(plan, collection_path, false, verbosity, query_catalog) }
                 ]
             }
         }
@@ -1114,8 +1141,13 @@ fn aggregate_explain_core(
             let bufs: Vec<RawDocumentBuf> = processed_stages
                 .into_iter()
                 .map(|(documentdb_name, plan, _, f)| {
-                    let mut doc =
-                        cursor_explain(plan.clone(), namespace, true, verbosity, query_catalog);
+                    let mut doc = cursor_explain(
+                        plan.clone(),
+                        collection_path,
+                        true,
+                        verbosity,
+                        query_catalog,
+                    );
                     if let Some(f) = f {
                         f(&plan, &mut doc, query_catalog)
                     }
@@ -1148,7 +1180,7 @@ fn classify_stages(
     let (stage_name, _) = get_stage_from_plan(&plan, prior_stage, query_catalog);
 
     // base case - if we see a table it becomes terminal - everything below gets put in here.
-    if plan.relation_name.is_some() {
+    if plan.relation_name.is_some() || stage_name == "ExplainWrapper" {
         processed_stages.push(("$cursor".to_owned(), plan, stage_name, None));
         return None;
     }
@@ -1188,15 +1220,12 @@ fn classify_stages(
     }
 
     if prior_stage.is_none() {
-        warn!(
-            "Found residual unparented aggregation stage {0}",
-            stage_name
-        );
+        log::warn!("Found residual unparented aggregation stage {stage_name}");
         processed_stages.push(("$root".to_owned(), plan, stage_name, None));
         return None;
     }
 
-    warn!("Unknown aggregation stage {}", stage_name);
+    log::warn!("Unknown aggregation stage {stage_name}");
     Some(plan)
 }
 
@@ -1220,7 +1249,7 @@ fn is_aggregation_stage_skippable(
         }
 
         // no filters, no output, no inner plan - ignorable.
-        if plan.output.as_ref().map_or(true, |o| o.is_empty()) {
+        if plan.output.as_ref().is_none_or(|o| o.is_empty()) {
             return true;
         }
 
@@ -1229,7 +1258,7 @@ fn is_aggregation_stage_skippable(
                 && plan
                     .alias
                     .as_ref()
-                    .is_some_and(|a| o[0] == format!("{}.document", a))
+                    .is_some_and(|a| o[0] == format!("{a}.document"))
             {
                 return true;
             }
@@ -1275,13 +1304,13 @@ fn get_total_examined(plan: &ExplainPlan) -> (i64, i64) {
 
 fn query_planner(
     plan: ExplainPlan,
-    namespace: &str,
+    collection_path: &str,
     is_aggregation_stage: bool,
     query_catalog: &QueryCatalog,
 ) -> RawDocumentBuf {
     let mut writer = RawDocumentBuf::new();
     if plan.distributed_plan.is_none() && !is_aggregation_stage {
-        writer.append("namespace", namespace)
+        writer.append("namespace", collection_path)
     }
     let result = walk_plan_stage(
         plan,
@@ -1291,20 +1320,88 @@ fn query_planner(
             let mut doc = rawdoc! {
                 "stage": stage_name,
             };
-            if let Some(index_name) = plan.index_name.as_deref() {
-                doc.append("indexName", index_name);
+
+            if stage_name != "FETCH" {
+                if let Some(index_name) = plan.index_name.as_deref() {
+                    doc.append("indexName", index_name);
+                }
+
+                if let Some(direction) = plan.scan_direction.as_deref() {
+                    doc.append("direction", direction);
+                }
+
+                if plan.node_type.contains("bitmap") {
+                    doc.append("isBitmap", true);
+                }
+
+                if plan.node_type == "Index Only Scan" {
+                    doc.append("isIndexOnlyScan", true);
+                }
+
+                if plan.index_details.is_some() {
+                    let mut arr = RawArrayBuf::new();
+                    for detail in plan.index_details.as_ref().unwrap() {
+                        if detail.index_name.as_deref() != plan.index_name.as_deref() {
+                            continue;
+                        }
+
+                        let mut index_doc = rawdoc! {};
+                        if let Some(index_name) = detail.index_name.as_deref() {
+                            index_doc.append("indexName", index_name);
+                        }
+
+                        if let Some(multi_key_val) = detail.is_multi_key {
+                            index_doc.append("isMultiKey", multi_key_val);
+                        }
+
+                        if let Some(index_bounds) = detail.index_bounds.as_ref() {
+                            let mut bounds_arr = RawArrayBuf::new();
+                            index_bounds.iter().for_each(|key| {
+                                bounds_arr.push(key.as_str());
+                            });
+                            index_doc.append("bounds", bounds_arr);
+                        }
+
+                        arr.push(index_doc);
+                    }
+
+                    doc.append("indexUsage", arr);
+                }
             }
 
             if let Some(page_size) = plan.page_size {
                 doc.append("page_size", smallest_from_i64(page_size));
             }
 
-            if let Some(direction) = plan.scan_direction.as_deref() {
-                doc.append("direction", direction);
+            if let Some(startup_cost) = plan.startup_cost {
+                doc.append("startupCost", startup_cost);
             }
 
-            if stage_name == "IXSCAN" && plan.node_type.contains("bitmap") {
-                doc.append("isBitmap", true);
+            if let Some(total_cost) = plan.total_cost {
+                doc.append("totalCost", total_cost);
+            }
+
+            if let Some(sort_keys) = plan.sort_keys.as_ref() {
+                let mut sort_keys_arr = RawArrayBuf::new();
+                for order_string in sort_keys {
+                    if let Some(order_value) =
+                        query_diagnostics::get_sort_conditions(order_string, query_catalog)
+                    {
+                        sort_keys_arr.push(order_value);
+                    }
+                }
+                if !sort_keys_arr.is_empty() {
+                    doc.append("sortKey", sort_keys_arr);
+                }
+
+                doc.append("sortKeysCount", sort_keys.len() as i32);
+            }
+            if let Some(presorted_keys) = plan.presorted_key.as_ref() {
+                doc.append("presortedKeysCount", presorted_keys.len() as i32);
+            }
+
+            if stage_name != "FETCH" && plan.node_type == "Index Scan" && plan.order_by.is_some() {
+                doc.append("hasOrderBy", true);
             }
 
             if let Some(vector_search_params) = plan.vector_search_custom_params.as_deref() {
@@ -1323,10 +1420,7 @@ fn query_planner(
                     }
                     doc.append("cosmosSearchCustomParams", vector_search)
                 } else {
-                    log::error!(
-                        "Failed to parse vector search params: {}",
-                        vector_search_params
-                    )
+                    log::error!("Failed to parse vector search params: {vector_search_params}")
                 }
             }
 
@@ -1410,9 +1504,53 @@ fn execution_stats(plan: ExplainPlan, query_catalog: &QueryCatalog) -> RawDocume
                 ),
             )
         }
-        if let Some(index_name) = plan.index_name.as_deref() {
-            doc.append("indexName", index_name)
+
+        if stage_name != "FETCH" {
+            if let Some(index_name) = plan.index_name.as_deref() {
+                doc.append("indexName", index_name)
+            }
+
+            if let Some(heap_fetches) = plan.heap_fetches {
+                doc.append("totalDocsAnalyzed", smallest_from_i64(heap_fetches));
+            }
+
+            if plan.index_details.is_some() {
+                let mut arr = RawArrayBuf::new();
+                for detail in plan.index_details.as_ref().unwrap() {
+                    let mut index_doc = rawdoc! {};
+                    if let Some(index_name) = detail.index_name.as_deref() {
+                        index_doc.append("indexName", index_name);
+                    }
+
+                    if let Some(inner_scan_loops) = detail.inner_scan_loops {
+                        index_doc.append("scanLoops", smallest_from_i64(inner_scan_loops));
+                    }
+
+                    if let Some(scan_type) = detail.scan_type.as_deref() {
+                        index_doc.append("scanType", scan_type);
+                    }
+
+                    if let Some(num_duplicates) = detail.num_duplicates {
+                        if num_duplicates > 0 {
+                            index_doc.append("numDuplicates", smallest_from_i64(num_duplicates));
+                        }
+                    }
+
+                    if let Some(scan_key_details) = detail.scan_key_details.as_ref() {
+                        let mut scan_key_arr = RawArrayBuf::new();
+                        scan_key_details.iter().for_each(|key| {
+                            scan_key_arr.push(key.as_str());
+                        });
+                        index_doc.append("scanKeys", scan_key_arr);
+                    }
+
+                    arr.push(index_doc);
+                }
+
+                doc.append("indexUsage", arr);
+            }
         }
+
         if stage_name == "TEXT_MATCH" {
             doc.append("textIndexVersion", 3)
         }
@@ -1452,6 +1590,7 @@ fn execution_stats(plan: ExplainPlan, query_catalog: &QueryCatalog) -> RawDocume
         if let Some(v) = plan.workers_launched {
             doc.append("parallelWorkers", smallest_from_i64(v))
         }
+
         doc
     });
     rawdoc! {
@@ -1460,6 +1599,16 @@ fn execution_stats(plan: ExplainPlan, query_catalog: &QueryCatalog) -> RawDocume
         "totalDocsExamined": total_rows_examined,
         "totalKeysExamined": total_keys_examined,
         "executionStages": stages
+    }
+}
+
+fn distribute_index_details(plan: &mut ExplainPlan, index_details: Option<Vec<IndexDetails>>) {
+    plan.index_details = index_details;
+
+    if let Some(inner_plans) = plan.inner_plans.as_mut() {
+        for inner_plan in inner_plans {
+            distribute_index_details(inner_plan, plan.index_details.clone());
+        }
     }
 }
 
@@ -1475,6 +1624,14 @@ fn skip_stage(plan: ExplainPlan, query_catalog: &QueryCatalog) -> ExplainPlan {
         let mut p = plan.inner_plans.expect("Checked").remove(0);
         p.alias = plan.alias;
         p
+    } else if plan.node_type == "Custom Scan"
+        && plan.custom_plan_provider.as_deref() == Some("DocumentDBApiExplainQueryScan")
+        && plan.inner_plans.as_ref().is_some_and(|ip| ip.len() == 1)
+    {
+        let mut new_plan = plan.inner_plans.expect("Checked").remove(0);
+        new_plan.output = plan.output;
+        distribute_index_details(&mut new_plan, plan.index_details.clone());
+        new_plan
     } else {
         plan
     }
@@ -1560,13 +1717,13 @@ fn walk_plan_stage_core(
 
 fn cursor_explain(
     plan: ExplainPlan,
-    namespace: &str,
+    collection_path: &str,
     is_aggregation_stage: bool,
     verbosity: Verbosity,
     query_catalog: &QueryCatalog,
 ) -> RawDocumentBuf {
     let mut doc = rawdoc! {
-        "queryPlanner": query_planner(plan.clone(), namespace, is_aggregation_stage, query_catalog),
+        "queryPlanner": query_planner(plan.clone(), collection_path, is_aggregation_stage, query_catalog),
     };
     if matches!(
         verbosity,

@@ -13,6 +13,7 @@ pub struct QueryCatalog {
     // auth.rs
     pub authenticate_with_scram_sha256: String,
     pub salt_and_iterations: String,
+    pub authenticate_with_token: String,
 
     // dataapi.rs (Not needed for OSS)
     pub authenticate_with_pwd: String,
@@ -26,9 +27,10 @@ pub struct QueryCatalog {
     // version.rs
     pub extension_versions: String,
 
-    // explain
+    // explain/mod.rs
     pub explain: String, // Has 2 params
     pub set_explain_all_tasks_true: String,
+    pub set_explain_all_plans_true: String,
     pub find_coalesce: String,
     pub find_operator: String,
     pub find_bson_text_meta_qual: String,
@@ -38,30 +40,32 @@ pub struct QueryCatalog {
     pub bson_dollar_project_output_regex: String,
     pub index_condition_split_regex: String,
     pub runtime_condition_split_regex: String,
+    pub sort_condition_split_regex: String,
     pub single_index_condition_regex: String,
     pub api_catalog_name_regex: String,
     pub output_count_regex: String,
+    pub output_bson_count_aggregate: String,
+    pub output_bson_command_count_aggregate: String,
 
     // client.rs
     pub set_search_path_and_timeout: String,
 
     // cursor.rs
     pub cursor_get_more: String,
+    pub kill_cursors: String,
 
-    // delete.rs
+    // data_description.rs
+    pub create_collection_view: String,
     pub drop_database: String,
     pub drop_collection: String,
-    pub delete: String,
     pub set_allow_write: String,
+    pub shard_collection: String,
+    pub rename_collection: String,
+    pub coll_mod: String,
+    pub unshard_collection: String,
 
-    // indexing.rs
-    pub create_indexes_background: String,
-    pub check_build_index_status: String,
-    pub re_index: String,
-    pub drop_indexes: String,
-    pub list_indexes_cursor_first_page: String,
-
-    // process.rs
+    // data_management.rs
+    pub delete: String,
     pub find_cursor_first_page: String,
     pub insert: String,
     pub aggregate_cursor_first_page: String,
@@ -72,20 +76,32 @@ pub struct QueryCatalog {
     pub find_and_modify: String,
     pub distinct_query: String,
     pub count_query: String,
-    pub create_collection_view: String,
     pub coll_stats: String,
     pub db_stats: String,
-    pub shard_collection: String,
-    pub rename_collection: String,
     pub current_op: String,
-    pub coll_mod: String,
     pub get_parameter: String,
+    pub compact: String,
+    pub kill_op: String,
+
+    // indexing.rs
+    pub create_indexes_background: String,
+    pub check_build_index_status: String,
+    pub re_index: String,
+    pub drop_indexes: String,
+    pub list_indexes_cursor_first_page: String,
 
     // user.rs
     pub create_user: String,
     pub drop_user: String,
     pub update_user: String,
     pub users_info: String,
+    pub connection_status: String,
+
+    // roles.rs
+    pub create_role: String,
+    pub update_role: String,
+    pub drop_role: String,
+    pub roles_info: String,
 
     // tests
     pub create_db_user: String,
@@ -101,6 +117,10 @@ impl QueryCatalog {
 
     pub fn salt_and_iterations(&self) -> &str {
         &self.salt_and_iterations
+    }
+
+    pub fn authenticate_with_token(&self) -> &str {
+        &self.authenticate_with_token
     }
 
     // Dataapi getters
@@ -141,6 +161,10 @@ impl QueryCatalog {
         &self.set_explain_all_tasks_true
     }
 
+    pub fn set_explain_all_plans_true(&self) -> &str {
+        &self.set_explain_all_plans_true
+    }
+
     pub fn find_coalesce(&self) -> &str {
         &self.find_coalesce
     }
@@ -170,6 +194,10 @@ impl QueryCatalog {
         &self.runtime_condition_split_regex
     }
 
+    pub fn sort_condition_split_regex(&self) -> &str {
+        &self.sort_condition_split_regex
+    }
+
     pub fn single_index_condition_regex(&self) -> &str {
         &self.single_index_condition_regex
     }
@@ -182,10 +210,19 @@ impl QueryCatalog {
         &self.output_count_regex
     }
 
+    pub fn output_bson_count_aggregate(&self) -> &str {
+        &self.output_bson_count_aggregate
+    }
+
+    pub fn output_bson_command_count_aggregate(&self) -> &str {
+        &self.output_bson_command_count_aggregate
+    }
+
     // Client getters
-    pub fn set_search_path_and_timeout(&self, timeout: &str) -> String {
+    pub fn set_search_path_and_timeout(&self, timeout: &str, transaction_timeout: &str) -> String {
         self.set_search_path_and_timeout
             .replace("{timeout}", timeout)
+            .replace("{transaction_timeout}", transaction_timeout)
     }
 
     // Cursor getters
@@ -322,6 +359,26 @@ impl QueryCatalog {
         &self.users_info
     }
 
+    pub fn connection_status(&self) -> &str {
+        &self.connection_status
+    }
+
+    pub fn create_role(&self) -> &str {
+        &self.create_role
+    }
+
+    pub fn update_role(&self) -> &str {
+        &self.update_role
+    }
+
+    pub fn drop_role(&self) -> &str {
+        &self.drop_role
+    }
+
+    pub fn roles_info(&self) -> &str {
+        &self.roles_info
+    }
+
     pub fn create_db_user(&self, user: &str, pass: &str) -> String {
         self.create_db_user
             .replace("{user}", user)
@@ -331,6 +388,22 @@ impl QueryCatalog {
     pub fn scan_types(&self) -> &Vec<String> {
         &self.scan_types
     }
+
+    pub fn unshard_collection(&self) -> &str {
+        &self.unshard_collection
+    }
+
+    pub fn compact(&self) -> &str {
+        &self.compact
+    }
+
+    pub fn kill_op(&self) -> &str {
+        &self.kill_op
+    }
+
+    pub fn kill_cursors(&self) -> &str {
+        &self.kill_cursors
+    }
 }
 
 pub fn create_query_catalog() -> QueryCatalog {
@@ -338,46 +411,50 @@ pub fn create_query_catalog() -> QueryCatalog {
             // auth.rs
             authenticate_with_scram_sha256: "SELECT documentdb_api_internal.authenticate_with_scram_sha256($1, $2, $3)".to_string(),
             salt_and_iterations: "SELECT documentdb_api_internal.scram_sha256_get_salt_and_iterations($1)".to_string(),
+            authenticate_with_token: "SELECT documentdb_api_internal.authenticate_token($1, $2)".to_string(),
 
             // dynamic.rs
             pg_settings: "SELECT name, setting FROM pg_settings WHERE name LIKE 'documentdb.%' OR name IN ('max_connections', 'default_transaction_read_only')".to_string(),
             pg_is_in_recovery: "SELECT pg_is_in_recovery()".to_string(),
 
-            // explain
+            // explain/mod.rs
             explain: "EXPLAIN (FORMAT JSON, ANALYZE {analyze}, VERBOSE True, BUFFERS {analyze}, TIMING {analyze}) SELECT document FROM documentdb_api_catalog.bson_aggregation_{query_base}($1, $2)".to_string(),
+            set_explain_all_plans_true: "SELECT set_config('documentdb.enableExtendedExplainPlans', 'true', true);".to_string(),
             find_coalesce: "COALESCE(documentdb_api_catalog.bson_array_agg".to_string(),
             find_operator: "OPERATOR(documentdb_api_catalog.@#%)".to_string(),
             find_bson_text_meta_qual: "documentdb_api_catalog.bson_text_meta_qual".to_string(),
             find_bson_repath_and_build: "documentdb_api_catalog.bson_repath_and_build".to_string(),
 
             // query_diagnostics.rs
-            bson_dollar_project_output_regex: "(documentdb_api_catalog.)?bson_dollar_([^\\(]+)\\([^,]+, 'BSONHEX([\\w\\d]+)'::documentdb_api_catalog.bson".to_string(),
-            index_condition_split_regex: "\\(?((\\s+AND\\s+)?(?<expr>\\S+ (OPERATOR\\(\\S+\\)|(@\\S+)) '[^']+'::(documentdb_api_catalog.)?bson))+\\)?".to_string(),
-            runtime_condition_split_regex: "\\(?((\\s+AND|OR\\s+)?(?<expr>\\S+ (OPERATOR\\(\\S+\\)|(@\\S+)) '[^']+'::(documentdb_api_catalog.)?bson))+\\)?".to_string(),
+            bson_dollar_project_output_regex: "(documentdb_api_catalog.)?bson_dollar_([^\\(]+)\\([^,]+, 'BSONHEX([\\w\\d]+)'::documentdb_core.bson".to_string(),
+            index_condition_split_regex: "\\(?((\\s+AND\\s+)?(?<expr>\\S+ (OPERATOR\\(\\S+\\)|(@\\S+)) '[^']+'::(documentdb_core.)?bson))+\\)?".to_string(),
+            runtime_condition_split_regex: "\\(?((\\s+AND|OR\\s+)?(?<expr>\\S+ (OPERATOR\\(\\S+\\)|(@\\S+)) '[^']+'::(documentdb_core.)?bson))+\\)?".to_string(),
+            sort_condition_split_regex: "(documentdb_api_catalog\\.)?bson_orderby\\(([^,]+), 'BSONHEX([\\w\\d]+)'::documentdb_core.bson\\)".to_string(),
             single_index_condition_regex: "(OPERATOR\\()?(documentdb_api_catalog\\.)?(?<operator>@[^\\)\\s]+)\\)?\\s+'BSONHEX(?<queryBson>\\S+)'".to_string(),
             api_catalog_name_regex: "documentdb_api_catalog.".to_string(),
-            output_count_regex: "BSONSUM('{ \"\" : { \"$numberInt\" : \"1\" } }'::documentdb_api_catalog.bson)".to_string(),
+            output_count_regex: "BSONSUM('{ \"\" : { \"$numberInt\" : \"1\" } }'::documentdb_core.bson)".to_string(),
+            output_bson_count_aggregate: "bsoncount(1)".to_string(),
+            output_bson_command_count_aggregate: "bsoncommandcount(1)".to_string(),
 
             // cursor.rs
             cursor_get_more: "SELECT cursorPage, continuation FROM documentdb_api.cursor_get_more($1, $2, $3)".to_string(),
+            kill_cursors: "SELECT documentdb_api_internal.delete_cursors($1)".to_string(),
 
             // client.rs
-            set_search_path_and_timeout: "SET search_path = documentdb_api_catalog,documentdb_api,public;SET statement_timeout = {timeout}".to_string(),
+            set_search_path_and_timeout: "-c search_path=documentdb_api_catalog,documentdb_api,public -c statement_timeout={timeout} -c idle_in_transaction_session_timeout={transaction_timeout}".to_string(),
 
-            // delete.rs
+            // data_description.rs
             drop_database: "SELECT documentdb_api.drop_database($1)".to_string(),
             drop_collection: "SELECT documentdb_api.drop_collection($1, $2)".to_string(),
-            delete: "SELECT * FROM documentdb_api.delete($1, $2, $3, NULL)".to_string(),
             set_allow_write: "SET LOCAL documentdb.IsPgReadOnlyForDiskFull to false; SET transaction read write".to_string(),
+            create_collection_view: "SELECT documentdb_api.create_collection_view($1, $2)".to_string(),
+            shard_collection: "SELECT documentdb_api.shard_collection($1, $2, $3, $4)".to_string(),
+            rename_collection: "SELECT documentdb_api.rename_collection($1, $2, $3, $4)".to_string(),
+            coll_mod: "SELECT documentdb_api.coll_mod($1, $2, $3)".to_string(),
+            unshard_collection: "SELECT documentdb_api.unshard_collection($1)".to_string(),
 
-            // indexing.rs
-            create_indexes_background: "SELECT * FROM documentdb_api.create_indexes_background($1, $2)".to_string(),
-            check_build_index_status: "SELECT * FROM documentdb_api_internal.check_build_index_status($1)".to_string(),
-            re_index: "CALL documentdb_api.re_index($1, $2)".to_string(),
-            drop_indexes: "CALL documentdb_api.drop_indexes($1, $2)".to_string(),
-            list_indexes_cursor_first_page: "SELECT cursorPage, continuation, persistConnection, cursorId FROM documentdb_api.list_indexes_cursor_first_page($1, $2)".to_string(),
-
-            // process.rs
+            // data_management.rs
+            delete: "SELECT * FROM documentdb_api.delete($1, $2, $3, NULL)".to_string(),
             find_cursor_first_page: "SELECT cursorPage, continuation, persistConnection, cursorId FROM documentdb_api.find_cursor_first_page($1, $2)".to_string(),
             insert: "SELECT * FROM documentdb_api.insert($1, $2, $3, NULL)".to_string(),
             aggregate_cursor_first_page: "SELECT cursorPage, continuation, persistConnection, cursorId FROM documentdb_api.aggregate_cursor_first_page($1, $2)".to_string(),
@@ -396,20 +473,32 @@ pub fn create_query_catalog() -> QueryCatalog {
             find_and_modify: "SELECT * FROM documentdb_api.find_and_modify($1, $2, NULL)".to_string(),
             distinct_query: "SELECT document FROM documentdb_api.distinct_query($1, $2)".to_string(),
             count_query: "SELECT document FROM documentdb_api.count_query($1, $2)".to_string(),
-            create_collection_view: "SELECT documentdb_api.create_collection_view($1, $2)".to_string(),
             coll_stats: "SELECT documentdb_api.coll_stats($1, $2, $3)".to_string(),
             db_stats: "SELECT documentdb_api.db_stats($1, $2, $3)".to_string(),
-            shard_collection: "SELECT documentdb_api.shard_collection($1, $2, $3, $4)".to_string(),
-            rename_collection: "SELECT documentdb_api.rename_collection($1, $2, $3, $4)".to_string(),
             current_op: "SELECT documentdb_api.current_op($1, $2, $3)".to_string(),
-            coll_mod: "SELECT documentdb_api.coll_mod($1, $2, $3)".to_string(),
             get_parameter: "SELECT documentdb_api.get_parameter($1, $2, $3)".to_string(),
+            compact: "SELECT documentdb_api.compact($1)".to_string(),
+            kill_op: "SELECT documentdb_api.kill_op($1)".to_string(),
+
+            // indexing.rs
+            create_indexes_background: "SELECT * FROM documentdb_api.create_indexes_background($1, $2)".to_string(),
+            check_build_index_status: "SELECT * FROM documentdb_api_internal.check_build_index_status($1)".to_string(),
+            re_index: "CALL documentdb_api.re_index($1, $2)".to_string(),
+            drop_indexes: "CALL documentdb_api.drop_indexes($1, $2)".to_string(),
+            list_indexes_cursor_first_page: "SELECT cursorPage, continuation, persistConnection, cursorId FROM documentdb_api.list_indexes_cursor_first_page($1, $2)".to_string(),
 
             // user.rs
             create_user: "SELECT documentdb_api.create_user($1)".to_string(),
             drop_user: "SELECT documentdb_api.drop_user($1)".to_string(),
             update_user: "SELECT documentdb_api.update_user($1)".to_string(),
             users_info: "SELECT documentdb_api.users_info($1)".to_string(),
+            connection_status: "SELECT documentdb_api.connection_status($1)".to_string(),
+
+            // roles.rs
+            create_role: "SELECT documentdb_api.create_role($1)".to_string(),
+            update_role: "SELECT documentdb_api.update_role($1)".to_string(),
+            drop_role: "SELECT documentdb_api.drop_role($1)".to_string(),
+            roles_info: "SELECT documentdb_api.roles_info($1)".to_string(),
 
             // tests
             create_db_user: "CREATE ROLE \"{user}\" WITH LOGIN INHERIT PASSWORD '{pass}' IN ROLE documentdb_readonly_role; 

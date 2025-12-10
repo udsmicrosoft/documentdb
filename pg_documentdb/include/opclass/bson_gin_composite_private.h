@@ -19,8 +19,8 @@ typedef struct CompositeSingleBound
 	bool isBoundInclusive;
 
 	/* The processed bound (post truncation if any) */
-	bson_value_t processedBoundValue;
-	bool isProcessedValueTruncated;
+	bytea *serializedTerm;
+	BsonIndexTerm indexTermValue;
 } CompositeSingleBound;
 
 typedef struct IndexRecheckArgs
@@ -58,19 +58,20 @@ typedef struct PathScanTermMap
 
 typedef struct CompositeQueryMetaInfo
 {
+	int32_t numIndexPaths;
 	bool hasTruncation;
 	int32_t truncationTermIndex;
 	bool requiresRuntimeRecheck;
 	int32_t numScanKeys;
 	bool hasMultipleScanKeysPerPath;
+	bool isBackwardScan;
 	PathScanKeyMap *scanKeyMap;
 } CompositeQueryMetaInfo;
 
 typedef struct CompositeQueryRunData
 {
-	CompositeIndexBounds indexBounds[INDEX_MAX_KEYS];
-	int32_t numIndexPaths;
 	CompositeQueryMetaInfo *metaInfo;
+	CompositeIndexBounds indexBounds[FLEXIBLE_ARRAY_MEMBER];
 } CompositeQueryRunData;
 
 typedef struct CompositeIndexBoundsSet
@@ -98,16 +99,15 @@ CreateCompositeIndexBoundsSet(int32_t numTerms, int32_t indexAttribute)
 }
 
 
-bool IsValidRecheckForIndexValue(const bson_value_t *compareValue,
-								 bool indexTermHasTruncation,
+bool IsValidRecheckForIndexValue(const BsonIndexTerm *compareTerm,
 								 IndexRecheckArgs *recheckArgs);
 
 bytea * BuildLowerBoundTermFromIndexBounds(CompositeQueryRunData *runData,
 										   IndexTermCreateMetadata *metadata,
-										   bool *hasInequalityMatch);
+										   bool *hasInequalityMatch, int8_t *sortOrders);
 
 bool UpdateBoundsForTruncation(CompositeIndexBounds *queryBounds, int32_t numPaths,
-							   IndexTermCreateMetadata *metadata);
+							   IndexTermCreateMetadata *metadata, int8_t *sortOrders);
 
 
 void ParseOperatorStrategy(const char **indexPaths, int32_t numPaths,
@@ -120,6 +120,9 @@ void UpdateRunDataForVariableBounds(CompositeQueryRunData *runData,
 									VariableIndexBounds *variableBounds,
 									int32_t permutation);
 
-void MergeSingleVariableBounds(VariableIndexBounds *variableBounds,
-							   CompositeQueryRunData *runData);
+List * MergeSingleVariableBounds(List *variableBounds,
+								 CompositeIndexBounds *mergedBounds);
+
+void PickVariableBoundsForOrderedScan(VariableIndexBounds *variableBounds,
+									  CompositeQueryRunData *runData);
  #endif

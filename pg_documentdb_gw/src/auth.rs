@@ -6,23 +6,34 @@
  *-------------------------------------------------------------------------
  */
 
-use std::str::from_utf8;
-
-use bson::{rawdoc, spec::BinarySubtype};
-use rand::{distributions::Uniform, prelude::Distribution, rngs::OsRng};
-use tokio_postgres::types::Type;
+use std::{str::from_utf8, sync::Arc};
 
 use crate::{
-    context::ConnectionContext,
+    context::{ConnectionContext, RequestContext},
     error::{DocumentDBError, ErrorCode, Result},
-    postgres::PgDocument,
+    postgres::{PgDataClient, PgDocument},
     processor,
     protocol::OK_SUCCEEDED,
-    requests::{Request, RequestType},
+    requests::{request_tracker::RequestTracker, Request, RequestType},
     responses::{RawResponse, Response},
 };
+use base64::{engine::general_purpose, Engine as _};
+use bson::{rawdoc, spec::BinarySubtype};
+use rand::Rng;
+use serde_json::Value;
+use tokio::{
+    sync::RwLock,
+    time::{sleep, Duration},
+};
+use tokio_postgres::types::Type;
 
 const NONCE_LENGTH: usize = 2;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthKind {
+    Native,
+    ExternalIdentity,
+}
 
 pub struct ScramFirstState {
     nonce: String,
@@ -31,10 +42,13 @@ pub struct ScramFirstState {
 }
 
 pub struct AuthState {
-    pub authorized: bool,
+    authorized: Arc<RwLock<bool>>,
     first_state: Option<ScramFirstState>,
     username: Option<String>,
     pub password: Option<String>,
+    user_oid: Option<u32>,
+    auth_kind: Option<AuthKind>,
+    timer_initialized: Arc<RwLock<bool>>,
 }
 
 impl Default for AuthState {
@@ -46,10 +60,13 @@ impl Default for AuthState {
 impl AuthState {
     pub fn new() -> Self {
         AuthState {
-            authorized: false,
+            authorized: Arc::new(RwLock::new(false)),
             first_state: None,
             username: None,
             password: None,
+            user_oid: None,
+            auth_kind: None,
+            timer_initialized: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -61,35 +78,111 @@ impl AuthState {
             ))
     }
 
+    pub fn user_oid(&self) -> Result<u32> {
+        self.user_oid.ok_or(DocumentDBError::internal_error(
+            "User OID missing".to_string(),
+        ))
+    }
+
+    pub fn is_authorized(&self) -> Arc<RwLock<bool>> {
+        Arc::clone(&self.authorized)
+    }
+
+    pub fn auth_kind(&self) -> &Option<AuthKind> {
+        &self.auth_kind
+    }
+
     pub fn set_username(&mut self, user: &str) {
         self.username = Some(user.to_string());
     }
+
+    pub fn set_user_oid(&mut self, user_oid: u32) {
+        self.user_oid = Some(user_oid);
+    }
+
+    pub fn set_auth_kind(&mut self, kind: AuthKind) -> Result<()> {
+        if self.auth_kind.is_none() {
+            self.auth_kind = Some(kind);
+            Ok(())
+        } else if self.auth_kind != Some(kind) {
+            Err(DocumentDBError::internal_error(
+                "Auth kind is already set".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn initialize_expiry_timer(
+        &mut self,
+        timeout_secs: u64,
+        connection_activity_id: &str,
+    ) -> Result<()> {
+        let timer_initialized = Arc::clone(&self.timer_initialized);
+        if *timer_initialized.read().await {
+            return Err(DocumentDBError::internal_error(
+                "Authentication expiry timer is already initialized".to_string(),
+            ));
+        }
+
+        let authorized = Arc::clone(&self.authorized);
+        let connection_activity_id_owned = connection_activity_id.to_string();
+
+        // Spawn new expiry task that counts down and sets authorized to false
+        tokio::spawn(async move {
+            *timer_initialized.write().await = true;
+
+            sleep(Duration::from_secs(timeout_secs)).await;
+
+            let connection_activity_id_as_str = connection_activity_id_owned.as_str();
+            log::info!(
+                activity_id = connection_activity_id_as_str;
+                "Authentication expiry timer elapsed"
+            );
+            *authorized.write().await = false;
+            *timer_initialized.write().await = false;
+        });
+
+        Ok(())
+    }
 }
 
-pub async fn process(ctx: &mut ConnectionContext, request: &Request<'_>) -> Result<Response> {
-    if let Some(response) = handle_auth_request(ctx, request).await? {
+pub async fn process<T>(
+    connection_context: &mut ConnectionContext,
+    request_context: &mut RequestContext<'_>,
+) -> Result<Response>
+where
+    T: PgDataClient,
+{
+    let request = request_context.payload;
+    if let Some(response) = handle_auth_request(connection_context, request).await? {
         return Ok(response);
     }
 
     if request.request_type().allowed_unauthorized() {
-        return processor::process_request(request, &request.extract_common()?, ctx).await;
+        let service_context = Arc::clone(&connection_context.service_context);
+        let data_client = T::new_unauthorized(&service_context).await?;
+
+        return processor::process_request(request_context, connection_context, data_client).await;
     }
 
     Err(DocumentDBError::unauthorized(format!(
-        "Command {} not supported prior to authentication.",
+        "Command {} is not allowed as the connection is not authenticated yet.",
         request.request_type().to_string().to_lowercase()
     )))
 }
 
 async fn handle_auth_request(
-    ctx: &mut ConnectionContext,
+    connection_context: &mut ConnectionContext,
     request: &Request<'_>,
 ) -> Result<Option<Response>> {
     match request.request_type() {
-        RequestType::SaslStart => Ok(Some(handle_sasl_start(ctx, request).await?)),
-        RequestType::SaslContinue => Ok(Some(handle_sasl_continue(ctx, request).await?)),
+        RequestType::SaslStart => Ok(Some(handle_sasl_start(connection_context, request).await?)),
+        RequestType::SaslContinue => Ok(Some(
+            handle_sasl_continue(connection_context, request).await?,
+        )),
         RequestType::Logout => {
-            ctx.auth_state = AuthState::new();
+            connection_context.auth_state = AuthState::new();
             Ok(Some(Response::Raw(RawResponse(rawdoc! {
                 "ok": OK_SUCCEEDED,
             }))))
@@ -98,18 +191,45 @@ async fn handle_auth_request(
     }
 }
 
-async fn handle_sasl_start(ctx: &mut ConnectionContext, request: &Request<'_>) -> Result<Response> {
+fn generate_server_nonce(client_nonce: &str) -> String {
+    const CHARSET: &[u8] = b"!\"#$%&'()*+-./0123456789:;<>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let mut rng = rand::thread_rng();
+
+    let mut result = String::with_capacity(NONCE_LENGTH);
+    for _ in 0..NONCE_LENGTH {
+        let idx = rng.gen_range(0..CHARSET.len());
+        result.push(CHARSET[idx] as char);
+    }
+
+    format!("{client_nonce}{result}")
+}
+
+async fn handle_sasl_start(
+    connection_context: &mut ConnectionContext,
+    request: &Request<'_>,
+) -> Result<Response> {
     let mechanism = request
         .document()
         .get_str("mechanism")
         .map_err(DocumentDBError::parse_failure())?;
 
-    if mechanism != "SCRAM-SHA-256" {
-        return Err(DocumentDBError::unauthorized(
-            "Only SCRAM-SHA-256 is supported".to_string(),
-        ));
+    if mechanism != "SCRAM-SHA-256" && mechanism != "MONGODB-OIDC" {
+        return Err(DocumentDBError::unauthorized(format!(
+            "Only SCRAM-SHA-256 and MONGODB-OIDC are supported, got: {mechanism}"
+        )));
     }
 
+    if mechanism == "MONGODB-OIDC" {
+        return handle_oidc(connection_context, request).await;
+    } else {
+        return handle_scram(connection_context, request).await;
+    }
+}
+
+async fn handle_scram(
+    connection_context: &mut ConnectionContext,
+    request: &Request<'_>,
+) -> Result<Response> {
     let payload = parse_sasl_payload(request, true)?;
 
     let username = payload.username.ok_or(DocumentDBError::unauthorized(
@@ -120,25 +240,22 @@ async fn handle_sasl_start(ctx: &mut ConnectionContext, request: &Request<'_>) -
         "Nonce missing from SaslStart.".to_string(),
     ))?;
 
-    let mut nonce = String::with_capacity(client_nonce.len() + NONCE_LENGTH);
-    nonce.push_str(client_nonce);
-    nonce.extend(
-        Uniform::from(33..125)
-            .sample_iter(OsRng)
-            .map(|x: u8| if x > 43 { (x + 1) as char } else { x as char })
-            .take(NONCE_LENGTH),
-    );
+    let server_nonce = generate_server_nonce(client_nonce);
 
-    let (salt, iterations) = get_salt_and_iteration(ctx, username).await?;
-    let response = format!("r={},s={},i={}", nonce, salt, iterations);
+    let (salt, iterations) = get_salt_and_iteration(connection_context, username).await?;
+    let response = format!("r={server_nonce},s={salt},i={iterations}");
 
-    ctx.auth_state.first_state = Some(ScramFirstState {
-        nonce,
-        first_message_bare: format!("n={},r={}", username, client_nonce),
+    connection_context.auth_state.first_state = Some(ScramFirstState {
+        nonce: server_nonce,
+        first_message_bare: format!("n={username},r={client_nonce}"),
         first_message: response.clone(),
     });
 
-    ctx.auth_state.username = Some(username.to_string());
+    connection_context.auth_state.username = Some(username.to_string());
+
+    connection_context
+        .auth_state
+        .set_auth_kind(AuthKind::Native)?;
 
     let binary_response = bson::Binary {
         subtype: BinarySubtype::Generic,
@@ -153,13 +270,175 @@ async fn handle_sasl_start(ctx: &mut ConnectionContext, request: &Request<'_>) -
     })))
 }
 
+async fn handle_oidc(
+    connection_context: &mut ConnectionContext,
+    request: &Request<'_>,
+) -> Result<Response> {
+    let payload = request
+        .document()
+        .get_binary("payload")
+        .map_err(DocumentDBError::parse_failure())?;
+
+    let payload_doc = bson::Document::from_reader(&mut std::io::Cursor::new(payload.bytes))
+        .map_err(|e| {
+            DocumentDBError::bad_value(format!("Failed to parse OIDC payload as BSON: {e}"))
+        })?;
+
+    let jwt_token = payload_doc.get_str("jwt").map_err(|_| {
+        DocumentDBError::unauthorized("JWT token missing from OIDC payload".to_string())
+    })?;
+
+    handle_oidc_token_authentication(connection_context, jwt_token).await
+}
+
+async fn handle_oidc_token_authentication(
+    connection_context: &mut ConnectionContext,
+    token_string: &str,
+) -> Result<Response> {
+    let (oid, seconds_until_expiry) = parse_and_validate_jwt_token(token_string)?;
+
+    let authentication_token_row = connection_context
+        .service_context
+        .authentication_connection()
+        .await?
+        .query(
+            connection_context
+                .service_context
+                .query_catalog()
+                .authenticate_with_token(),
+            &[Type::TEXT, Type::TEXT],
+            &[&oid, &token_string],
+            None,
+            &mut RequestTracker::new(),
+        )
+        .await?;
+
+    let authentication_result: String = authentication_token_row
+        .first()
+        .ok_or(DocumentDBError::pg_response_empty())?
+        .try_get(0)?;
+
+    if authentication_result.trim() != oid {
+        return Err(DocumentDBError::unauthorized(
+            "Token validation failed".to_string(),
+        ));
+    }
+
+    let server_signature = "";
+    let payload = bson::Binary {
+        subtype: BinarySubtype::Generic,
+        bytes: server_signature.as_bytes().to_vec(),
+    };
+
+    connection_context.auth_state.set_username(&oid);
+    connection_context.auth_state.password = Some(token_string.to_string());
+    connection_context.auth_state.user_oid = Some(get_user_oid(connection_context, &oid).await?);
+
+    *connection_context.auth_state.is_authorized().write().await = true;
+    connection_context
+        .auth_state
+        .set_auth_kind(AuthKind::ExternalIdentity)?;
+
+    /* We are setting a timer for the time until token expiry, which will set authorized to false at the end */
+    let connection_activity_id = connection_context.connection_id.to_string();
+    let connection_activity_id_as_str = connection_activity_id.as_str();
+    log::info!(activity_id = connection_activity_id_as_str;
+        "Setting authentication expiry timer for {seconds_until_expiry} seconds until token expiry.",
+    );
+    connection_context
+        .auth_state
+        .initialize_expiry_timer(seconds_until_expiry, connection_activity_id_as_str)
+        .await?;
+
+    Ok(Response::Raw(RawResponse(rawdoc! {
+        "payload": payload,
+        "ok": OK_SUCCEEDED,
+        "conversationId": 1,
+        "done": true
+    })))
+}
+
+fn parse_and_validate_jwt_token(token_string: &str) -> Result<(String, u64)> {
+    let token_parts: Vec<&str> = token_string.split('.').collect();
+    if token_parts.len() != 3 {
+        return Err(DocumentDBError::unauthorized(
+            "Invalid JWT token format.".to_string(),
+        ));
+    }
+
+    let payload_part = token_parts[1];
+    let payload_bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_part)
+        .map_err(|_| DocumentDBError::unauthorized("Invalid JWT token encoding.".to_string()))?;
+
+    let payload_json: Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| DocumentDBError::unauthorized("Invalid JWT token payload.".to_string()))?;
+
+    let oid = payload_json
+        .get("oid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| DocumentDBError::unauthorized("Token does not contain OID.".to_string()))?
+        .to_string();
+
+    let aud = payload_json
+        .get("aud")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            DocumentDBError::unauthorized("Token does not contain audience claim.".to_string())
+        })?
+        .to_string();
+
+    let exp = payload_json
+        .get("exp")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            DocumentDBError::unauthorized("Token does not contain expiry time.".to_string())
+        })?;
+
+    let valid_audiences = ["https://ossrdbms-aad.database.windows.net"];
+    if !valid_audiences.contains(&aud.as_str()) {
+        return Err(DocumentDBError::unauthorized(
+            "Invalid audience claim.".to_string(),
+        ));
+    }
+
+    let exp_datetime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(exp as u64);
+    let now = std::time::SystemTime::now();
+
+    if exp_datetime < now {
+        return Err(DocumentDBError::reauthentication_required(
+            "Token has expired.".to_string(),
+        ));
+    }
+
+    let timeout_seconds = exp_datetime
+        .duration_since(now)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+
+    Ok((oid, timeout_seconds))
+}
+
 async fn handle_sasl_continue(
-    ctx: &mut ConnectionContext,
+    connection_context: &mut ConnectionContext,
     request: &Request<'_>,
 ) -> Result<Response> {
     let payload = parse_sasl_payload(request, false)?;
 
-    if let Some(first_state) = ctx.auth_state.first_state.as_ref() {
+    if let Some(first_state) = connection_context.auth_state.first_state.as_ref() {
+        let mechanism_result = request.document().get_str("mechanism");
+
+        // Only validate mechanism if it's present - it's optional in SaslContinue
+        if let Ok(mechanism) = mechanism_result {
+            if mechanism == "MONGODB-OIDC" {
+                return Err(DocumentDBError::unauthorized(
+                    "Auth mechanism MONGODB-OIDC is not supported in SaslContinue".to_string(),
+                ));
+            }
+        } else {
+            log::warn!("Auth mechanism not provided in SaslContinue");
+        }
+
         // Username is not always provided by saslcontinue
 
         let client_nonce = payload.nonce.ok_or(DocumentDBError::unauthorized(
@@ -175,9 +454,9 @@ async fn handle_sasl_continue(
             ))?;
         let username = payload
             .username
-            .or(ctx.auth_state.username.as_deref())
+            .or(connection_context.auth_state.username.as_deref())
             .ok_or(DocumentDBError::internal_error(
-                "Username missing from sasl continue".to_string(),
+                "Username missing from SaslContinue".to_string(),
             ))?;
 
         if client_nonce != first_state.nonce {
@@ -194,25 +473,28 @@ async fn handle_sasl_continue(
             client_nonce
         );
 
-        let results = ctx
+        let scram_sha256_row = connection_context
             .service_context
-            .system_client()
+            .authentication_connection()
             .await?
             .query(
-                ctx.service_context
+                connection_context
+                    .service_context
                     .query_catalog()
                     .authenticate_with_scram_sha256(),
                 &[Type::TEXT, Type::TEXT, Type::TEXT],
                 &[&username, &auth_message, &proof],
                 None,
+                &mut RequestTracker::new(),
             )
             .await?;
 
-        let result: PgDocument = results
+        let scram_sha256_doc: PgDocument = scram_sha256_row
             .first()
             .ok_or(DocumentDBError::pg_response_empty())?
             .try_get(0)?;
-        if result
+
+        if scram_sha256_doc
             .0
             .get_i32("ok")
             .map_err(DocumentDBError::pg_response_invalid)?
@@ -220,17 +502,22 @@ async fn handle_sasl_continue(
         {
             return Err(DocumentDBError::unauthorized("Invalid key".to_string()));
         }
-        let server_signature = result
+
+        let server_signature = scram_sha256_doc
             .0
             .get_str("ServerSignature")
             .map_err(DocumentDBError::pg_response_invalid)?;
+
         let payload = bson::Binary {
             subtype: BinarySubtype::Generic,
-            bytes: format!("v={}", server_signature).as_bytes().to_vec(),
+            bytes: format!("v={server_signature}").as_bytes().to_vec(),
         };
 
-        ctx.auth_state.password = Some("".to_string());
-        ctx.auth_state.authorized = true;
+        connection_context.auth_state.password = Some("".to_string());
+        connection_context.auth_state.user_oid =
+            Some(get_user_oid(connection_context, username).await?);
+
+        *connection_context.auth_state.is_authorized().write().await = true;
 
         Ok(Response::Raw(RawResponse(rawdoc! {
             "payload": payload,
@@ -240,7 +527,7 @@ async fn handle_sasl_continue(
         })))
     } else {
         Err(DocumentDBError::unauthorized(
-            "Sasl Continue called without SaslStart state.".to_string(),
+            "SaslContinue called without SaslStart state.".to_string(),
         ))
     }
 }
@@ -261,10 +548,7 @@ fn parse_sasl_payload<'a, 'b: 'a>(
         .get_binary("payload")
         .map_err(DocumentDBError::parse_failure())?;
     let mut payload = from_utf8(payload.bytes).map_err(|e| {
-        DocumentDBError::bad_value(format!(
-            "Sasl payload couldn't be converted to utf-8: {}",
-            e
-        ))
+        DocumentDBError::bad_value(format!("Sasl payload couldn't be converted to utf-8: {e}"))
     })?;
 
     if with_header {
@@ -313,8 +597,11 @@ fn parse_sasl_payload<'a, 'b: 'a>(
     })
 }
 
-async fn get_salt_and_iteration(ctx: &ConnectionContext, username: &str) -> Result<(String, i32)> {
-    for blocked_prefix in ctx
+async fn get_salt_and_iteration(
+    connection_context: &ConnectionContext,
+    username: &str,
+) -> Result<(String, i32)> {
+    for blocked_prefix in connection_context
         .service_context
         .setup_configuration()
         .blocked_role_prefixes()
@@ -329,15 +616,19 @@ async fn get_salt_and_iteration(ctx: &ConnectionContext, username: &str) -> Resu
         }
     }
 
-    let results = ctx
+    let results = connection_context
         .service_context
-        .system_client()
+        .authentication_connection()
         .await?
         .query(
-            ctx.service_context.query_catalog().salt_and_iterations(),
+            connection_context
+                .service_context
+                .query_catalog()
+                .salt_and_iterations(),
             &[Type::TEXT],
             &[&username],
             None,
+            &mut RequestTracker::new(),
         )
         .await?;
 
@@ -367,4 +658,26 @@ async fn get_salt_and_iteration(ctx: &ConnectionContext, username: &str) -> Resu
         .map_err(DocumentDBError::pg_response_invalid)?;
 
     Ok((salt.to_string(), iterations))
+}
+
+pub async fn get_user_oid(connection_context: &ConnectionContext, username: &str) -> Result<u32> {
+    let user_oid_rows = connection_context
+        .service_context
+        .authentication_connection()
+        .await?
+        .query(
+            "SELECT oid from pg_roles WHERE rolname = $1",
+            &[Type::TEXT],
+            &[&username],
+            None,
+            &mut RequestTracker::new(),
+        )
+        .await?;
+
+    let user_oid = user_oid_rows
+        .first()
+        .ok_or(DocumentDBError::pg_response_empty())?
+        .try_get::<_, tokio_postgres::types::Oid>(0)?;
+
+    Ok(user_oid)
 }

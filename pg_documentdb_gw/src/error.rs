@@ -10,10 +10,14 @@ use std::{backtrace::Backtrace, fmt::Display, io};
 
 use bson::raw::ValueAccessError;
 use deadpool_postgres::{BuildError, CreatePoolError, PoolError};
-use num_traits::FromPrimitive;
 use openssl::error::ErrorStack;
 
-#[derive(Debug)]
+use documentdb_macros::documentdb_error_code_enum;
+
+use crate::responses::constant::pg_returned_invalid_response_message;
+
+documentdb_error_code_enum!();
+
 pub enum DocumentDBError {
     IoError(io::Error, Backtrace),
     DocumentDBError(ErrorCode, String, Backtrace),
@@ -31,7 +35,7 @@ pub enum DocumentDBError {
 
 impl DocumentDBError {
     pub fn parse_failure<'a, E: std::fmt::Display>() -> impl Fn(E) -> Self + 'a {
-        move |e| DocumentDBError::bad_value(format!("Failed to parse: {}", e))
+        move |e| DocumentDBError::bad_value(format!("Failed to parse: {e}"))
     }
 
     pub fn pg_response_empty() -> Self {
@@ -39,7 +43,7 @@ impl DocumentDBError {
     }
 
     pub fn pg_response_invalid(e: ValueAccessError) -> Self {
-        DocumentDBError::internal_error(format!("PG returned invalid response: {}", e))
+        DocumentDBError::internal_error(pg_returned_invalid_response_message(e))
     }
 
     pub fn sasl_payload_invalid() -> Self {
@@ -62,6 +66,14 @@ impl DocumentDBError {
         DocumentDBError::DocumentDBError(ErrorCode::TypeMismatch, msg, Backtrace::capture())
     }
 
+    pub fn reauthentication_required(msg: String) -> Self {
+        DocumentDBError::DocumentDBError(
+            ErrorCode::ReauthenticationRequired,
+            msg,
+            Backtrace::capture(),
+        )
+    }
+
     #[allow(clippy::self_named_constructors)]
     pub fn documentdb_error(e: ErrorCode, msg: String) -> Self {
         DocumentDBError::DocumentDBError(e, msg, Backtrace::capture())
@@ -70,25 +82,8 @@ impl DocumentDBError {
     pub fn error_code_enum(&self) -> Option<ErrorCode> {
         match self {
             DocumentDBError::DocumentDBError(code, _, _) => Some(*code),
-            DocumentDBError::UntypedDocumentDBError(code, _, _, _) => {
-                ErrorCode::from_i64(*code as i64)
-            }
+            DocumentDBError::UntypedDocumentDBError(code, _, _, _) => ErrorCode::from_i32(*code),
             _ => None,
-        }
-    }
-}
-
-impl Display for DocumentDBError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DocumentDBError::PostgresError(e, _) => {
-                if let Some(dbe) = e.as_db_error() {
-                    write!(f, "PostgresError({:?}, {:?})", dbe.code(), dbe.hint())
-                } else {
-                    write!(f, "{:?}", e)
-                }
-            }
-            _ => write!(f, "{:?}", self),
         }
     }
 }
@@ -150,76 +145,106 @@ impl From<ValueAccessError> for DocumentDBError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum ErrorCode {
-    Ok = 0,
-    InternalError = 1,
-    BadValue = 2,
-    Unauthorized = 13,
-    TypeMismatch = 14,
-    AuthenticationFailed = 18,
-    IllegalOperation = 20,
-    LockTimeout = 24,
-    NamespaceNotFound = 26,
-    CursorNotFound = 43,
-    ExceededTimeLimit = 50,
-    InvalidOptions = 72,
-    InvalidNamespace = 73,
-    ShutdownInProgress = 91,
-    WriteConflict = 112,
-    CommandNotSupported = 115,
-    ConflictingOperationInProgress = 117,
-    ExceededMemoryLimit = 146,
-    ClientMetadataCannotBeMutated = 186,
-    TransactionTooOld = 225,
-    NoSuchTransaction = 251,
-    TransactionCommitted = 256,
-    OperationNotSupportedInTransaction = 263,
-    DuplicateKey = 11000,
-    OutOfDiskSpace = 14031,
-    UnknownBsonField = 40415,
-}
-
-impl FromPrimitive for ErrorCode {
-    fn from_i64(n: i64) -> Option<Self> {
-        match n {
-            0 => Some(ErrorCode::Ok),
-            1 => Some(ErrorCode::InternalError),
-            2 => Some(ErrorCode::BadValue),
-            13 => Some(ErrorCode::Unauthorized),
-            14 => Some(ErrorCode::TypeMismatch),
-            18 => Some(ErrorCode::AuthenticationFailed),
-            20 => Some(ErrorCode::IllegalOperation),
-            24 => Some(ErrorCode::LockTimeout),
-            26 => Some(ErrorCode::NamespaceNotFound),
-            43 => Some(ErrorCode::CursorNotFound),
-            50 => Some(ErrorCode::ExceededTimeLimit),
-            72 => Some(ErrorCode::InvalidOptions),
-            73 => Some(ErrorCode::InvalidNamespace),
-            91 => Some(ErrorCode::ShutdownInProgress),
-            112 => Some(ErrorCode::WriteConflict),
-            115 => Some(ErrorCode::CommandNotSupported),
-            117 => Some(ErrorCode::ConflictingOperationInProgress),
-            146 => Some(ErrorCode::ExceededMemoryLimit),
-            186 => Some(ErrorCode::ClientMetadataCannotBeMutated),
-            225 => Some(ErrorCode::TransactionTooOld),
-            251 => Some(ErrorCode::NoSuchTransaction),
-            256 => Some(ErrorCode::TransactionCommitted),
-            263 => Some(ErrorCode::OperationNotSupportedInTransaction),
-            11000 => Some(ErrorCode::DuplicateKey),
-            14031 => Some(ErrorCode::OutOfDiskSpace),
-            40415 => Some(ErrorCode::UnknownBsonField),
-            _ => None,
-        }
-    }
-
-    fn from_u64(n: u64) -> Option<Self> {
-        Self::from_i64(n as i64)
-    }
-}
-
 impl Display for ErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
+    }
+}
+
+// When DocumentDBError is logged with {e} style, this Display trait here is used.
+// To ensure the PII content of the DocumentDBError is not logged, always redirect to the PII free Debug implementation.
+impl Display for DocumentDBError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f) // reuse Debug impl
+    }
+}
+
+// When DocumentDBError is logged with {e:?} style, this Debug trait here is used.
+// DocumentDBError's message field contains PII content and should not be logged.
+impl std::fmt::Debug for DocumentDBError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DocumentDBError::IoError(error, backtrace) => f
+                .debug_struct("IoError")
+                .field("error", error)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::DocumentDBError(code, msg, backtrace) => f
+                .debug_struct("DocumentDBError")
+                .field("code", code)
+                // TODO: Redact message when DocumentDBError::DocumentDBError supports err_hint field.
+                .field("message", msg)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::UntypedDocumentDBError(code, msg, code_name, backtrace) => f
+                .debug_struct("UntypedDocumentDBError")
+                .field("code", code)
+                // TODO: Redact message when DocumentDBError::UntypedDocumentDBError supports err_hint field.
+                .field("message", msg)
+                .field("code_name", code_name)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::PostgresError(error, backtrace) => {
+                if let Some(dbe) = error.as_db_error() {
+                    f.debug_struct("PostgresError")
+                        .field("sql_state", &dbe.code())
+                        .field("message", &"[REDACTED]")
+                        .field("hint", &dbe.hint())
+                        .field("backtrace", backtrace)
+                        .finish()
+                } else {
+                    f.debug_struct("PostgresError")
+                        .field(
+                            "error_type",
+                            &std::any::type_name::<tokio_postgres::Error>(),
+                        )
+                        .field("backtrace", backtrace)
+                        .finish()
+                }
+            }
+            DocumentDBError::PostgresDocumentDBError(code, _msg, backtrace) => f
+                .debug_struct("PostgresDocumentDBError")
+                .field("code", code)
+                .field("message", &"[REDACTED]")
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::PoolError(error, backtrace) => f
+                .debug_struct("PoolError")
+                .field("error", error)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::CreatePoolError(error, backtrace) => f
+                .debug_struct("CreatePoolError")
+                .field("error", error)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::BuildPoolError(error, backtrace) => f
+                .debug_struct("BuildPoolError")
+                .field("error", error)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::RawBsonError(_error, backtrace) => f
+                .debug_struct("RawBsonError")
+                .field("error_type", &std::any::type_name::<bson::raw::Error>())
+                .field("error_display", &"[REDACTED]")
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::SSLError(error, backtrace) => f
+                .debug_struct("SSLError")
+                .field("error", error)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::SSLErrorStack(error, backtrace) => f
+                .debug_struct("SSLErrorStack")
+                .field("error", error)
+                .field("backtrace", backtrace)
+                .finish(),
+            DocumentDBError::ValueAccessError(_error, backtrace) => f
+                .debug_struct("ValueAccessError")
+                .field("error_type", &std::any::type_name::<ValueAccessError>())
+                .field("error_display", &"[REDACTED]")
+                .field("backtrace", backtrace)
+                .finish(),
+        }
     }
 }

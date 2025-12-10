@@ -43,6 +43,9 @@ typedef enum CustomOrderByOptions
 
 	/* Allow only numbers, required for ORDER BY in $setWindowFields */
 	CustomOrderByOptions_AllowOnlyNumbers = 0x2,
+
+	/* Set the reverse order flag on the order output */
+	CustomOrderByOptions_SetReverseFlag = 0x4,
 } CustomOrderByOptions;
 
 /* --------------------------------------------------------- */
@@ -58,7 +61,7 @@ typedef struct BsonDollarAllQueryState
 	/* Whether or not the $all array has exclusively nulls */
 	bool arrayHasOnlyNulls;
 
-	/* The number of elements in the $all array */
+	/* The total count of elements present in the $all array */
 	int numElements;
 
 	/* An array of exprEvalState for expression evaluation.
@@ -111,6 +114,9 @@ typedef struct TraverseOrderByValidateState
 	bool isOrderByMin;
 	bson_value_t orderByValue;
 	CustomOrderByOptions options;
+	const char *collationString;
+	int32_t nestedArrayCount;
+	bool foundAsTopLevelPath;
 } TraverseOrderByValidateState;
 
 /* State for comparison operations of simple dollar operators
@@ -124,7 +130,7 @@ typedef struct TraverseElementValidateState
 	const char *collationString;
 } TraverseElementValidateState;
 
-/* State for the comparison of $in operator */
+/* Comparison state for the $in operator */
 typedef struct TraverseInValidateState
 {
 	/* must be the first field */
@@ -254,6 +260,27 @@ typedef struct TraverseElemMatchValidateState
 	const char *collationString;
 } TraverseElemMatchValidateState;
 
+/*
+ * Sort comparison input.
+ * This is data used in the orderby function and operator
+ * to populate data used in tracking sort metadata.
+ */
+typedef struct
+{
+	/* The raw element being compared for sort */
+	pgbsonelement element;
+
+	/* Sorting operation uses specified collation */
+	const char *collationString;
+
+	/* Whether or not the sort input is truncated */
+	bool isTruncated;
+
+	/* Whether or not the sort is on a reverse sort */
+	bool isReverse;
+} BsonSortInput;
+
+
 typedef bool (*IsQueryFilterNullFunc)(const TraverseValidateState *state);
 extern bool EnableCollation;
 extern bool EnableNowSystemVariable;
@@ -296,7 +323,7 @@ static bool CompareArrayTypeMatch(const pgbsonelement *documentIterator,
 static bool CompareAllMatch(const pgbsonelement *documentIterator,
 							TraverseValidateState *validationState, bool
 							isFirstArrayTerm);
-static void CompareForOrderBy(const pgbsonelement *documentIterator,
+static void CompareForOrderBy(const bson_value_t *documentIterator,
 							  TraverseOrderByValidateState *validationState);
 static bool CompareBitsAllClearMatch(const pgbsonelement *documentIterator,
 									 TraverseValidateState *traverseState, bool
@@ -361,20 +388,32 @@ static bool CompareVisitTopLevelField(pgbsonelement *element, const
 static bool CompareVisitArrayField(pgbsonelement *element, const StringView *filterPath,
 								   int arrayIndex, void *state);
 static void CompareSetTraverseResult(void *state, TraverseBsonResult compareResult);
+static void CompareSetTraverseResultForNulls(void *state,
+											 TraverseBsonResult compareResult);
 static bool CompareContinueProcessIntermediateArray(void *state, const
-													bson_value_t *value);
+													bson_value_t *value, bool
+													isArrayIndexSearch);
 static bool OrderByVisitTopLevelField(pgbsonelement *element, const
 									  StringView *filterPath,
 									  void *state);
+static bool OrderByContinueProcessIntermediateArray(void *state, const
+													bson_value_t *value, bool
+													isArrayIndexSearch);
+static void OrderByHandleIntermediateArrayPathNotFound(void *state,
+													   int32_t arrayIndex, const
+													   StringView *remainingPath);
+static void OrderBySetIntermediateArrayStartEnd(void *state, bool isStart);
 static bool OrderByVisitArrayField(pgbsonelement *element, const StringView *filterPath,
 								   int arrayIndex, void *state);
+static void OrderBySetTraverseResult(void *state, TraverseBsonResult compareResult);
 static bool DollarRangeVisitTopLevelField(pgbsonelement *element, const
 										  StringView *filterPath,
 										  void *state);
 static bool DollarRangeVisitArrayField(pgbsonelement *element, const
 									   StringView *filterPath,
 									   int arrayIndex, void *state);
-static Datum BsonOrderbyCore(pgbson *leftBson, pgbson *rightBson, bool validateSort,
+static Datum BsonOrderbyCore(pgbson *leftBson, pgbson *rightBson, const
+							 char *collationString, bool validateSort,
 							 const CustomOrderByOptions options);
 
 /*
@@ -385,18 +424,38 @@ static const TraverseBsonExecutionFuncs CompareExecutionFuncs = {
 	.SetTraverseResult = CompareSetTraverseResult,
 	.VisitArrayField = CompareVisitArrayField,
 	.VisitTopLevelField = CompareVisitTopLevelField,
-	.SetIntermediateArrayIndex = NULL
+	.SetIntermediateArrayIndex = NULL,
+	.HandleIntermediateArrayPathNotFound = NULL,
+	.SetIntermediateArrayStartEnd = NULL,
 };
+
+
+/*
+ * Standard execution functions for traversing bson and evaluating queries for $ops.
+ * This is specifically tailored for querying against nulls.
+ */
+static const TraverseBsonExecutionFuncs CompareNullExecutionFuncs = {
+	.ContinueProcessIntermediateArray = CompareContinueProcessIntermediateArray,
+	.SetTraverseResult = CompareSetTraverseResultForNulls,
+	.VisitArrayField = CompareVisitArrayField,
+	.VisitTopLevelField = CompareVisitTopLevelField,
+	.SetIntermediateArrayIndex = NULL,
+	.HandleIntermediateArrayPathNotFound = NULL,
+	.SetIntermediateArrayStartEnd = NULL,
+};
+
 
 /*
  * Execution functions for traversing bson and evaluating queries for order by.
  */
 static const TraverseBsonExecutionFuncs OrderByExecutionFuncs = {
-	.ContinueProcessIntermediateArray = CompareContinueProcessIntermediateArray,
-	.SetTraverseResult = CompareSetTraverseResult,
+	.ContinueProcessIntermediateArray = OrderByContinueProcessIntermediateArray,
+	.SetTraverseResult = OrderBySetTraverseResult,
 	.VisitArrayField = OrderByVisitArrayField,
 	.VisitTopLevelField = OrderByVisitTopLevelField,
-	.SetIntermediateArrayIndex = NULL
+	.SetIntermediateArrayIndex = NULL,
+	.HandleIntermediateArrayPathNotFound = OrderByHandleIntermediateArrayPathNotFound,
+	.SetIntermediateArrayStartEnd = OrderBySetIntermediateArrayStartEnd,
 };
 
 
@@ -410,6 +469,8 @@ static const TraverseBsonExecutionFuncs CompareTopLevelFieldExecutionFuncs = {
 	.VisitArrayField = NULL,
 	.VisitTopLevelField = CompareVisitTopLevelField,
 	.SetIntermediateArrayIndex = NULL,
+	.HandleIntermediateArrayPathNotFound = NULL,
+	.SetIntermediateArrayStartEnd = NULL,
 };
 
 
@@ -422,7 +483,9 @@ static const TraverseBsonExecutionFuncs CompareDollarRangeExecutionFuncs = {
 	.SetTraverseResult = CompareSetTraverseResult,
 	.VisitArrayField = DollarRangeVisitArrayField,
 	.VisitTopLevelField = DollarRangeVisitTopLevelField,
-	.SetIntermediateArrayIndex = NULL
+	.SetIntermediateArrayIndex = NULL,
+	.HandleIntermediateArrayPathNotFound = NULL,
+	.SetIntermediateArrayStartEnd = NULL,
 };
 
 
@@ -498,8 +561,15 @@ PG_FUNCTION_INFO_V1(bson_dollar_ne);
 PG_FUNCTION_INFO_V1(bson_dollar_nin);
 PG_FUNCTION_INFO_V1(bson_dollar_exists);
 PG_FUNCTION_INFO_V1(command_bson_orderby);
+PG_FUNCTION_INFO_V1(command_bson_orderby_reverse);
 PG_FUNCTION_INFO_V1(bson_orderby_partition);
 PG_FUNCTION_INFO_V1(bson_vector_orderby);
+PG_FUNCTION_INFO_V1(bson_orderby_compare);
+PG_FUNCTION_INFO_V1(bson_orderby_compare_sort_support);
+PG_FUNCTION_INFO_V1(bson_orderby_lt);
+PG_FUNCTION_INFO_V1(bson_orderby_eq);
+PG_FUNCTION_INFO_V1(bson_orderby_gt);
+
 PG_FUNCTION_INFO_V1(bson_dollar_bits_all_clear);
 PG_FUNCTION_INFO_V1(bson_dollar_bits_any_clear);
 PG_FUNCTION_INFO_V1(bson_dollar_bits_all_set);
@@ -515,6 +585,8 @@ PG_FUNCTION_INFO_V1(bson_dollar_not_gt);
 PG_FUNCTION_INFO_V1(bson_dollar_not_gte);
 PG_FUNCTION_INFO_V1(bson_dollar_not_lt);
 PG_FUNCTION_INFO_V1(bson_dollar_not_lte);
+PG_FUNCTION_INFO_V1(bson_dollar_fullscan);
+PG_FUNCTION_INFO_V1(bson_dollar_index_hint);
 
 PG_FUNCTION_INFO_V1(bson_value_dollar_eq);
 PG_FUNCTION_INFO_V1(bson_value_dollar_gt);
@@ -717,7 +789,7 @@ bson_value_dollar_all(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $elemMatch functionality
+ * implements the $elemMatch functionality
  * in the runtime. Checks that the value in the element is
  * an array and at least one element matches all the conditions
  * provided in the nested filter.
@@ -741,7 +813,7 @@ bson_dollar_elemmatch(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $elemMatch functionality
+ * implements the $elemMatch functionality
  * in the runtime for bson_values. Checks that the value in the element is
  * an array and at least one element matches all the conditions
  * provided in the nested filter.
@@ -766,7 +838,7 @@ bson_value_dollar_elemmatch(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_bits_all_clear implements the Mongo's $bitsAllClear functionality
+ * bson_dollar_bits_all_clear implements the $bitsAllClear functionality
  * in the runtime. This compares that all set bits of filter are unset in document or not.
  */
 Datum
@@ -782,7 +854,7 @@ bson_dollar_bits_all_clear(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_bits_any_clear implements the Mongo's $bitsAnyClear functionality
+ * bson_dollar_bits_any_clear implements the $bitsAnyClear functionality
  * in the runtime. This compares that any set bit of filter is unset in document or not.
  */
 Datum
@@ -798,7 +870,7 @@ bson_dollar_bits_any_clear(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_bits_all_set implements the Mongo's $bitsAllSet functionality
+ * bson_dollar_bits_all_set implements the $bitsAllSet functionality
  * in the runtime. This compares that all set bits of filter are set in document or not.
  */
 Datum
@@ -814,7 +886,7 @@ bson_dollar_bits_all_set(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_bits_any_set implements the Mongo's $bitsAnySet functionality
+ * bson_dollar_bits_any_set implements the $bitsAnySet functionality
  * in the runtime. This compares that any set bit of filter is set in document or not.
  */
 Datum
@@ -830,7 +902,7 @@ bson_dollar_bits_any_set(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $bitsAllClear functionality
+ * implements the $bitsAllClear functionality
  * in the runtime. This compares that all set bits of filter are unset in element value or not.
  */
 Datum
@@ -847,7 +919,7 @@ bson_value_dollar_bits_all_clear(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $bitsAnyClear functionality
+ * implements the $bitsAnyClear functionality
  * in the runtime. This compares that any set bits of filter is unset in element value or not.
  */
 Datum
@@ -864,7 +936,7 @@ bson_value_dollar_bits_any_clear(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $bitsAllSet functionality
+ * implements the $bitsAllSet functionality
  * in the runtime. This compares that all set bits of filter are set in element value or not.
  */
 Datum
@@ -881,7 +953,7 @@ bson_value_dollar_bits_all_set(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $bitsAnySet functionality
+ * implements the $bitsAnySet functionality
  * in the runtime. This compares that any set bits of filter is set in element value or not.
  */
 Datum
@@ -898,8 +970,8 @@ bson_value_dollar_bits_any_set(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_regex implements the Mongo's $regex functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_regex implements the $regex functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the regex on the value provided.
  */
@@ -921,7 +993,7 @@ bson_dollar_regex(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $regex functionality
+ * implements the $regex functionality
  * in the runtime. Checks that the value in the element provided
  * that at least one matches the regex on the value provided.
  */
@@ -944,7 +1016,7 @@ bson_value_dollar_regex(PG_FUNCTION_ARGS)
 
 
 /*
- * Implements the Mongo's $mod functionality in the runtime for bson_values.
+ * Implements the $mod functionality in the runtime for bson_values.
  * Checks if the value of given field divided by a divisor has the specified remainder
  */
 Datum
@@ -960,7 +1032,7 @@ bson_dollar_mod(PG_FUNCTION_ARGS)
 
 
 /*
- * Implements the Mongo's $mod functionality in the runtime.
+ * Implements the $mod functionality in the runtime.
  * Checks if the value of given field divided by a divisor has the specified remainder
  */
 Datum
@@ -976,8 +1048,8 @@ bson_value_dollar_mod(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_eq implements the Mongo's $eq functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_eq implements the $eq functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the equality semantics on the value
  * provided.
@@ -994,7 +1066,7 @@ bson_dollar_eq(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $eq functionality
+ * implements the $eq functionality
  * in the runtime. Checks that the value in the element provided
  * is equal to the value in the filter.
  *
@@ -1014,8 +1086,8 @@ bson_value_dollar_eq(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_gt implements the Mongo's $gt functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_gt implements the $gt functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the greater than semantics on the value
  * provided.
@@ -1033,7 +1105,7 @@ bson_dollar_gt(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $gt functionality
+ * implements the $gt functionality
  * in the runtime. Checks that the value in the element provided
  * is greater than the value in the filter.
  */
@@ -1050,7 +1122,7 @@ bson_value_dollar_gt(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $not: { $gt: {} } functionality
+ * implements the $not: { $gt: {} } functionality
  * in the runtime. Checks that the value in the element provided
  * is greater than the value in the filter.
  */
@@ -1068,8 +1140,8 @@ bson_dollar_not_gt(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_gte implements the Mongo's $gte functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_gte implements the $gte functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the greater than or equal
  *  semantics on the value provided.
@@ -1086,8 +1158,8 @@ bson_dollar_gte(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_gte implements the Mongo's $not: { $gte: {} } functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_gte implements the $not: { $gte: {} } functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the greater than or equal
  *  semantics on the value provided.
@@ -1104,9 +1176,33 @@ bson_dollar_not_gte(PG_FUNCTION_ARGS)
 }
 
 
+Datum
+bson_dollar_fullscan(PG_FUNCTION_ARGS)
+{
+	/*
+	 * This function is a no-op. It is used to indicate that the query
+	 * should be executed as a full scan, without any filters.
+	 * The actual logic for full scan is handled in the query planner.
+	 */
+	ereport(ERROR, (errmsg("This function should be replaced by the planner")));
+}
+
+
+Datum
+bson_dollar_index_hint(PG_FUNCTION_ARGS)
+{
+	/*
+	 * This function is a no-op. It is used to indicate that the query
+	 * should use a specific index hint, which is handled in the query planner.
+	 * The actual logic for index hint is handled in the query planner.
+	 */
+	ereport(ERROR, (errmsg("The index hint function should be replaced by the planner")));
+}
+
+
 /*
  * bson_dollar_range implements the DocumentDB API's version of the range
- * functionality in the runtime. Note that this is different from MongoDB's
+ * functionality in the runtime. Note that this is different from
  * $range array operator. This combines $gt and $lt conditions into a range
  * operator that can be used to traverse an index efficiently.
  *
@@ -1134,9 +1230,7 @@ bson_dollar_range(PG_FUNCTION_ARGS)
 		PopulateRangeStateFromQuery,
 		filter);
 
-	DollarRangeParams localState = {
-		{ 0 }, { 0 }, false, false
-	};
+	DollarRangeParams localState = { 0 };
 	if (cachedRangeParamsState == NULL)
 	{
 		PopulateRangeStateFromQuery(&localState, filter);
@@ -1181,6 +1275,15 @@ bson_dollar_range(PG_FUNCTION_ARGS)
 	rangeState.isMinConditionSet = false;
 	rangeState.isMaxConditionSet = false;
 
+	if (rangeState.params.isFullScan || rangeState.params.isElemMatch)
+	{
+		/* if the range is a full scan, we don't need to traverse the document
+		 * similarly for $elemMatch this range query is only used on the index
+		 * so we bypass the runtime recheck and let the runtime filter handle it.
+		 */
+		PG_RETURN_BOOL(true);
+	}
+
 	bson_iter_t documentIterator;
 	PgbsonInitIterator(document, &documentIterator);
 	TraverseBson(&documentIterator, rangeState.elementState.filter->path,
@@ -1201,7 +1304,7 @@ bson_dollar_range(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $gte functionality
+ * implements the $gte functionality
  * in the runtime. Checks that the value in the element provided
  * is greater than or equal the value in the filter.
  */
@@ -1219,8 +1322,8 @@ bson_value_dollar_gte(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_not_lt implements the Mongo's $not: { $lt: {}} functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_not_lt implements the $not: { $lt: {}} functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the less than
  *  semantics on the value provided.
@@ -1239,8 +1342,8 @@ bson_dollar_not_lt(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_lt implements the Mongo's $lt functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_lt implements the $lt functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the less than
  *  semantics on the value provided.
@@ -1258,7 +1361,7 @@ bson_dollar_lt(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $lt functionality
+ * implements the $lt functionality
  * in the runtime. Checks that the value in the element provided
  * is less than the value in the filter.
  */
@@ -1275,8 +1378,8 @@ bson_value_dollar_lt(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_lte implements the Mongo's $lte functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_lte implements the $lte functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the less than or equal
  *  semantics on the value provided.
@@ -1294,8 +1397,8 @@ bson_dollar_lte(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_not_lte implements the Mongo's $not: { $lte: {}} functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_not_lte implements the $not: { $lte: {}} functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches the less than or equal
  *  semantics on the value provided.
@@ -1314,7 +1417,7 @@ bson_dollar_not_lte(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $lte functionality
+ * implements the $lte functionality
  * in the runtime. Checks that the value in the element provided
  * is less than or equal to the value in the filter.
  */
@@ -1331,8 +1434,8 @@ bson_value_dollar_lte(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_in implements the Mongo's $in functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_in implements the $in functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one matches at least one of the input array values.
  */
@@ -1386,7 +1489,7 @@ bson_dollar_merge_join_filter(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $in functionality
+ * implements the $in functionality
  * in the runtime. Checks that the value in the element provided
  * is equal to at least one of the values in the filter.
  */
@@ -1408,11 +1511,11 @@ bson_value_dollar_in(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_nin implements the Mongo's $nin functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_nin implements the $nin functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one does not match the query value presented.
- * Note: per Mongo's $nin requirements, documents that don't have the field
+ * Note: per $nin requirements, documents that don't have the field
  * are also considered to be $nin.
  */
 Datum
@@ -1443,7 +1546,7 @@ bson_dollar_nin(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $nin functionality
+ * implements the $nin functionality
  * in the runtime. Checks that the value in the element provided
  * is not equal to any of the values in the filter.
  */
@@ -1465,11 +1568,11 @@ bson_value_dollar_nin(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_ne implements the Mongo's $ne functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_ne implements the $ne functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one does not match the query value presented.
- * Note: per Mongo's $ne requirements, documents that don't have the field
+ * Note: per $ne requirements, documents that don't have the field
  * are also considered to be $ne.
  */
 Datum
@@ -1485,7 +1588,7 @@ bson_dollar_ne(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $ne functionality
+ * implements the $ne functionality
  * in the runtime. Checks that the value in the element provided
  * is not equal to the value in the filter.
  */
@@ -1502,8 +1605,8 @@ bson_value_dollar_ne(PG_FUNCTION_ARGS)
 
 
 /*
- * bson_dollar_exists implements the Mongo's $exits functionality
- * in the runtime. This traverses the document based on Mongo's
+ * bson_dollar_exists implements the $exits functionality
+ * in the runtime. This traverses the document based on
  * filter dot-notation syntax and for all possible values, checks
  * that at least one path matches the $exists operator.
  */
@@ -1523,7 +1626,7 @@ bson_dollar_exists(PG_FUNCTION_ARGS)
 
 
 /*
- * implements the Mongo's $gt functionality
+ * implements the $gt functionality
  * in the runtime. Checks that the value in the element provided
  * exists.
  */
@@ -1543,7 +1646,7 @@ bson_value_dollar_exists(PG_FUNCTION_ARGS)
 
 
 /*
- * implements Mongo's $expr functionality
+ * implements $expr functionality
  * in the runtime. Evaluates the expression pointed to by the filter
  * against the document. Returns true in the following cases:
  * 1) The expression evaluated to a boolean result and is true.
@@ -1615,14 +1718,14 @@ bson_dollar_expr(PG_FUNCTION_ARGS)
 
 
 /*
- * implements Mongo's $text functionality
+ * implements $text functionality
  * in the runtime. Simply fails as $text is not supported on the runtime.
  */
 Datum
 bson_dollar_text(PG_FUNCTION_ARGS)
 {
 	ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INDEXNOTFOUND),
-					errmsg("text index required for $text query")));
+					errmsg("A text index is necessary to perform a $text query.")));
 	PG_RETURN_BOOL(false);
 }
 
@@ -1638,9 +1741,40 @@ command_bson_orderby(PG_FUNCTION_ARGS)
 {
 	pgbson *document = PG_GETARG_PGBSON_PACKED(0);
 	pgbson *filter = PG_GETARG_PGBSON_PACKED(1);
+	char *collationString = NULL;
+
+	if (EnableCollation && PG_NARGS() > 2 && !PG_ARGISNULL(2))
+	{
+		collationString = text_to_cstring(PG_GETARG_TEXT_P(2));
+	}
+
 	bool validateSort = true;
 	CustomOrderByOptions options = CustomOrderByOptions_Default;
-	Datum returnedBson = BsonOrderbyCore(document, filter, validateSort, options);
+	Datum returnedBson = BsonOrderbyCore(document, filter, collationString, validateSort,
+										 options);
+
+	PG_FREE_IF_COPY(document, 0);
+	PG_FREE_IF_COPY(filter, 1);
+	PG_RETURN_DATUM(returnedBson);
+}
+
+
+Datum
+command_bson_orderby_reverse(PG_FUNCTION_ARGS)
+{
+	pgbson *document = PG_GETARG_PGBSON_PACKED(0);
+	pgbson *filter = PG_GETARG_PGBSON_PACKED(1);
+	char *collationString = NULL;
+
+	if (EnableCollation && PG_NARGS() > 2 && !PG_ARGISNULL(2))
+	{
+		collationString = text_to_cstring(PG_GETARG_TEXT_P(2));
+	}
+
+	bool validateSort = true;
+	CustomOrderByOptions options = CustomOrderByOptions_SetReverseFlag;
+	Datum returnedBson = BsonOrderbyCore(document, filter, collationString, validateSort,
+										 options);
 
 	PG_FREE_IF_COPY(document, 0);
 	PG_FREE_IF_COPY(filter, 1);
@@ -1659,12 +1793,19 @@ bson_orderby_partition(PG_FUNCTION_ARGS)
 	pgbson *document = PG_GETARG_PGBSON_PACKED(0);
 	pgbson *filter = PG_GETARG_PGBSON_PACKED(1);
 	bool isTimeRangeWindow = PG_GETARG_BOOL(2);
+	char *collationString = NULL;
+
+	if (EnableCollation && PG_NARGS() > 3 && !PG_ARGISNULL(3))
+	{
+		collationString = text_to_cstring(PG_GETARG_TEXT_P(3));
+	}
+
 	bool validateSort = true;
 
 	CustomOrderByOptions options = isTimeRangeWindow ?
 								   CustomOrderByOptions_AllowOnlyDates :
 								   CustomOrderByOptions_AllowOnlyNumbers;
-	Datum returnedBson = BsonOrderbyCore(document, filter, validateSort,
+	Datum returnedBson = BsonOrderbyCore(document, filter, collationString, validateSort,
 										 options);
 
 	PG_FREE_IF_COPY(document, 0);
@@ -1693,16 +1834,250 @@ bson_vector_orderby(PG_FUNCTION_ARGS)
 }
 
 
+static void
+PgbsonToBsonSortInput(pgbson *bson, BsonSortInput *sortInput)
+{
+	bson_iter_t iter;
+	PgbsonInitIterator(bson, &iter);
+	sortInput->collationString = NULL;
+	sortInput->isTruncated = false;
+	sortInput->isReverse = false;
+
+	if (!bson_iter_next(&iter))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("invalid input BSON: Should not have empty document")));
+	}
+
+	BsonIterToPgbsonElement(&iter, &sortInput->element);
+	while (bson_iter_next(&iter))
+	{
+		if (strcmp(bson_iter_key(&iter), "collation") == 0)
+		{
+			sortInput->collationString = bson_iter_utf8(&iter, NULL);
+		}
+		else if (strcmp(bson_iter_key(&iter), "t") == 0)
+		{
+			sortInput->isTruncated = bson_iter_bool(&iter);
+		}
+		else if (strcmp(bson_iter_key(&iter), "r") == 0)
+		{
+			sortInput->isReverse = bson_iter_bool(&iter);
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg(
+								"invalid input BSON: entry in the bson document must have key \"collation\" or \"t\" or \"r\"")));
+		}
+	}
+}
+
+
+inline static int32_t
+CompareBsonSortInputForOrderingCore(BsonSortInput *left, BsonSortInput *right)
+{
+	left->collationString = IsCollationApplicable(left->collationString) ?
+							left->collationString : NULL;
+
+	right->collationString = IsCollationApplicable(right->collationString) ?
+							 right->collationString : NULL;
+
+	/* compare the collation strings. */
+	const char *collationString = NULL;
+	if (left->collationString != NULL && right->collationString != NULL)
+	{
+		int collationCmp = strcmp(left->collationString, right->collationString);
+
+		if (collationCmp != 0)
+		{
+			return collationCmp;
+		}
+
+		collationString = left->collationString;
+	}
+	else if (left->collationString != NULL && right->collationString == NULL)
+	{
+		return 1;
+	}
+	else if (right->collationString != NULL && left->collationString == NULL)
+	{
+		return -1;
+	}
+
+	/* compare the left and right values */
+	int cmp = 0;
+	bool isComparisonValid = true;
+	if (collationString != NULL)
+	{
+		cmp = CompareBsonValueAndTypeWithCollation(&left->element.bsonValue,
+												   &right->element.bsonValue,
+												   &isComparisonValid, collationString);
+	}
+	else
+	{
+		cmp = CompareBsonValueAndType(&left->element.bsonValue, &right->element.bsonValue,
+									  &isComparisonValid);
+	}
+
+	return cmp;
+}
+
+
+static int32_t
+CompareDatumsForOrdering(Datum left, Datum right, SortSupport sortSupport)
+{
+	pgbson *leftBson = DatumGetPgBsonPacked(left);
+	pgbson *rightBson = DatumGetPgBsonPacked(right);
+
+	BsonSortInput leftInput, rightInput;
+	PgbsonToBsonSortInput(leftBson, &leftInput);
+	PgbsonToBsonSortInput(rightBson, &rightInput);
+	int cmp = CompareBsonSortInputForOrderingCore(&leftInput, &rightInput);
+
+	if ((Pointer) (left) != DatumGetPointer(left))
+	{
+		pfree(leftBson);
+	}
+
+	if ((Pointer) (right) != DatumGetPointer(right))
+	{
+		pfree(rightBson);
+	}
+
+	if (leftInput.isReverse ^ rightInput.isReverse)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("cannot compare documents with different reverse flags")));
+	}
+
+	/* On truncation, order by is comparing a runtime term with an index term.
+	 * In this path, if one term is truncated and the other isn't, ensure that we're
+	 * only tracking the order as "ascending". If both are truncated, or not we apply
+	 * the order as requested. This is to match the behavior in IndexOrderWithRecheck
+	 * in nodeIndexScan.c
+	 */
+	bool isTruncationSame = leftInput.isTruncated == rightInput.isTruncated;
+	return (leftInput.isReverse && isTruncationSame) ? -cmp : cmp;
+}
+
+
+/*
+ * bson_orderby_compare compares two bson documents.
+ * It returns:
+ * -1 if the left document is less than the right document
+ * 0 if the left document is equal to the right document
+ * 1 if the left document is greater than the right document
+ *
+ * left and right will contain one or two fields:
+ * 1. the compare field path
+ * 2. the collation string to use for comparison (optional)
+ *
+ * Example: { "a": "name", "collation": "en-u-ks-level1" }
+ *
+ * It is also the custom comparator for ORDER BY ... USING clause.
+ */
+Datum
+bson_orderby_compare(PG_FUNCTION_ARGS)
+{
+	pgbson *leftBson = PG_GETARG_PGBSON_PACKED(0);
+	pgbson *rightBson = PG_GETARG_PGBSON_PACKED(1);
+
+	BsonSortInput leftInput, rightInput;
+	PgbsonToBsonSortInput(leftBson, &leftInput);
+	PgbsonToBsonSortInput(rightBson, &rightInput);
+	int cmp = CompareBsonSortInputForOrderingCore(&leftInput, &rightInput);
+	PG_FREE_IF_COPY(leftBson, 0);
+	PG_FREE_IF_COPY(rightBson, 1);
+	PG_RETURN_INT32(cmp);
+}
+
+
+/* Support function for order by op-class that can provide a custom comparator function */
+Datum
+bson_orderby_compare_sort_support(PG_FUNCTION_ARGS)
+{
+	SortSupport sortSupport = (SortSupport) PG_GETARG_POINTER(0);
+	if (sortSupport->ssup_reverse)
+	{
+		sortSupport->comparator = CompareDatumsForOrdering;
+	}
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * bson_orderby_lt compares two bson documents and returns true if the left document
+ * is less than the right document.
+ *
+ * left and right will contain one or two fields:
+ * 1. the compare field path
+ * 2. the collation string to use for comparison (optional)
+ *
+ * Example: { "a": "name", "collation": "en-u-ks-level1" }
+ *
+ * It is also the comparator for ORDER BY ... USING  <<< clause.
+ */
+Datum
+bson_orderby_lt(PG_FUNCTION_ARGS)
+{
+	int cmp = DatumGetInt32(bson_orderby_compare(fcinfo));
+	PG_RETURN_BOOL(cmp < 0);
+}
+
+
+/*
+ * bson_orderby_eq compares two bson documents and returns true if the left document
+ * is equal than the right document.
+ *
+ * left and right will contain one or two fields:
+ * 1. the compare field path
+ * 2. the collation string to use for comparison (optional)
+ *
+ * Example: { "a": "name", "collation": "en-u-ks-level1" }
+ *
+ * It implements the === internal operator.
+ */
+Datum
+bson_orderby_eq(PG_FUNCTION_ARGS)
+{
+	int cmp = DatumGetInt32(bson_orderby_compare(fcinfo));
+	PG_RETURN_BOOL(cmp == 0);
+}
+
+
+/*
+ * bson_orderby_gt compares two bson documents and returns true if the left document
+ * is greater than the right document.
+ *
+ * left and right will contain one or two fields:
+ * 1. the compare field path
+ * 2. the collation string to use for comparison (optional)
+ *
+ * Example: { "a": "name", "collation": "en-u-ks-level1" }
+ *
+ * It is also the comparator for ORDER BY ... USING >>> clause.
+ */
+Datum
+bson_orderby_gt(PG_FUNCTION_ARGS)
+{
+	int cmp = DatumGetInt32(bson_orderby_compare(fcinfo));
+	PG_RETURN_BOOL(cmp > 0);
+}
+
+
 /*
  * Applies the $sort runtime projection.
  * ValidateSort is to handle a bug with $first where it passes the expression
  * as one of the sort specs
  */
 Datum
-BsonOrderby(pgbson *document, pgbson *filter, bool validateSort)
+BsonOrderby(pgbson *document, pgbson *filter, bool validateSort, const
+			char *collationString)
 {
 	CustomOrderByOptions options = CustomOrderByOptions_Default;
-	return BsonOrderbyCore(document, filter, validateSort, options);
+	return BsonOrderbyCore(document, filter, collationString, validateSort, options);
 }
 
 
@@ -1754,7 +2129,7 @@ bool
 CompareArrayForBitsAllClear(bson_iter_t *sourceArrayIter, bson_iter_t *filterArrayIter,
 							bool isSignExtended)
 {
-	/* filter or source array is empty */
+	/* The filter or source array has no elements */
 	if (!bson_iter_next(filterArrayIter) || !bson_iter_next(sourceArrayIter))
 	{
 		return true;
@@ -1818,7 +2193,7 @@ CompareArrayForBitsAnyClear(bson_iter_t *sourceArrayIter, bson_iter_t *filterArr
 		return false;
 	}
 
-	/* source array is empty */
+	/* The source array contains no elements */
 	if (!bson_iter_next(sourceArrayIter))
 	{
 		return true;
@@ -1899,7 +2274,7 @@ CompareArrayForBitsAllSet(bson_iter_t *sourceArrayIter, bson_iter_t *filterArray
 		return true;
 	}
 
-	/* source array is empty */
+	/* The source array contains no elements */
 	if (!bson_iter_next(sourceArrayIter))
 	{
 		return false;
@@ -1980,7 +2355,7 @@ CompareArrayForBitsAnySet(bson_iter_t *sourceArrayIter, bson_iter_t *filterArray
 		return false;
 	}
 
-	/* source array is empty */
+	/* The source array contains no elements */
 	if (!bson_iter_next(sourceArrayIter))
 	{
 		return false;
@@ -2182,13 +2557,13 @@ GetRemainderFromModBsonValues(const bson_value_t *dividendValue,
 		if (IsBsonValueInfinity(divisorValue))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-								"divisor cannot be infinite")));
+								"Division by an infinite value is not allowed")));
 		}
 
 		if (IsBsonValueNaN(divisorValue))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-								"divisor cannot be NaN")));
+								"A divisor value must not be NaN")));
 		}
 
 		if ((divisorValue->value_type == BSON_TYPE_DECIMAL128 && IsDecimal128Zero(
@@ -2196,7 +2571,7 @@ GetRemainderFromModBsonValues(const bson_value_t *dividendValue,
 			(BsonValueAsDouble(divisorValue) == 0.0))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-								"divisor cannot be Zero")));
+								"Division by zero is not permitted")));
 		}
 	}
 
@@ -2233,7 +2608,6 @@ GetRemainderFromModBsonValues(const bson_value_t *dividendValue,
 		 *    both operands are long or one is int, we should return long
 		 *    one of the operands is double (not Inf) and one long and the remainder fits in an int32, we should return long.
 		 *    the dividend is an int32, the other is not Inf and the remainder can be represented as an int32, we should return int.
-		 * (ref: 4.4.13\jstests\core\mod_overflow.js, 4.4.13\jstests\aggregation\expressions\expression_mod.js).
 		 */
 		bool checkFixedInteger = true;
 		if ((dividendValue->value_type == BSON_TYPE_INT64 ||
@@ -2321,13 +2695,13 @@ CompareModOperator(const bson_value_t *srcVal, const bson_value_t *modArrVal)
  * Few cases require the type to be same e.g. $sort in `$setWindowFields` stage
  */
 static Datum
-BsonOrderbyCore(pgbson *document, pgbson *filter, bool validateSort,
-				CustomOrderByOptions options)
+BsonOrderbyCore(pgbson *document, pgbson *filter, const char *collationString,
+				bool validateSort, CustomOrderByOptions options)
 {
 	bson_iter_t documentIterator;
 	pgbsonelement filterElement;
 	TraverseOrderByValidateState state = {
-		{ 0 }, NULL, { 0 }, options
+		{ 0 }, NULL, { 0 }, options, collationString, 0, false
 	};
 
 	pgbson_writer writer;
@@ -2347,7 +2721,7 @@ BsonOrderbyCore(pgbson *document, pgbson *filter, bool validateSort,
 	if (!BsonValueIsNumber(&filterElement.bsonValue) && validateSort)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-						errmsg("Invalid sort direction %s",
+						errmsg("Sort direction value %s is not valid",
 							   BsonValueToJsonForLogging(
 								   &filterElement.bsonValue))));
 	}
@@ -2364,13 +2738,21 @@ BsonOrderbyCore(pgbson *document, pgbson *filter, bool validateSort,
 	{
 		/* here we write an empty path and minKey so it's sorted first. */
 		state.orderByValue.value_type = BSON_TYPE_UNDEFINED;
-		PgbsonWriterAppendValue(&writer, filterElement.path, filterPathLength,
-								&state.orderByValue);
 	}
-	else
+
+	PgbsonWriterAppendValue(&writer, filterElement.path, filterPathLength,
+							&state.orderByValue);
+
+	/* append the collation for use in bson_orderby_compare */
+	if (IsCollationApplicable(collationString))
 	{
-		PgbsonWriterAppendValue(&writer, filterElement.path, filterPathLength,
-								&state.orderByValue);
+		PgbsonWriterAppendUtf8(&writer, "collation", 9, collationString);
+	}
+
+	if (options == CustomOrderByOptions_SetReverseFlag)
+	{
+		/* if the order by is min, we set the reverse flag to true */
+		PgbsonWriterAppendBool(&writer, "r", 1, true);
 	}
 
 	return PointerGetDatum(PgbsonWriterGetPgbson(&writer));
@@ -2413,8 +2795,9 @@ CompareBsonValueAgainstQueryCore(const pgbsonelement *element,
 		}
 
 		filterElement->pathLength = 0;
-		TraverseBson(&documentIterator, filterElement->path, state,
-					 executionFuncs);
+		StringView pathView = CreateStringViewFromString(filterElement->path);
+		TraverseBsonPathStringView(&documentIterator, &pathView, state,
+								   executionFuncs);
 		return ProcessQueryResultAndGetMatch(isQueryFilterNull, state);
 	}
 }
@@ -2450,8 +2833,20 @@ CompareBsonAgainstQuery(const pgbson *element,
 	filterElement.pathLength = 0;
 	state.filter = &filterElement;
 	state.traverseState.matchFunc = compareFunc;
-	TraverseBson(&documentIterator, filterElement.path, &state.traverseState,
-				 &CompareExecutionFuncs);
+	bool isFilterNull = isQueryFilterNull != NULL && isQueryFilterNull(
+		&state.traverseState);
+	const TraverseBsonExecutionFuncs *execFuncs = &CompareExecutionFuncs;
+	if (isFilterNull)
+	{
+		/* if the filter is null, start by assuming path mismatch. If we find
+		 * pathNotFound, it'll get overwritten. This way we can track explicitly
+		 * that we got pathNotFound.
+		 */
+		state.traverseState.compareResult = CompareResult_Mismatch;
+		execFuncs = &CompareNullExecutionFuncs;
+	}
+
+	TraverseBson(&documentIterator, filterElement.path, &state.traverseState, execFuncs);
 	return ProcessQueryResultAndGetMatch(isQueryFilterNull, &state.traverseState);
 }
 
@@ -2864,27 +3259,39 @@ CompareAllMatch(const pgbsonelement *documentIterator,
  * than the one selected so far.
  */
 static void
-CompareForOrderBy(const pgbsonelement *element,
+CompareForOrderBy(const bson_value_t *element,
 				  TraverseOrderByValidateState *validationState)
 {
 	if (validationState->orderByValue.value_type == BSON_TYPE_EOD)
 	{
-		validationState->orderByValue = element->bsonValue;
+		validationState->orderByValue = *element;
 	}
 	else
 	{
 		bool isComparisonValidIgnore;
-		int sortOrderCmp = CompareBsonValueAndType(&element->bsonValue,
+		int sortOrderCmp = 0;
+		if (IsCollationApplicable(validationState->collationString))
+		{
+			sortOrderCmp =
+				CompareBsonValueAndTypeWithCollation(element,
+													 &validationState->orderByValue,
+													 &isComparisonValidIgnore,
+													 validationState->collationString);
+		}
+		else
+		{
+			sortOrderCmp = CompareBsonValueAndType(element,
 												   &validationState->orderByValue,
 												   &isComparisonValidIgnore);
+		}
 
 		if (sortOrderCmp > 0 && !validationState->isOrderByMin)
 		{
-			validationState->orderByValue = element->bsonValue;
+			validationState->orderByValue = *element;
 		}
 		else if (sortOrderCmp < 0 && validationState->isOrderByMin)
 		{
-			validationState->orderByValue = element->bsonValue;
+			validationState->orderByValue = *element;
 		}
 	}
 }
@@ -2954,7 +3361,7 @@ PopulateRegexState(PG_FUNCTION_ARGS, TraverseRegexValidateState *state)
 
 	if (EnableCollation)
 	{
-		/* collation does not take effect on $regex according to native Mongo */
+		/* collation does not take effect on $regex  */
 		PgbsonToSinglePgbsonElementWithCollation(filter, &filterElement);
 	}
 	else
@@ -2963,18 +3370,18 @@ PopulateRegexState(PG_FUNCTION_ARGS, TraverseRegexValidateState *state)
 	}
 
 	/* State populated if and only if cached state is unusable */
-	RegexData localState = { 0 };
-
 	SetCachedFunctionState(regexState, RegexData, 1, PopulateRegexFromQuery,
 						   &filterElement);
 	if (regexState == NULL)
 	{
-		/* Cache is not available */
-		PopulateRegexFromQuery(&localState, &filterElement);
-		regexState = &localState;
+		/* Cache not available */
+		PopulateRegexFromQuery(&state->regexData, &filterElement);
+	}
+	else
+	{
+		state->regexData = *regexState;
 	}
 
-	state->regexData = *regexState;
 	state->traverseState.matchFunc = CompareRegexMatch;
 	return filterElement;
 }
@@ -2992,7 +3399,7 @@ PopulateRegexFromQuery(RegexData *regexState, pgbsonelement *filterElement)
 		filterElement->bsonValue.value_type != BSON_TYPE_REGEX)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"$regex has to be a string")));
+							"$regex must be provided with a string value")));
 	}
 
 
@@ -3677,6 +4084,35 @@ CompareVisitArrayField(pgbsonelement *element, const StringView *filterPath, int
 }
 
 
+static void
+CompareSetTraverseResultForNulls(void *state, TraverseBsonResult traverseResult)
+{
+	TraverseValidateState *validateState = (TraverseValidateState *) state;
+	switch (traverseResult)
+	{
+		case TraverseBsonResult_PathNotFound:
+		{
+			validateState->compareResult = CompareResult_PathNotFound;
+			break;
+		}
+
+		case TraverseBsonResult_TypeMismatch:
+		{
+			/* The state starts out as mismatch and we would reset it to either
+			 * Match or PathNotFound - ignore new TypeMismatch requests (since
+			 * PathNotFound wins over Mismatch).
+			 */
+			break;
+		}
+
+		default:
+		{
+			ereport(ERROR, (errmsg("Unexpected traverse result %d", traverseResult)));
+		}
+	}
+}
+
+
 /*
  * Updates the comparison logic with the traverse result for path not found/mismatches.
  */
@@ -3710,7 +4146,8 @@ CompareSetTraverseResult(void *state, TraverseBsonResult traverseResult)
  * Returns whether or not comparison searches should continue.
  */
 static bool
-CompareContinueProcessIntermediateArray(void *state, const bson_value_t *value)
+CompareContinueProcessIntermediateArray(void *state, const bson_value_t *value, bool
+										isArrayIndexSearch)
 {
 	TraverseValidateState *validateState = (TraverseValidateState *) state;
 	return validateState->compareResult != CompareResult_Match;
@@ -3736,14 +4173,12 @@ OrderByVisitTopLevelField(pgbsonelement *element, const
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5429513),
 							errmsg(
-								"PlanExecutor error during aggregation :: caused by :: "
-								"Invalid range: Expected the sortBy field to be a Date, "
-								"but it was %s", BsonTypeName(
+								"Aggregation PlanExecutor encountered an - Invalid range - error: The specified sortBy field should be of type Date, but a different type (%s) was provided.",
+								BsonTypeName(
 									element->bsonValue.value_type)),
 							errdetail_log(
-								"PlanExecutor error during aggregation :: caused by :: "
-								"Invalid range: Expected the sortBy field to be a Date, "
-								"but it was %s", BsonTypeName(
+								"Aggregation PlanExecutor encountered an - Invalid range - error: The specified sortBy field should be of type Date, but a different type (%s) was provided.",
+								BsonTypeName(
 									element->bsonValue.value_type))));
 		}
 	}
@@ -3755,14 +4190,12 @@ OrderByVisitTopLevelField(pgbsonelement *element, const
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5429414),
 							errmsg(
-								"PlanExecutor error during aggregation :: caused by :: "
-								"Invalid range: Expected the sortBy field to be a number, "
-								"but it was %s", BsonTypeName(
+								"Aggregation PlanExecutor encountered an - Invalid range - error: The specified sortBy field should be of type Date, but a different type (%s) was provided.",
+								BsonTypeName(
 									element->bsonValue.value_type)),
 							errdetail_log(
-								"PlanExecutor error during aggregation :: caused by :: "
-								"Invalid range: Expected the sortBy field to be a number, "
-								"but it was %s", BsonTypeName(
+								"Aggregation PlanExecutor encountered an - Invalid range - error: The specified sortBy field should be of type Date, but a different type (%s) was provided.",
+								BsonTypeName(
 									element->bsonValue.value_type))));
 		}
 	}
@@ -3773,7 +4206,13 @@ OrderByVisitTopLevelField(pgbsonelement *element, const
 		return true;
 	}
 
-	CompareForOrderBy(element, validateState);
+	CompareForOrderBy(&element->bsonValue, validateState);
+
+	/* Track if we found ourselves without any intermediate arrays:
+	 * I.e. if the path is a.b then it is only reachable by "b" not being an array.
+	 * If the path is a.b.0 then 0 is a top level field of the array.
+	 */
+	validateState->foundAsTopLevelPath = true;
 	return true;
 }
 
@@ -3786,8 +4225,76 @@ OrderByVisitArrayField(pgbsonelement *element, const StringView *filterPath,
 					   int arrayIndex, void *state)
 {
 	TraverseOrderByValidateState *validateState = (TraverseOrderByValidateState *) state;
-	CompareForOrderBy(element, validateState);
+	CompareForOrderBy(&element->bsonValue, validateState);
 	return true;
+}
+
+
+static bool
+OrderByContinueProcessIntermediateArray(void *state, const
+										bson_value_t *value, bool isArrayIndexSearch)
+{
+	/* Orderby needs to continue traversing even after a match to see if there's better options */
+	TraverseOrderByValidateState *validateState = (TraverseOrderByValidateState *) state;
+	if (validateState->foundAsTopLevelPath &&
+		isArrayIndexSearch)
+	{
+		/* We found a path and this is via the array index - we don't recurse again as documents */
+		return false;
+	}
+
+	return true;
+}
+
+
+static void
+OrderByHandleIntermediateArrayPathNotFound(void *state,
+										   int32_t arrayIndex, const
+										   StringView *remainingPath)
+{
+	/* If an intermediate field is not traversable, it gets marked as null */
+	TraverseOrderByValidateState *validateState = (TraverseOrderByValidateState *) state;
+	if (validateState->nestedArrayCount > 0)
+	{
+		bson_value_t nullValue = { 0 };
+		nullValue.value_type = BSON_TYPE_NULL;
+		CompareForOrderBy(&nullValue, validateState);
+	}
+}
+
+
+static void
+OrderBySetIntermediateArrayStartEnd(void *state, bool isStart)
+{
+	TraverseOrderByValidateState *validateState = (TraverseOrderByValidateState *) state;
+	if (isStart)
+	{
+		validateState->nestedArrayCount++;
+	}
+	else
+	{
+		validateState->nestedArrayCount--;
+	}
+}
+
+
+static void
+OrderBySetTraverseResult(void *state, TraverseBsonResult compareResult)
+{
+	TraverseOrderByValidateState *validateState =
+		(TraverseOrderByValidateState *) state;
+	if (compareResult == TraverseBsonResult_PathNotFound &&
+		validateState->nestedArrayCount > 0)
+	{
+		/* This is the path where we request a.b.c (which means we expect b to be an object or array)
+		 * but b is a primitive type. This gets compared as null.
+		 */
+		bson_value_t nullValue = { 0 };
+		nullValue.value_type = BSON_TYPE_NULL;
+		CompareForOrderBy(&nullValue, validateState);
+	}
+
+	CompareSetTraverseResult(state, compareResult);
 }
 
 

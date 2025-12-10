@@ -55,7 +55,7 @@ typedef void (*ParseAggregationExpressionFunc)(const bson_value_t *argument,
  */
 typedef struct
 {
-	/* The mongodb name of the operator (e.g. $literal) */
+	/* The name of the operator (e.g. $literal) */
 	const char *operatorName;
 
 	/* Function pointer to parse the aggregation expression. */
@@ -66,7 +66,7 @@ typedef struct
 
 	/* The feature counter type in order to report feature usage telemetry. */
 	FeatureType featureCounterId;
-} MongoOperatorExpression;
+} DocumentDbOperatorExpression;
 
 
 /*
@@ -85,6 +85,7 @@ typedef struct BsonExpressionPartitionByFieldsGetState
 
 extern bool EnableCollation;
 extern bool EnableNowSystemVariable;
+extern bool EnableVariablesSupportForWriteCommands;
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
@@ -169,7 +170,7 @@ static void CreateProjectionTreeStateForPartitionByFields(
  *  Keep this list lexicographically sorted by the operator name,
  *  as it is binary searched on the key to find the handler.
  */
-static MongoOperatorExpression OperatorExpressions[] = {
+static DocumentDbOperatorExpression OperatorExpressions[] = {
 	{ "$_bucketInternal", &ParseDollarBucketInternal,
 	  &HandlePreParsedDollarBucketInternal,
 	  INTERNAL_FEATURE_TYPE },
@@ -419,7 +420,7 @@ static MongoOperatorExpression OperatorExpressions[] = {
 	{ "$strcasecmp", &ParseDollarStrCaseCmp, &HandlePreParsedDollarStrCaseCmp,
 	  FEATURE_AGG_OPERATOR_STRCASECMP },
 	{ "$substr", &ParseDollarSubstrBytes, &HandlePreParsedDollarSubstrBytes,
-	  FEATURE_AGG_OPERATOR_SUBSTR }, /* MongoDB treats $substr the same as $substrBytes, including error messages */
+	  FEATURE_AGG_OPERATOR_SUBSTR }, /* $substr is the same as $substrBytes */
 	{ "$substrBytes", &ParseDollarSubstrBytes, &HandlePreParsedDollarSubstrBytes,
 	  FEATURE_AGG_OPERATOR_SUBSTRBYTES },
 	{ "$substrCP", &ParseDollarSubstrCP, &HandlePreParsedDollarSubstrCP,
@@ -478,7 +479,7 @@ static MongoOperatorExpression OperatorExpressions[] = {
 };
 
 static int NumberOfOperatorExpressions = sizeof(OperatorExpressions) /
-										 sizeof(MongoOperatorExpression);
+										 sizeof(DocumentDbOperatorExpression);
 
 static const StringView CurrentVariableName =
 {
@@ -552,7 +553,7 @@ PG_FUNCTION_INFO_V1(bson_expression_map);
 
 /*
  * bson_expression_get evaluates a bson expression from a given
- * document. This follows operator expressions as per mongo aggregation expressions.
+ * document. This follows operator expressions as per aggregation expressions.
  * The input is expected to be a bson document with a single value
  * e.g. { "sum": "$a.b"}
  * A fourth argument of the collation string could be provided in which case it will be appended
@@ -799,7 +800,7 @@ bson_expression_partition_by_fields_get(PG_FUNCTION_ARGS)
 
 /*
  * bson_expression_map evaluates a bson expression from a given array of
- * document. This follows operator expressions as per mongo aggregation expressions.
+ * document. This follows operator expressions as per aggregation expressions.
  * The input document should be a document containing the given field name that
  * points to an array of documents.
  * e.g. { "array": [{"_id": 1 ...}, {"_id": 2 ...}, ...]}
@@ -994,10 +995,12 @@ CreateProjectionTreeStateForPartitionByFields(
 
 	bool forceProjectId = false;
 	bool allowInclusionExclusion = true;
+	pgbson *variableSpec = NULL;
 	state->projectionTreeState =
 		(BsonProjectionQueryState *) GetProjectionStateForBsonProject(&iter,
 																	  forceProjectId,
-																	  allowInclusionExclusion);
+																	  allowInclusionExclusion,
+																	  variableSpec);
 }
 
 
@@ -1192,7 +1195,7 @@ ValidateVariableNameCore(StringView name, bool allowStartWithUpper)
 	if (name.length <= 0)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE), errmsg(
-							"empty variable names are not allowed")));
+							"Variable names cannot be left empty")));
 	}
 
 	uint32_t i;
@@ -1204,14 +1207,14 @@ ValidateVariableNameCore(StringView name, bool allowStartWithUpper)
 			(!isupper(current) || !allowStartWithUpper))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE), errmsg(
-								"'%s' starts with an invalid character for a user variable name",
+								"The variable name '%s' begins with a character that is not valid for user-defined variables",
 								name.string)));
 		}
 		else if (isascii(current) && !isdigit(current) && !islower(current) &&
 				 !isupper(current) && current != '_')
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE), errmsg(
-								"'%s' contains an invalid character for a variable name: '%c'",
+								"The variable name '%s' contains an invalid character '%c'.",
 								name.string, current)));
 		}
 	}
@@ -1297,7 +1300,7 @@ ReportOperatorExpressonSyntaxError(const char *fieldA, bson_iter_t *fieldBIter, 
 	if (bson_iter_key_len(fieldBIter) == 0)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE), errmsg(
-							"FieldPath cannot be constructed with empty string.")));
+							"A FieldPath object cannot be created when the provided string is empty.")));
 	}
 
 	/* 1. If performOperatorCheck = false, time to throw error already */
@@ -1306,7 +1309,7 @@ ReportOperatorExpressonSyntaxError(const char *fieldA, bson_iter_t *fieldBIter, 
 									  fieldBIter)[0] == '$'))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION40181), errmsg(
-							"an expression operator specification must contain exactly one field, found 2 fields '%s' and '%s'.",
+							"Expected a single field in an expression operator specification. Found: '%s' and '%s'.",
 							fieldA,
 							bson_iter_key(fieldBIter))));
 	}
@@ -1316,8 +1319,8 @@ ReportOperatorExpressonSyntaxError(const char *fieldA, bson_iter_t *fieldBIter, 
 static int
 CompareOperatorExpressionByName(const void *a, const void *b)
 {
-	return strcmp((*(MongoOperatorExpression *) a).operatorName,
-				  (*(MongoOperatorExpression *) b).operatorName);
+	return strcmp((*(DocumentDbOperatorExpression *) a).operatorName,
+				  (*(DocumentDbOperatorExpression *) b).operatorName);
 }
 
 
@@ -1517,11 +1520,16 @@ ExpressionResultSetValue(ExpressionResult *expressionResult, const
 		expressionResult->value = *value;
 	}
 
-	if (!expressionResult->expressionResultPrivate.variableContext.hasSingleVariable)
+	/* Some variable context tables (eg: from $let) need to be preserved until */
+	/* every document is processed. */
+	ExpressionVariableContext variableContext =
+		expressionResult->expressionResultPrivate.variableContext;
+	bool destroyTable = !variableContext.preserveVariableTable &&
+						!variableContext.hasSingleVariable;
+	if (destroyTable)
 	{
-		hash_destroy(
-			expressionResult->expressionResultPrivate.variableContext.context.table);
-		expressionResult->expressionResultPrivate.variableContext.context.table = NULL;
+		hash_destroy(variableContext.context.table);
+		variableContext.context.table = NULL;
 	}
 }
 
@@ -1753,7 +1761,8 @@ ParseAggregationExpressionData(AggregationExpressionData *expressionData,
 				{
 					/* We got a $$var. expression which is invalid. */
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-									errmsg("FieldPath must not end with a '.'.")));
+									errmsg(
+										"The FieldPath cannot terminate with a '.' character.")));
 				}
 
 				if (StringViewEqualsCString(&expressionView, "$$NOW"))
@@ -1764,7 +1773,7 @@ ParseAggregationExpressionData(AggregationExpressionData *expressionData,
 					{
 						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 										errmsg(
-											"$$NOW is not supported in this context.")));
+											"The $$NOW operator cannot be used within this specific context.")));
 					}
 
 					if (dottedSuffix.length == 0)
@@ -1819,7 +1828,8 @@ ParseAggregationExpressionData(AggregationExpressionData *expressionData,
 					else
 					{
 						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION17276),
-										errmsg("Use of undefined variable: DESCEND")));
+										errmsg(
+											"Usage of an undefined variable detected: DESCEND")));
 					}
 				}
 				else if (StringViewEqualsCString(&expressionView, "$$PRUNE"))
@@ -1834,7 +1844,8 @@ ParseAggregationExpressionData(AggregationExpressionData *expressionData,
 					else
 					{
 						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION17276),
-										errmsg("Use of undefined variable: PRUNE")));
+										errmsg(
+											"Reference to variable PRUNE is not defined")));
 					}
 				}
 				else if (StringViewEqualsCString(&expressionView, "$$KEEP"))
@@ -1849,7 +1860,8 @@ ParseAggregationExpressionData(AggregationExpressionData *expressionData,
 					else
 					{
 						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION17276),
-										errmsg("Use of undefined variable: KEEP")));
+										errmsg(
+											"Reference to variable KEEP is not defined")));
 					}
 				}
 				else if (StringViewEqualsCString(&expressionView, "$$SEARCH_META"))
@@ -1886,7 +1898,7 @@ ParseAggregationExpressionData(AggregationExpressionData *expressionData,
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION16411),
 									errmsg(
-										"FieldPath field names may not contain embedded nulls")));
+										"FieldPath field names cannot include embedded null characters")));
 				}
 			}
 		}
@@ -1902,7 +1914,8 @@ ParseAggregationExpressionData(AggregationExpressionData *expressionData,
 	if (context != NULL &&
 		context->validateParsedExpressionFunc != NULL)
 	{
-		context->validateParsedExpressionFunc(expressionData);
+		context->validateParsedExpressionFunc(expressionData,
+											  context->operatorVariables);
 	}
 }
 
@@ -2002,7 +2015,7 @@ EvaluateAggregationExpressionData(const AggregationExpressionData *expressionDat
 
 		default:
 		{
-			ereport(ERROR, (errmsg("Unexpected aggregation expression kind %d",
+			ereport(ERROR, (errmsg("Unexpected type of aggregation expression %d",
 								   expressionData->kind)));
 		}
 	}
@@ -2132,7 +2145,7 @@ EvaluateAggregationExpressionDataToWriter(const AggregationExpressionData *expre
 
 		default:
 		{
-			ereport(ERROR, (errmsg("Unexpected aggregation expression kind %d",
+			ereport(ERROR, (errmsg("Unexpected type of aggregation expression %d",
 								   expressionData->kind)));
 		}
 	}
@@ -2165,13 +2178,13 @@ ParseFixedArgumentsForExpression(const bson_value_t *argumentValue, int
 
 	int numArgs = BsonDocumentValueCountKeys(argumentValue);
 
-	/* In order to match native mongo, we need to do this in 2 passes.
+	/* To ensure correct error reporting, we need to do this in 2 passes.
 	 * First pass to validate number of args is correct.
 	 * Second pass evaluate the expressions.
 	 * We need to do it in 2 different passes as if we evaluate
 	 * expressions in the first pass and a nested expression throws an error
 	 * we would report that error, rather than the wrong number of args error,
-	 * and native mongo's wrong number of args error always wins. */
+	 * and the wrong number of args error should always take precedence. */
 	if (numArgs != numberOfExpectedArgs)
 	{
 		ThrowExpressionTakesExactlyNArgs(operatorName, numberOfExpectedArgs, numArgs);
@@ -2240,7 +2253,7 @@ EvaluateAggregationExpressionVariable(const AggregationExpressionData *data,
 	if (!ExpressionResultGetVariable(varName, expressionResult, document, &variableValue))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION17276),
-						errmsg("Use of undefined variable: %s",
+						errmsg("Attempting to use an undefined variable: %s",
 							   CreateStringFromStringView(&varName))));
 	}
 
@@ -2447,30 +2460,32 @@ ParseDocumentAggregationExpressionData(const bson_value_t *value,
 		if (bson_iter_next(&docIter))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION40181), errmsg(
-								"an expression operator specification must contain exactly one field, found 2 fields '%s' and '%s'.",
+								"Expected a single field in an expression operator specification. Found: '%s' and '%s'.",
 								operatorKey,
 								bson_iter_key(&docIter))));
 		}
 
 		expressionData->kind = AggregationExpressionKind_Operator;
-		MongoOperatorExpression searchKey = {
+		DocumentDbOperatorExpression searchKey = {
 			.operatorName = operatorKey,
 			.handlePreParsedOperatorFunc = NULL,
 			.parseAggregationExpressionFunc = NULL,
 		};
 
-		MongoOperatorExpression *pItem = (MongoOperatorExpression *) bsearch(&searchKey,
-																			 OperatorExpressions,
-																			 NumberOfOperatorExpressions,
-																			 sizeof(
-																				 MongoOperatorExpression),
-																			 CompareOperatorExpressionByName);
+		DocumentDbOperatorExpression *pItem = (DocumentDbOperatorExpression *) bsearch(
+			&searchKey,
+			OperatorExpressions,
+			NumberOfOperatorExpressions,
+			sizeof(
+				DocumentDbOperatorExpression),
+			CompareOperatorExpressionByName);
 
 		if (pItem == NULL)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION31325),
-							errmsg("Unknown expression %s", searchKey.operatorName),
-							errdetail_log("Unknown expression %s",
+							errmsg("Unrecognized expression format: %s",
+								   searchKey.operatorName),
+							errdetail_log("Unrecognized expression format: %s",
 										  searchKey.operatorName)));
 		}
 
@@ -2508,9 +2523,9 @@ ParseDocumentAggregationExpressionData(const bson_value_t *value,
 		else
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
-							errmsg("Operator %s not implemented yet",
+							errmsg("Operator %s is currently not supported",
 								   searchKey.operatorName),
-							errdetail_log("Operator %s not implemented yet",
+							errdetail_log("Operator %s is currently not supported",
 										  searchKey.operatorName)));
 		}
 
@@ -2529,7 +2544,7 @@ ParseDocumentAggregationExpressionData(const bson_value_t *value,
 	BsonValueInitIterator(value, &docIter);
 
 	BuildBsonPathTreeContext context = { 0 };
-	context.parseAggregationContext.collationString = parseContext->collationString;
+	context.parseAggregationContext = *parseContext;
 	context.buildPathTreeFuncs = &DefaultPathTreeFuncs;
 	BsonIntermediatePathNode *treeNode = BuildBsonPathTree(&docIter, &context,
 														   forceLeafExpression,
@@ -2543,13 +2558,14 @@ ParseDocumentAggregationExpressionData(const bson_value_t *value,
 	}
 	else
 	{
-		ereport(DEBUG3, (errmsg("Optimizing document expression into constant.")));
+		ereport(DEBUG3, (errmsg(
+							 "Converting document expression into a fixed constant.")));
 
 		/* We write the tree instead of just copying the input value for 2 reasons:
-		 * 1. Document keys need to be deduplicated to match native Mongo. Since we've built the tree already and that deduplicates keys, we use it.
+		 * 1. Document keys need to be deduplicated for compatibility. Since we've built the tree already and that deduplicates keys, we use it.
 		 * 2. If it is a constant document, it could've had nested operators that were transformed to a constant
 		 * as the result of evaluating that operator is always constant. So we need to write the value from the parsed tree
-		 * instead of just copying the input value. i.e: { "a": { $literal: "foo" } }, needs to evaluate to { "a": "foo" }. */
+		 * instead of just copying the input value. For example: { "a": { $literal: "foo" } }, needs to evaluate to { "a": "foo" }. */
 		pgbson_writer writer;
 		PgbsonWriterInit(&writer);
 
@@ -2647,7 +2663,7 @@ ParseArrayAggregationExpressionData(const bson_value_t *value,
 
 	if (isConstantArray)
 	{
-		ereport(DEBUG3, (errmsg("Optimizing array expression into constant.")));
+		ereport(DEBUG3, (errmsg("Transforming array expression into fixed constant.")));
 
 		/* If it is a constant array, it could've had nested operators that were transformed to a constant
 		 * as the result of evaluating that operator is always constant. So we need to write the value from the parsed tree
@@ -2704,13 +2720,13 @@ ParseRangeArgumentsForExpression(const bson_value_t *argumentValue,
 	}
 	else
 	{
-		/* In order to match native mongo, we need to do this in 2 passes.
+		/* To ensure correct error reporting, we need to do this in 2 passes.
 		 * First pass to validate number of args is correct.
 		 * Second pass evaluate the expressions.
 		 * We need to do it in 2 different passes as if we evaluate
 		 * expressions in the first pass and a nested expression throws an error
 		 * we would report that error, rather than the wrong number of args error,
-		 * and native mongo's wrong number of args error always wins. */
+		 * and the wrong number of args error should always take precedence. */
 		int numArgs = BsonDocumentValueCountKeys(argumentValue);
 
 		if (numArgs < minRequiredArgs || numArgs > maxRequiredArgs)
@@ -2739,7 +2755,7 @@ ParseRangeArgumentsForExpression(const bson_value_t *argumentValue,
 
 
 /* --------------------------------------------------------- */
-/* Operator implementation functions */
+/* Functions for implementing operators */
 /* --------------------------------------------------------- */
 
 /*
@@ -2768,7 +2784,7 @@ ParseDollarLet(const bson_value_t *argument, AggregationExpressionData *data,
 	if (argument->value_type != BSON_TYPE_DOCUMENT)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION16874), errmsg(
-							"$let only supports an object as its argument")));
+							"$let can accept only an object type as its argument.")));
 	}
 
 	bson_iter_t docIter;
@@ -2790,28 +2806,29 @@ ParseDollarLet(const bson_value_t *argument, AggregationExpressionData *data,
 		else
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION16875), errmsg(
-								"Unrecognized parameter to $let: %s", key),
+								"Unrecognized argument supplied to $let: %s",
+								key),
 							errdetail_log(
-								"Unrecognized parameter to $let, unexpected key")));
+								"Unrecognized argument supplied to $let, unexpected key")));
 		}
 	}
 
 	if (vars.value_type == BSON_TYPE_EOD)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION16876), errmsg(
-							"Missing 'vars' parameter to $let")));
+							"'vars' parameter for $let is missing")));
 	}
 
 	if (in.value_type == BSON_TYPE_EOD)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION16876), errmsg(
-							"Missing 'in' parameter to $let")));
+							"'in' parameter is missing for $let")));
 	}
 
 	if (vars.value_type != BSON_TYPE_DOCUMENT)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION10065), errmsg(
-							"invalid parameter: expected an object (vars)")));
+							"Parameter is invalid: an object type was expected (vars)")));
 	}
 
 	AggregationExpressionData *inData = palloc0(sizeof(AggregationExpressionData));
@@ -2824,6 +2841,9 @@ ParseDollarLet(const bson_value_t *argument, AggregationExpressionData *data,
 		isInConstant ? NULL : palloc0(sizeof(ExpressionVariableContext));
 
 	ParseVariableSpec(&vars, inputVariableContext, context);
+
+	/* do not destroy the variables table after runtime evaluation on a document */
+	inputVariableContext->preserveVariableTable = true;
 
 	if (isInConstant)
 	{
@@ -2858,9 +2878,11 @@ HandlePreParsedDollarLet(pgbson *doc, void *arguments,
 	 * instead do it inline. */
 	ExpressionResult childExpressionResult = ExpressionResultCreateWithTracker(
 		expressionResult->expressionResultPrivate.tracker);
-	childExpressionResult.expressionResultPrivate.variableContext = *inputVariableContext;
-	childExpressionResult.expressionResultPrivate.variableContext.parent =
-		&expressionResult->expressionResultPrivate.variableContext;
+	ExpressionVariableContext *childContext =
+		&childExpressionResult.expressionResultPrivate.variableContext;
+
+	*childContext = *inputVariableContext;
+	childContext->parent = &expressionResult->expressionResultPrivate.variableContext;
 
 	bool isNullOnEmpty = false;
 	EvaluateAggregationExpressionData(inExpression, doc, &childExpressionResult,
@@ -2922,7 +2944,8 @@ ParseVariableArgumentsForExpression(const bson_value_t *value, bool *isConstant,
 
 /* Call back function for top level command let parsing to disallow path expressions, CURRENT and ROOT for a top level variable spec. */
 static void
-DisallowExpressionsForTopLevelLet(AggregationExpressionData *parsedExpression)
+DisallowExpressionsForTopLevelLet(AggregationExpressionData *parsedExpression,
+								  HTAB *operatorVariables)
 {
 	/* Path expressions, CURRENT and ROOT are not allowed in command level let. */
 	if (parsedExpression->kind == AggregationExpressionKind_Path ||
@@ -2933,16 +2956,14 @@ DisallowExpressionsForTopLevelLet(AggregationExpressionData *parsedExpression)
 		  AggregationExpressionSystemVariableKind_Root)))
 	{
 		ereport(ERROR, errcode(ERRCODE_DOCUMENTDB_LOCATION4890500), errmsg(
-					"Command let Expression tried to access a field,"
-					" but this is not allowed because command let expressions"
-					" run before the query examines any documents."));
+					"A command let expression attempted to access a field, which is disallowed because such expressions execute prior to the query processing any documents."));
 	}
 }
 
 
 /* Stores the value of $$NOW from the variableSpec in timeSystemVariables. */
 void
-GetTimeSystemVariablesFromVariableSpec(pgbson *variableSpec,
+GetTimeSystemVariablesFromVariableSpec(const pgbson *variableSpec,
 									   TimeSystemVariables *timeSystemVariables)
 {
 	if (!EnableNowSystemVariable || variableSpec == NULL)
@@ -3004,10 +3025,14 @@ GetTimeSystemVariables(TimeSystemVariables *timeVariables)
  */
 pgbson *
 ParseAndGetTopLevelVariableSpec(const bson_value_t *varSpec,
-								TimeSystemVariables *timeSystemVariables)
+								TimeSystemVariables *timeSystemVariables,
+								bool isWriteCommand)
 {
 	/* Short circuit here */
-	if (varSpec->value_type == BSON_TYPE_EOD && !EnableNowSystemVariable)
+	bool generateTimeVariables = EnableNowSystemVariable ||
+								 (isWriteCommand &&
+								  EnableVariablesSupportForWriteCommands);
+	if (varSpec->value_type == BSON_TYPE_EOD && !generateTimeVariables)
 	{
 		return PgbsonInitEmpty();
 	}
@@ -3019,8 +3044,8 @@ ParseAndGetTopLevelVariableSpec(const bson_value_t *varSpec,
 	pgbson_writer resultWriter;
 	PgbsonWriterInit(&resultWriter);
 
-	/* Write the time system variables */
-	if (EnableNowSystemVariable && IsClusterVersionAtleast(DocDB_V0, 24, 0))
+	/* Write time system variables (e.g., $$NOW) to the result writer if required. */
+	if (generateTimeVariables)
 	{
 		bson_value_t nowVariableValue = GetTimeSystemVariables(timeSystemVariables);
 		PgbsonWriterAppendValue(&resultWriter, "now", 3, &nowVariableValue);

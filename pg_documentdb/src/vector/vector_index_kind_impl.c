@@ -49,7 +49,7 @@ typedef struct PgVectorIvfflatOptions
 typedef struct PgVectorHnswOptions
 {
 	int32 vl_len_;              /* varlena header (do not touch directly!) */
-	int m;                      /* number of connections */
+	int m;                      /* Total number of active connections */
 	int efConstruction;         /* size of dynamic candidate list */
 } PgVectorHnswOptions;
 
@@ -286,20 +286,20 @@ ParseIVFCreationSpec(bson_iter_t *vectorOptionsIter,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_CANNOTCREATEINDEX),
 								errmsg(
-									"%s must be greater than or equal to %d not %d",
+									"%s must be greater than or equal to %d, but was %d",
 									VECTOR_PARAMETER_NAME_IVF_NLISTS,
-									IVFFLAT_MIN_LISTS,
-									vectorIndexOptions->numLists)));
+									vectorIndexOptions->numLists,
+									IVFFLAT_MIN_LISTS)));
 			}
 
 			if (vectorIndexOptions->numLists > IVFFLAT_MAX_LISTS)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_CANNOTCREATEINDEX),
 								errmsg(
-									"%s must be less or equal than or equal to %d not %d",
+									"Current value of %s is %d, which exceeds the max value of %d",
 									VECTOR_PARAMETER_NAME_IVF_NLISTS,
-									IVFFLAT_MAX_LISTS,
-									vectorIndexOptions->numLists)));
+									vectorIndexOptions->numLists,
+									IVFFLAT_MAX_LISTS)));
 			}
 		}
 	}
@@ -363,19 +363,21 @@ ParseHNSWCreationSpec(bson_iter_t *vectorOptionsIter,
 			if (vectorIndexOptions->m < HNSW_MIN_M)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_CANNOTCREATEINDEX),
-								errmsg("%s must be greater than or equal to %d not %d",
-									   VECTOR_PARAMETER_NAME_HNSW_M,
-									   HNSW_MIN_M,
-									   vectorIndexOptions->m)));
+								errmsg(
+									"%s must be greater than or equal to %d, but was %d",
+									VECTOR_PARAMETER_NAME_HNSW_M,
+									HNSW_MIN_M,
+									vectorIndexOptions->m)));
 			}
 
 			if (vectorIndexOptions->m > HNSW_MAX_M)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_CANNOTCREATEINDEX),
-								errmsg("%s must be less than or equal to %d not %d",
-									   VECTOR_PARAMETER_NAME_HNSW_M,
-									   HNSW_MAX_M,
-									   vectorIndexOptions->m)));
+								errmsg(
+									"%s should not exceed %d, but received %d",
+									VECTOR_PARAMETER_NAME_HNSW_M,
+									HNSW_MAX_M,
+									vectorIndexOptions->m)));
 			}
 		}
 		else if (strcmp(optionsIterKey,
@@ -396,7 +398,7 @@ ParseHNSWCreationSpec(bson_iter_t *vectorOptionsIter,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_CANNOTCREATEINDEX),
 								errmsg(
-									"%s must be greater than or equal to %d not %d",
+									"%s must be greater than or equal to %d, but was %d",
 									VECTOR_PARAMETER_NAME_HNSW_EF_CONSTRUCTION,
 									HNSW_MIN_EF_CONSTRUCTION,
 									vectorIndexOptions->efConstruction)));
@@ -406,7 +408,7 @@ ParseHNSWCreationSpec(bson_iter_t *vectorOptionsIter,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_CANNOTCREATEINDEX),
 								errmsg(
-									"%s must be less than or equal to %d not %d",
+									"%s should not exceed %d, but received %d",
 									VECTOR_PARAMETER_NAME_HNSW_EF_CONSTRUCTION,
 									HNSW_MAX_EF_CONSTRUCTION,
 									vectorIndexOptions->efConstruction)));
@@ -414,7 +416,7 @@ ParseHNSWCreationSpec(bson_iter_t *vectorOptionsIter,
 		}
 	}
 
-	/* Set default efConstruction for hnsw */
+	/* Default efConstruction value set for hnsw */
 	if (vectorIndexOptions->efConstruction == 0)
 	{
 		vectorIndexOptions->efConstruction = HNSW_DEFAULT_EF_CONSTRUCTION;
@@ -498,7 +500,7 @@ ParseIVFIndexSearchSpec(const VectorSearchOptions *vectorSearchOptions)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 								errmsg(
-									"$nProbes must be an integer value.")));
+									"$nProbes is required to be an integer value.")));
 			}
 
 			int32_t nProbes = BsonValueAsInt32(value);
@@ -507,7 +509,7 @@ ParseIVFIndexSearchSpec(const VectorSearchOptions *vectorSearchOptions)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 								errmsg(
-									"$nProbes must be greater than or equal to %d.",
+									"The value of $nProbes should be at least %d.",
 									IVFFLAT_MIN_NPROBES)));
 			}
 
@@ -515,7 +517,7 @@ ParseIVFIndexSearchSpec(const VectorSearchOptions *vectorSearchOptions)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 								errmsg(
-									"$nProbes must be less than or equal to %d.",
+									"The value of $nProbes must not exceed %d.",
 									IVFFLAT_MAX_NPROBES)));
 			}
 
@@ -550,7 +552,7 @@ ParseHNSWIndexSearchSpec(const VectorSearchOptions *vectorSearchOptions)
 		/* Safe guard against the ApiGucPrefix.enableVectorHNSWIndex GUC */
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
 						errmsg(
-							"hnsw index is not supported."),
+							"HNSW index type is currently unsupported"),
 						errdetail(
 							"hnsw index configuration is not enabled. Set ApiGucPrefix.enableVectorHNSWIndex to true to enable hnsw index.")));
 	}
@@ -583,7 +585,7 @@ ParseHNSWIndexSearchSpec(const VectorSearchOptions *vectorSearchOptions)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 								errmsg(
-									"$efSearch must be greater than or equal to %d.",
+									"The parameter $efSearch should have a value that is greater than or equal to %d.",
 									HNSW_MIN_EF_SEARCH)));
 			}
 
@@ -631,6 +633,8 @@ CalculateIVFSearchParamBson(bytea *indexOptions, Cardinality indexRows,
 		return searchParamBson;
 	}
 
+	ReportFeatureUsage(FEATURE_STAGE_SEARCH_VECTOR_DEFAULT_NPROBES);
+
 	/* Calculate the default nProbes */
 	int numLists = -1;
 	if (indexOptions == NULL)
@@ -645,27 +649,40 @@ CalculateIVFSearchParamBson(bytea *indexOptions, Cardinality indexRows,
 	}
 
 	int defaultNumProbes = -1;
-	if (numLists < 0)
+	if (numLists <= 0)
 	{
 		defaultNumProbes = IVFFLAT_DEFAULT_NPROBES;
 	}
 	else
 	{
-		/* nProbes
-		 *  < 10000 rows: numLists
-		 *  < 1M rows: rows / 1000
-		 *  >= 1M rows: sqrt(rows) */
-		if (indexRows < VECTOR_SEARCH_SMALL_COLLECTION_ROWS)
+		if (EnableVectorCalculateDefaultSearchParameter)
 		{
-			defaultNumProbes = numLists;
-		}
-		else if (indexRows < VECTOR_SEARCH_1M_COLLECTION_ROWS)
-		{
-			defaultNumProbes = indexRows / 1000;
+			/* nProbes < 10000 rows: numLists */
+			if (indexRows < VECTOR_SEARCH_SMALL_COLLECTION_ROWS)
+			{
+				defaultNumProbes = numLists;
+			}
+			else
+			{
+				/* >= 10000 rows: we calculate nProbes based on estimated rowsPerCluster
+				 * To make sure we don't scan too many rows */
+				double rowsPerCluster = indexRows / numLists;
+				defaultNumProbes = ceil(VECTOR_SEARCH_SMALL_COLLECTION_ROWS /
+										rowsPerCluster);
+				if (defaultNumProbes > numLists)
+				{
+					defaultNumProbes = numLists;
+				}
+
+				if (defaultNumProbes < 1)
+				{
+					defaultNumProbes = 1;
+				}
+			}
 		}
 		else
 		{
-			defaultNumProbes = sqrt(indexRows);
+			defaultNumProbes = IVFFLAT_DEFAULT_NPROBES;
 		}
 	}
 
@@ -700,6 +717,8 @@ CalculateHNSWSearchParamBson(bytea *indexOptions, Cardinality indexRows,
 		return searchParamBson;
 	}
 
+	ReportFeatureUsage(FEATURE_STAGE_SEARCH_VECTOR_DEFAULT_EFSEARCH);
+
 	/* Calculate the default efSearch */
 	int efConstruction = -1;
 
@@ -721,9 +740,16 @@ CalculateHNSWSearchParamBson(bytea *indexOptions, Cardinality indexRows,
 	}
 	else
 	{
-		if (indexRows < VECTOR_SEARCH_SMALL_COLLECTION_ROWS)
+		if (EnableVectorCalculateDefaultSearchParameter)
 		{
-			defaultEfSearch = efConstruction;
+			if (indexRows < VECTOR_SEARCH_SMALL_COLLECTION_ROWS)
+			{
+				defaultEfSearch = efConstruction;
+			}
+			else
+			{
+				defaultEfSearch = HNSW_DEFAULT_EF_SEARCH;
+			}
 		}
 		else
 		{

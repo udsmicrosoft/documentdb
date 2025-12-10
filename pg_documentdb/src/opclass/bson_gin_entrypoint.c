@@ -37,6 +37,8 @@
 #include "metadata/metadata_cache.h"
 #include "collation/collation.h"
 
+extern bool EnableExprLookupIndexPushdown;
+extern bool EnableValueOnlyIndexTerms;
 
 /* --------------------------------------------------------- */
 /* Top level exports */
@@ -465,7 +467,7 @@ gin_bson_get_single_path_generated_terms(PG_FUNCTION_ARGS)
 			PgbsonWriterInit(&writer);
 			PgbsonWriterAppendValue(&writer, term.element.path, term.element.pathLength,
 									&term.element.bsonValue);
-			PgbsonWriterAppendBool(&writer, "t", 1, term.isIndexTermTruncated);
+			PgbsonWriterAppendBool(&writer, "t", 1, IsIndexTermTruncated(&term));
 			SRF_RETURN_NEXT(functionContext, PointerGetDatum(PgbsonWriterGetPgbson(
 																 &writer)));
 		}
@@ -549,7 +551,7 @@ gin_bson_get_wildcard_project_generated_terms(PG_FUNCTION_ARGS)
 			PgbsonWriterInit(&writer);
 			PgbsonWriterAppendValue(&writer, term.element.path, term.element.pathLength,
 									&term.element.bsonValue);
-			PgbsonWriterAppendBool(&writer, "t", 1, term.isIndexTermTruncated);
+			PgbsonWriterAppendBool(&writer, "t", 1, IsIndexTermTruncated(&term));
 			SRF_RETURN_NEXT(functionContext, PointerGetDatum(PgbsonWriterGetPgbson(
 																 &writer)));
 		}
@@ -798,6 +800,55 @@ FailIfQueryPathHasDigitsForWildcard(Datum query, bytea *options)
 }
 
 
+const char *
+GetFirstPathFromIndexOptionsIfApplicable(bytea *indexOptions, bool *isWildcardIndex)
+{
+	BsonGinIndexOptionsBase *options = (BsonGinIndexOptionsBase *) indexOptions;
+	*isWildcardIndex = false;
+	switch (options->type)
+	{
+		case IndexOptionsType_Text:
+		{
+			/* Text index does not have a path */
+			return NULL;
+		}
+
+		case IndexOptionsType_2d:
+		case IndexOptionsType_2dsphere:
+		{
+			/* TODO: Should we support this? */
+			return NULL;
+		}
+
+		case IndexOptionsType_SinglePath:
+		{
+			BsonGinSinglePathOptions *singlePathOptions =
+				(BsonGinSinglePathOptions *) options;
+			uint32_t indexPathLength;
+			const char *indexPath;
+			Get_Index_Path_Option(singlePathOptions, path, indexPath, indexPathLength);
+
+			*isWildcardIndex = singlePathOptions->isWildcard;
+			return pnstrdup(indexPath, indexPathLength);
+		}
+
+		case IndexOptionsType_Composite:
+		{
+			return GetCompositeFirstIndexPath(options);
+		}
+
+		case IndexOptionsType_Hashed:
+		case IndexOptionsType_Wildcard:
+		case IndexOptionsType_UniqueShardKey:
+		case IndexOptionsType_UniqueShardPath:
+		default:
+		{
+			return NULL;
+		}
+	}
+}
+
+
 /*
  * ValidateIndexForQualifierValue checks that a given queryValue can be satisfied
  * by the current index given the indexOptions for that index and an operator strategy.
@@ -830,7 +881,7 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 
 		if (IsCollationValid(collationString))
 		{
-			/* We don't yet support collated index, until then we can't use index is operator has collation */
+			/* We don't yet support collated index, until then we can't use index */
 			return false;
 		}
 	}
@@ -839,6 +890,14 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 		PgbsonToSinglePgbsonElement(queryBson, &filterElement);
 	}
 
+	return ValidateIndexForQualifierElement(indexOptions, &filterElement, strategy);
+}
+
+
+bool
+ValidateIndexForQualifierElement(bytea *indexOptions, pgbsonelement *filterElement,
+								 BsonIndexStrategy strategy)
+{
 	BsonGinIndexOptionsBase *options = (BsonGinIndexOptionsBase *) indexOptions;
 
 	IndexTraverseOption traverse = IndexTraverse_Invalid;
@@ -858,8 +917,8 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 			uint32_t indexPathLength;
 			const char *indexPath;
 			Get_Index_Path_Option(option, path, indexPath, indexPathLength);
-			if (indexPathLength == filterElement.pathLength &&
-				strncmp(indexPath, filterElement.path, indexPathLength) == 0)
+			if (indexPathLength == filterElement->pathLength &&
+				strncmp(indexPath, filterElement->path, indexPathLength) == 0)
 			{
 				/* this is an exact match on the path. */
 				traverse = IndexTraverse_Match;
@@ -878,12 +937,13 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 
 			if (singlePathOptions->isWildcard)
 			{
-				StringView fieldPathName = CreateStringViewFromString(filterElement.path);
+				StringView fieldPathName = CreateStringViewFromString(
+					filterElement->path);
 
 				if (StringViewEndsWith(&fieldPathName, '.'))
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_DOTTEDFIELDNAME), errmsg(
-										"FieldPath must not end with a '.'.")));
+										"The FieldPath cannot terminate with a '.' character.")));
 				}
 			}
 
@@ -892,8 +952,8 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 				/* currently we don't yet support pushing down paths with fields that have
 				 * purely numbers as their paths. TODO: We need to lift this requirement.
 				 */
-				if (QueryPathHasDigits(filterElement.path,
-									   filterElement.pathLength))
+				if (QueryPathHasDigits(filterElement->path,
+									   filterElement->pathLength))
 				{
 					/* Don't push down */
 					traverse = IndexTraverse_Invalid;
@@ -902,19 +962,22 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 			}
 
 			traverse = GetSinglePathIndexTraverseOption(options,
-														filterElement.path,
-														filterElement.pathLength,
-														filterElement.bsonValue.value_type);
+														filterElement->path,
+														filterElement->pathLength,
+														filterElement->bsonValue.
+														value_type);
 			break;
 		}
 
 		case IndexOptionsType_Composite:
 		{
+			int32_t compositeColumnIgnore;
 			traverse = GetCompositePathIndexTraverseOption(
 				strategy, options,
-				filterElement.path,
-				filterElement.pathLength,
-				filterElement.bsonValue.value_type);
+				filterElement->path,
+				filterElement->pathLength,
+				&filterElement->bsonValue,
+				&compositeColumnIgnore);
 			break;
 		}
 
@@ -928,23 +991,24 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 			}
 
 			traverse = GetHashIndexTraverseOption(options,
-												  filterElement.path,
-												  filterElement.pathLength);
+												  filterElement->path,
+												  filterElement->pathLength);
 			break;
 		}
 
 		case IndexOptionsType_Wildcard:
 		{
 			traverse = GetWildcardProjectionPathIndexTraverseOption(options,
-																	filterElement.path,
-																	filterElement.
+																	filterElement->path,
+																	filterElement->
 																	pathLength,
-																	filterElement.
+																	filterElement->
 																	bsonValue.value_type);
 			break;
 		}
 
 		case IndexOptionsType_UniqueShardKey:
+		case IndexOptionsType_UniqueShardPath:
 		{
 			traverse = IndexTraverse_Invalid;
 			break;
@@ -952,7 +1016,8 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
 
 		default:
 		{
-			ereport(ERROR, (errmsg("Unrecognized index options type %d", options->type)));
+			ereport(ERROR, (errmsg("Index options type %d not recognized",
+								   options->type)));
 			break;
 		}
 	}
@@ -966,7 +1031,8 @@ ValidateIndexForQualifierValue(bytea *indexOptions, Datum queryValue, BsonIndexS
  * checks if a path can be pushed to an index given the options for a $in type query.
  */
 bool
-ValidateIndexForQualifierPathForDollarIn(bytea *indexOptions, const StringView *queryPath)
+ValidateIndexForQualifierPathForEquality(bytea *indexOptions, const StringView *queryPath,
+										 BsonIndexStrategy strat)
 {
 	if (indexOptions == NULL)
 	{
@@ -1004,7 +1070,7 @@ ValidateIndexForQualifierPathForDollarIn(bytea *indexOptions, const StringView *
 				if (StringViewEndsWith(queryPath, '.'))
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_DOTTEDFIELDNAME), errmsg(
-										"FieldPath must not end with a '.'.")));
+										"The FieldPath cannot terminate with a '.' character.")));
 				}
 			}
 
@@ -1035,12 +1101,24 @@ ValidateIndexForQualifierPathForDollarIn(bytea *indexOptions, const StringView *
 
 		case IndexOptionsType_Composite:
 		{
-			/* TODO: Support $lookup pushdown to composite index */
-			traverse = IndexTraverse_Invalid;
+			if (!EnableExprLookupIndexPushdown)
+			{
+				traverse = IndexTraverse_Invalid;
+				break;
+			}
+
+			int32_t compositeColumnIgnore;
+			bson_value_t unspecifiedValue = { 0 };
+			traverse = GetCompositePathIndexTraverseOption(
+				strat, options, queryPath->string,
+				queryPath->length,
+				&unspecifiedValue,
+				&compositeColumnIgnore);
 			break;
 		}
 
 		case IndexOptionsType_UniqueShardKey:
+		case IndexOptionsType_UniqueShardPath:
 		{
 			traverse = IndexTraverse_Invalid;
 			break;
@@ -1048,7 +1126,8 @@ ValidateIndexForQualifierPathForDollarIn(bytea *indexOptions, const StringView *
 
 		default:
 		{
-			ereport(ERROR, (errmsg("Unrecognized index options type %d", options->type)));
+			ereport(ERROR, (errmsg("Index options type %d not recognized",
+								   options->type)));
 			break;
 		}
 	}
@@ -1072,6 +1151,8 @@ GetIndexTermMetadata(void *indexOptions)
 		StringView pathPrefix = { 0 };
 		bool isWildcard = false;
 		bool isWildcardProjection = false;
+		bool allowValueOnly = false;
+		int32_t truncationLimit = options->indexTermTruncateLimit;
 		if (options->type == IndexOptionsType_SinglePath)
 		{
 			/* For single path indexes, we can elide the index path prefix */
@@ -1093,6 +1174,15 @@ GetIndexTermMetadata(void *indexOptions)
 		{
 			pathPrefix.string = "$";
 			pathPrefix.length = 1;
+			allowValueOnly = EnableValueOnlyIndexTerms;
+			if (allowValueOnly)
+			{
+				/* Since we lose one character on valueOnly scenarios for the path,
+				 * reduce the truncation limit to ensure the overall value stays the same.
+				 */
+				int32_t pathCount = GetCompositeOpClassPathCount(options);
+				truncationLimit -= pathCount;
+			}
 		}
 		else if (options->type == IndexOptionsType_Wildcard)
 		{
@@ -1105,19 +1195,24 @@ GetIndexTermMetadata(void *indexOptions)
 								"Index version V1 is not supported by hashed, text or 2d sphere indexes")));
 		}
 
-		uint32_t wildcardIndexTruncatedPathLimit =
-			options->wildcardIndexTruncatedPathLimit == 0 ?
-			UINT32_MAX :
-			options->
-			wildcardIndexTruncatedPathLimit;
+		uint32_t wildcardIndexTruncatedPathLimit = UINT32_MAX;
+		if (isWildcard)
+		{
+			wildcardIndexTruncatedPathLimit = options->wildcardIndexTruncatedPathLimit ==
+											  0 ?
+											  UINT32_MAX :
+											  options->wildcardIndexTruncatedPathLimit;
+		}
+
 
 		return (IndexTermCreateMetadata) {
-				   .indexTermSizeLimit = options->indexTermTruncateLimit,
+				   .indexTermSizeLimit = truncationLimit,
 				   .wildcardIndexTruncatedPathLimit = wildcardIndexTruncatedPathLimit,
 				   .pathPrefix = pathPrefix,
 				   .isWildcard = isWildcard,
 				   .isWildcardProjection = isWildcardProjection,
-				   .indexVersion = options->version
+				   .indexVersion = options->version,
+				   .allowValueOnly = allowValueOnly
 		};
 	}
 
@@ -1138,7 +1233,7 @@ GetIndexTermMetadata(void *indexOptions)
  * a wildcard, and/or suffix of the given path.
  * The method assumes that the options provided is a BsonGinWildcardProjectionPathOptions
  */
-IndexTraverseOption
+pg_attribute_no_sanitize_alignment() IndexTraverseOption
 GetWildcardProjectionPathIndexTraverseOption(void *contextOptions, const
 											 char *currentPath, uint32_t
 											 currentPathLength,
@@ -1273,7 +1368,7 @@ ValidateSinglePathSpec(const char *prefix)
 	int32_t stringLength = strlen(prefix);
 	if (stringLength == 0)
 	{
-		/* root wildcard index */
+		/* root wildcard index value */
 		return;
 	}
 }
@@ -1369,7 +1464,7 @@ ValidateWildcardProjectPathSpec(const char *prefix)
 	if (stringLength < 3)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"at least one filter path must be specified")));
+							"A minimum of one filter path is required to be provided")));
 	}
 }
 
@@ -1385,13 +1480,13 @@ ValidateWildcardProjectPathSpec(const char *prefix)
  * Here we parse the jsonified path options to build a serialized path
  * structure that is more efficiently parsed during term generation.
  */
-static Size
+pg_attribute_no_sanitize_alignment() static Size
 FillWildcardProjectPathSpec(const char *prefix, void *buffer)
 {
 	if (prefix == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"at least one filter path must be specified")));
+							"A minimum of one filter path is required to be provided")));
 	}
 
 	pgbson *bson = PgbsonInitFromJson(prefix);

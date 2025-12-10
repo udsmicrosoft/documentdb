@@ -16,9 +16,6 @@
 #include "utils/type_cache.h"
 
 extern PGDLLIMPORT char *ApiDataSchemaName;
-extern PGDLLIMPORT char *ApiAdminRole;
-extern PGDLLIMPORT char *ApiAdminRoleV2;
-extern PGDLLIMPORT char *ApiReadOnlyRole;
 extern PGDLLIMPORT char *ApiSchemaName;
 extern PGDLLIMPORT char *ApiSchemaNameV2;
 extern PGDLLIMPORT char *ApiInternalSchemaName;
@@ -35,6 +32,17 @@ extern PGDLLIMPORT char *ApiCatalogToApiInternalSchemaName;
 extern PGDLLIMPORT char *PostgisSchemaName;
 extern PGDLLIMPORT char *DocumentDBApiInternalSchemaName;
 extern PGDLLIMPORT char *ApiCatalogToCoreSchemaName;
+
+/* Roles */
+extern PGDLLIMPORT char *ApiAdminRole;
+extern PGDLLIMPORT char *ApiAdminRoleV2;
+extern PGDLLIMPORT char *ApiBgWorkerRole;
+extern PGDLLIMPORT char *ApiReadOnlyRole;
+extern PGDLLEXPORT char *ApiReadWriteRole;
+extern PGDLLEXPORT char *ApiReplicationRole;
+extern PGDLLEXPORT char *ApiRootInternalRole;
+extern PGDLLIMPORT char *ApiRootRole;
+extern PGDLLEXPORT char *ApiUserAdminRole;
 
 extern MemoryContext DocumentDBApiMetadataCacheContext;
 
@@ -67,6 +75,8 @@ Oid BsonLessThanEqualMatchRuntimeOperatorId(void);
 Oid BsonLessThanEqualMatchIndexFunctionId(void);
 Oid BsonRangeMatchFunctionId(void);
 Oid BsonRangeMatchOperatorOid(void);
+Oid BsonFullScanFunctionOid(void);
+Oid BsonIndexHintFunctionOid(void);
 Oid BsonInMatchFunctionId(void);
 Oid BsonNinMatchFunctionId(void);
 Oid BsonNotEqualMatchFunctionId(void);
@@ -141,6 +151,8 @@ Oid BsonLessThanOperatorId(void);
 Oid BsonGreaterThanEqualOperatorId(void);
 Oid BsonLessThanEqualOperatorId(void);
 Oid BsonGetValueFunctionOid(void);
+Oid BsonUniqueIndexEqualOperatorId(void);
+Oid BsonUniqueShardPathEqualOperatorId(void);
 Oid PostgresInt4PlusFunctionOid(void);
 Oid PostgresInt4LessOperatorOid(void);
 Oid PostgresInt4LessOperatorFunctionOid(void);
@@ -156,7 +168,7 @@ Oid BsonQueryTypeId(void);
 Oid VectorTypeId(void);
 Oid HalfVectorTypeId(void);
 Oid IndexSpecTypeId(void);
-Oid MongoCatalogCollectionsTypeOid(void);
+Oid ApiCatalogCollectionsTypeOid(void);
 Oid GetClusterBsonQueryTypeId(void);
 Oid GetBsonArrayTypeOid(void);
 Oid BsonIndexBoundsTypeId(void);
@@ -168,8 +180,18 @@ Oid ApiCatalogCollectionIndexIdSequenceId(void);
 
 /* order by */
 Oid BsonOrderByFunctionOid(void);
+Oid BsonOrderByWithCollationFunctionOid(void);
 Oid BsonOrderByPartitionFunctionOid(void);
+Oid BsonOrderByPartitionWithCollationFunctionOid(void);
+Oid BsonOrderByCompareFunctionOId(void);
+Oid BsonOrderByLtFunctionOId(void);
+Oid BsonOrderByEqFunctionOId(void);
+Oid BsonOrderByGtFunctionOId(void);
+Oid BsonOrderyByLtOperatorId(void);
+Oid BsonOrderyByEqOperatorId(void);
+Oid BsonOrderyByGtOperatorId(void);
 Oid BsonOrderByIndexOperatorId(void);
+Oid BsonOrderByReverseIndexOperatorId(void);
 
 /* Postgres internal functions */
 Oid PostgresDrandomFunctionId(void);
@@ -211,6 +233,8 @@ Oid BsonRumSinglePathOperatorFamily(void);
 Oid Float8PlusOperatorId(void);
 Oid Float8MinusOperatorId(void);
 Oid Float8MultiplyOperatorId(void);
+Oid BsonRumHashPathOperatorFamily(void);
+Oid BsonRumUniquePathOperatorFamily(void);
 
 /* Vector Functions */
 Oid PgDoubleToVectorFunctionOid(void);
@@ -289,7 +313,6 @@ Oid PostgisGeographyExpandFunctionId(void);
 /* Text search functions */
 Oid WebSearchToTsQueryFunctionId(void);
 Oid WebSearchToTsQueryWithRegConfigFunctionId(void);
-Oid RumExtractTsVectorFunctionId(void);
 Oid BsonTextSearchMetaQualFuncId(void);
 Oid TsRankFunctionId(void);
 Oid TsVectorConcatFunctionId(void);
@@ -301,6 +324,7 @@ Oid ApiCatalogAggregationPipelineFunctionId(void);
 Oid ApiCatalogAggregationFindFunctionId(void);
 Oid ApiCatalogAggregationCountFunctionId(void);
 Oid ApiCatalogAggregationDistinctFunctionId(void);
+Oid ApiCatalogAggregationGetMoreFunctionId(void);
 Oid BsonCovariancePopAggregateFunctionOid(void);
 Oid BsonCovarianceSampAggregateFunctionOid(void);
 Oid BsonDollarAddFieldsFunctionOid(void);
@@ -330,6 +354,8 @@ Oid BsonDollarReplaceRootFunctionOid(void);
 Oid BsonDollarReplaceRootWithLetFunctionOid(void);
 Oid BsonDollarReplaceRootWithLetAndCollationFunctionOid(void);
 Oid BsonSumAggregateFunctionOid(void);
+Oid BsonCommandCountAggregateFunctionOid(void);
+Oid BsonCountAggregateFunctionOid(void);
 Oid BsonIntegralAggregateFunctionOid(void);
 Oid BsonDerivativeAggregateFunctionOid(void);
 Oid BsonAvgAggregateFunctionOid(void);
@@ -381,6 +407,7 @@ Oid BsonDollarLookupJoinFilterFunctionOid(void);
 Oid BsonLookupExtractFilterArrayFunctionOid(void);
 Oid BsonLookupUnwindFunctionOid(void);
 Oid BsonDistinctUnwindFunctionOid(void);
+Oid BsonDollarBucketAutoFunctionOid(void);
 Oid BsonDistinctAggregateFunctionOid(void);
 Oid RowGetBsonFunctionOid(void);
 Oid ApiChangeStreamAggregationFunctionOid(void);
@@ -414,6 +441,8 @@ Oid ApiDataNamespaceOid(void);
 Oid UpdateWorkerFunctionOid(void);
 Oid InsertWorkerFunctionOid(void);
 Oid DeleteWorkerFunctionOid(void);
+Oid CommandNodeWorkerFunctionOid(void);
+Oid CursorGetMoreFunctionOid(void);
 
 /* Compat functions*/
 Oid DocumentDBCoreBsonToBsonFunctionOId(void);

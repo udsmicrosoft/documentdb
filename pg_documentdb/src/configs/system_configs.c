@@ -14,6 +14,7 @@
 #include <limits.h>
 #include "configs/config_initialization.h"
 #include "vector/vector_configs.h"
+#include "index_am/documentdb_rum.h"
 
 /*
  * Externally defined GUC constants
@@ -116,6 +117,9 @@ char *CurrentOpApplicationName = DEFAULT_CURRENT_OP_APPLICATION_NAME;
 #define DEFAULT_AGGREGATION_STAGES_LIMIT 1000
 int MaxAggregationStagesAllowed = DEFAULT_AGGREGATION_STAGES_LIMIT;
 
+#define DEFAULT_CURSOR_FIRST_PAGE_BATCH_SIZE 101
+int DefaultCursorFirstPageBatchSize = DEFAULT_CURSOR_FIRST_PAGE_BATCH_SIZE;
+
 #define DEFAULT_INDEX_TERM_COMPRESSION_THRESHOLD INT_MAX
 int IndexTermCompressionThreshold = DEFAULT_INDEX_TERM_COMPRESSION_THRESHOLD;
 
@@ -124,6 +128,51 @@ bool EnableUserCrud = DEFAULT_ENABLE_USER_CRUD;
 
 #define DEFAULT_VECTOR_ITERATIVE_SCAN_MODE VectorIterativeScan_RELAXED_ORDER
 int VectorPreFilterIterativeScanMode = DEFAULT_VECTOR_ITERATIVE_SCAN_MODE;
+
+#define DEFAULT_ENABLE_GEONEAR_FORCE_INDEX_PUSHDOWN true
+bool EnableGeonearForceIndexPushdown = DEFAULT_ENABLE_GEONEAR_FORCE_INDEX_PUSHDOWN;
+
+#define DEFAULT_ENABLE_EXTENDED_EXPLAIN_PLANS false
+bool EnableExtendedExplainPlans = DEFAULT_ENABLE_EXTENDED_EXPLAIN_PLANS;
+
+/* Note that this is explicitly left disabled
+ * This is primarily because the operator that sets default_transaction_readonly
+ * would want to avoid new writes (perhaps due to high disk usage) and a background
+ * job that can go and delete documents can produce WAL files and can exacerbate
+ * the issue by putting disk load. Make this explicitly opt-in.
+ */
+#define DEFAULT_ENABLE_TTL_JOBS_ON_READ_ONLY false
+bool EnableTtlJobsOnReadOnly = DEFAULT_ENABLE_TTL_JOBS_ON_READ_ONLY;
+
+#define DEFAULT_CURSOR_EXPIRY_TIME_LIMIT_SECONDS 60
+int DefaultCursorExpiryTimeLimitSeconds = DEFAULT_CURSOR_EXPIRY_TIME_LIMIT_SECONDS;
+
+#define DEFAULT_MAX_CURSOR_FILE_INTERMEDIATE_FILE_SIZE_MB 4 * 1024
+int MaxAllowedCursorIntermediateFileSizeMB =
+	DEFAULT_MAX_CURSOR_FILE_INTERMEDIATE_FILE_SIZE_MB;
+
+#define DEFAULT_MAX_CURSOR_FILE_COUNT 5000
+int MaxCursorFileCount = DEFAULT_MAX_CURSOR_FILE_COUNT;
+
+/* Starting pg18 use documentdb_extended_rum for the rum library */
+#if PG_VERSION_NUM >= 180000
+#define DEFAULT_RUM_LIBRARY_LOAD_OPTION RumLibraryLoadOption_RequireDocumentDBRum
+#else
+#define DEFAULT_RUM_LIBRARY_LOAD_OPTION RumLibraryLoadOption_None
+#endif
+
+RumLibraryLoadOptions DocumentDBRumLibraryLoadOption = DEFAULT_RUM_LIBRARY_LOAD_OPTION;
+
+#define DEFAULT_ENABLE_STATEMENT_TIMEOUT true
+bool EnableBackendStatementTimeout = DEFAULT_ENABLE_STATEMENT_TIMEOUT;
+
+static struct config_enum_entry rum_load_options[4] = {
+	{ "none", RumLibraryLoadOption_None, false },
+	{ "prefer_documentdb_extended_rum", RumLibraryLoadOption_PreferDocumentDBRum, false },
+	{ "require_documentdb_extended_rum", RumLibraryLoadOption_RequireDocumentDBRum,
+	  false },
+	{ NULL, 0, false }
+};
 
 void
 InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
@@ -226,7 +275,7 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 	DefineCustomIntVariable(
 		psprintf("%s.maxIndexesPerCollection", prefix),
 		gettext_noop(
-			"Max number of indexes per collection."),
+			"Maximum allowed indexes for a given collection."),
 		NULL, &MaxIndexesPerCollection, DEFAULT_MAX_INDEXES_PER_COLLECTION, 0, 300,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
@@ -330,7 +379,7 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		gettext_noop("The size in bytes above which index terms will be compressed."),
 		NULL,
 		&IndexTermCompressionThreshold,
-		DEFAULT_INDEX_TERM_COMPRESSION_THRESHOLD, 256,
+		DEFAULT_INDEX_TERM_COMPRESSION_THRESHOLD, 128,
 		INT_MAX,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
@@ -341,6 +390,22 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		NULL, &EnableUserCrud, DEFAULT_ENABLE_USER_CRUD,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		psprintf("%s.enableTTLJobsOnReadOnly", newGucPrefix),
+		gettext_noop(
+			"Enables TTL jobs on read-only nodes. This will override"
+			" the default_transaction_readonly on the TTL job only."),
+		NULL, &EnableTtlJobsOnReadOnly, DEFAULT_ENABLE_TTL_JOBS_ON_READ_ONLY,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_force_push_geonear_index", newGucPrefix),
+		gettext_noop(
+			"Enables ensuring that geonear queries are always pushed to the geospatial index."),
+		NULL, &EnableGeonearForceIndexPushdown,
+		DEFAULT_ENABLE_GEONEAR_FORCE_INDEX_PUSHDOWN,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomEnumVariable(
 		psprintf("%s.vectorPreFilterIterativeScanMode", newGucPrefix),
 		gettext_noop(
@@ -349,5 +414,58 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 			"Strict order ensures results are in the exact order by distance"),
 		NULL, &VectorPreFilterIterativeScanMode, DEFAULT_VECTOR_ITERATIVE_SCAN_MODE,
 		VECTOR_ITERATIVE_SCAN_OPTIONS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.defaultCursorFirstPageBatchSize", newGucPrefix),
+		gettext_noop("The default batch size for the first page of a cursor."),
+		NULL, &DefaultCursorFirstPageBatchSize,
+		DEFAULT_CURSOR_FIRST_PAGE_BATCH_SIZE, 1, INT_MAX,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableExtendedExplainPlans", newGucPrefix),
+		gettext_noop(
+			"Enables extended explain plans for queries. "
+			"This will include additional information in the explain plans."),
+		NULL, &EnableExtendedExplainPlans, DEFAULT_ENABLE_EXTENDED_EXPLAIN_PLANS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.defaultCursorExpiryTimeLimitSeconds", newGucPrefix),
+		gettext_noop(
+			"Default expiry time limit for cursor."),
+		NULL, &DefaultCursorExpiryTimeLimitSeconds,
+		DEFAULT_CURSOR_EXPIRY_TIME_LIMIT_SECONDS,
+		1, 3600, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.maxCursorIntermediateFileSizeMB", newGucPrefix),
+		gettext_noop(
+			"Maximum size of intermediate file for cursor."),
+		NULL, &MaxAllowedCursorIntermediateFileSizeMB,
+		DEFAULT_MAX_CURSOR_FILE_INTERMEDIATE_FILE_SIZE_MB,
+		1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		psprintf("%s.maxCursorFileCount", newGucPrefix),
+		gettext_noop(
+			"Maximum number of cursor files allowed. set to 0 to disable cursor file limit."),
+		NULL, &MaxCursorFileCount,
+		DEFAULT_MAX_CURSOR_FILE_COUNT, 0, INT_MAX,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		psprintf("%s.rum_library_load_option", newGucPrefix),
+		gettext_noop("Specifies the RUM library load option for DocumentDB."),
+		NULL, (int *) &DocumentDBRumLibraryLoadOption,
+		DEFAULT_RUM_LIBRARY_LOAD_OPTION,
+		rum_load_options,
+		PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableStatementTimeout", newGucPrefix),
+		gettext_noop(
+			"Whether to enable per statement backend timeout override in the backend."),
+		NULL, &EnableBackendStatementTimeout, DEFAULT_ENABLE_STATEMENT_TIMEOUT,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 }

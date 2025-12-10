@@ -22,6 +22,9 @@ SET search_path to documentdb_core,documentdb_api,documentdb_api_catalog,change_
 -- Delete all old create index requests from other tests
 DELETE from documentdb_api_catalog.documentdb_index_queue;
 
+-- show index_queue schema
+\d documentdb_api_catalog.documentdb_index_queue;
+
 ---- createIndexes - top level - parse error ----
 SELECT * FROM documentdb_api.create_indexes_background('db', NULL);
 SELECT * FROM documentdb_api.create_indexes_background(NULL, '{}');
@@ -137,7 +140,7 @@ SELECT * FROM documentdb_api.create_indexes_background('db', '{"createIndexes": 
 SELECT * FROM documentdb_api.create_indexes_background('db', '{"createIndexes": "collection_6", "indexes": [{"key": {"a.$b.$**": 1}, "name": "my_idx_12"}]}');
 SELECT * FROM documentdb_api.create_indexes_background('db', '{"createIndexes": "collection_6", "indexes": [{"key": {"a.": 1}, "name": "my_idx_12"}]}');
 
--- valid mongo index type in specification, which are not supported yet
+-- valid index type in the reference implementation, which are not supported yet
 SELECT * FROM documentdb_api.create_indexes_background('db', '{"createIndexes": "collection_6", "indexes": [{"key": {"a$**": "2d"}, "name": "my_idx_2d"}]}');
 SELECT * FROM documentdb_api.create_indexes_background('db', '{"createIndexes": "collection_6", "indexes": [{"key": {"a$**": "2dsphere"}, "name": "my_idx_2dsphere"}]}');
 SELECT * FROM documentdb_api.create_indexes_background('db', '{"createIndexes": "collection_6", "indexes": [{"key": {"a$**": "text"}, "name": "my_idx_text"}]}');
@@ -175,6 +178,17 @@ CALL documentdb_distributed_test_helpers.create_indexes_background(
    p_log_index_queue => true
 );
 
+CALL documentdb_distributed_test_helpers.create_indexes_background(
+  'db',
+  '{
+     "createIndexes": "createIndex_background_1",
+     "indexes": [
+       {"key": {"block_c": 1}, "name": "my_idx_blocking_c", "storageEngine": { "blocking": true }}
+     ]
+   }',
+   p_log_index_queue => true
+);
+
 -- Queue should be empty
 SELECT index_cmd, cmd_type, index_id, index_cmd_status, collection_id, attempt, user_oid FROM documentdb_api_catalog.documentdb_index_queue ORDER BY index_id;
 
@@ -206,6 +220,20 @@ CALL documentdb_distributed_test_helpers.create_indexes_background(
      ]
    }'
 );
+
+-- create one concurrent and one blocking.
+CALL documentdb_distributed_test_helpers.create_indexes_background(
+  'db',
+  '{
+     "createIndexes": "createIndex_background_1",
+     "indexes": [
+       {"key": {"block_e": 1}, "name": "my_idx_block_e"},
+       {"key": {"block_f": 1}, "name": "my_idx_block_f", "storageEngine": { "blocking": true } }
+     ]
+   }',
+   p_log_index_queue => true
+);
+
 SELECT * FROM documentdb_distributed_test_helpers.count_collection_indexes('db', 'createIndex_background_1') ORDER BY 1,2;
 
 -- Test unique and non-unique index creation in same request
@@ -318,7 +346,7 @@ DELETE FROM documentdb_api_catalog.documentdb_index_queue;
 
 -- test with attempt > 1
 INSERT INTO documentdb_api_catalog.documentdb_index_queue (index_cmd, cmd_type, index_id, index_cmd_status, collection_id, attempt) 
-VALUES ('CREATE INDEX CONCURRENTLY', 'C', 32105, 2, 32000, 2);
+VALUES ('CREATE INDEX CONCURRENTLY', 'C', 32105, 2, 32000, 4);
 -- this should return finish : 1, ok : 0 and error message due to one attempt is failed "Index creation attempt failed"
 SELECT * FROM documentdb_api_internal.check_build_index_status('{"indexRequest" : {"cmdType" : "C", "ids" :[32101,32102,32103,32104,32105,32106]}}');
 DELETE FROM documentdb_api_catalog.documentdb_index_queue;

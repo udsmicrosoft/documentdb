@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
  *
- * src/oss_backend/commands/insert.c
+ * src/commands/insert.c
  *
  * Implementation of the insert operation.
  *
@@ -46,6 +46,8 @@
 #include "api_hooks.h"
 #include "schema_validation/schema_validation.h"
 #include "operators/bson_expr_eval.h"
+#include "planner/documentdb_planner.h"
+#include "optimizer/plancat.h"
 
 /*
  * BatchInsertionSpec describes a batch of insert operations.
@@ -129,6 +131,20 @@ static uint64 CallInsertWorkerForInsertOne(MongoCollection *collection, int64
 										   pgbson *document, text *transactionId);
 static Datum CommandInsertCore(PG_FUNCTION_ARGS, bool isTransactional, MemoryContext
 							   allocContext);
+static inline List * CreateValuesListForInsert(Const *shardKey, Expr *objectId,
+											   Expr *document, AttrNumber
+											   creationTimeVarAttNum);
+static uint64_t ExecuteLocalShardInsertPlan(PlannedStmt *queryPlan, ParamListInfo
+											paramListInfo);
+static PlannedStmt * CreateLocalShardInsertPlan(MongoCollection *collection, Oid
+												shardOid, List *valuesLists);
+static inline RangeTblEntry * CreateValueRteForInsert(MongoCollection *collection,
+													  List *valuesLists);
+static inline List * CreateTargetListForInsert(MongoCollection *collection);
+static inline RangeTblEntry * CreateBaseTableRteForInsert(MongoCollection *collection, Oid
+														  shardOid,
+														  List **optionalPermInfos);
+static inline void ReportInsertFeatureUsage(int batchSize);
 
 /*
  * ApiGucPrefix.enable_create_collection_on_insert GUC determines whether
@@ -138,6 +154,7 @@ bool EnableCreateCollectionOnInsert = true;
 extern bool UseLocalExecutionShardQueries;
 extern bool EnableBypassDocumentValidation;
 extern bool EnableSchemaValidation;
+extern bool EnableUpdateBsonDocument;
 
 /*
  * command_insert handles the insert command invocation through a PostgreSQL function.
@@ -211,7 +228,7 @@ CreateCollectionForInsert(Datum databaseNameDatum, Datum collectionNameDatum)
 		char *collectionName = TextDatumGetCString(collectionNameDatum);
 
 		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE),
-						errmsg("collection %s does not exist",
+						errmsg("The collection named %s cannot be found",
 							   quote_literal_cstr(collectionName))));
 	}
 
@@ -229,7 +246,7 @@ CreateCollectionForInsert(Datum databaseNameDatum, Datum collectionNameDatum)
 	if (collection == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-						errmsg("failed to create collection"),
+						errmsg("Unable to create the specified collection"),
 						errdetail_log(
 							"Could not get collection from cache after creating the collection")));
 	}
@@ -261,7 +278,7 @@ BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDo
 			if (!BSON_ITER_HOLDS_UTF8(insertCommandIter))
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-								errmsg("collection name has invalid type %s",
+								errmsg("Collection name contains an invalid data type %s",
 									   BsonIterTypeName(insertCommandIter))));
 			}
 
@@ -276,7 +293,8 @@ BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDo
 			if (insertDocs != NULL)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-								errmsg("Unexpected additional documents")));
+								errmsg(
+									"Both 'documents' and 'insert.documents' cannot be specified.")));
 			}
 
 			bson_iter_t insertArrayIter;
@@ -313,7 +331,7 @@ BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDo
 		}
 		else if (IsCommonSpecIgnoredField(field))
 		{
-			elog(DEBUG1, "Unrecognized command field: insert.%s", field);
+			elog(DEBUG1, "Command field not recognized: insert.%s", field);
 
 			/*
 			 *  Silently ignore now, so that clients don't break
@@ -325,16 +343,17 @@ BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDo
 		else
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_UNKNOWNBSONFIELD),
-							errmsg("BSON field 'insert.%s' is an unknown field",
-								   field)));
+							errmsg(
+								"The BSON field 'insert.%s' is not recognized as a valid field.",
+								field)));
 		}
 	}
 
 	if (collectionName == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION40414),
-						errmsg("BSON field 'insert.insert' is missing but "
-							   "a required field")));
+						errmsg(
+							"The BSON field 'insert.insert' is required but not provided")));
 	}
 
 	if (insertDocs != NULL)
@@ -356,8 +375,9 @@ BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDo
 		insertionCount > MaxWriteBatchSize)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDLENGTH),
-						errmsg("Write batch sizes must be between 1 and %d. "
-							   "Got %d operations.", MaxWriteBatchSize, insertionCount)));
+						errmsg(
+							"Write batch size must fall within the range of 1 to %d, but %d operations were provided.",
+							MaxWriteBatchSize, insertionCount)));
 	}
 
 	BatchInsertionSpec *batchSpec = palloc0(sizeof(BatchInsertionSpec));
@@ -538,12 +558,7 @@ DoMultiInsertWithoutTransactionId(MongoCollection *collection, List *inserts, Oi
 	PG_TRY();
 	{
 		List *valuesList = NIL;
-
 		ListCell *insertCell;
-
-		TimestampTz nowValueTime = GetCurrentTimestamp();
-		Const *nowValue = makeConst(TIMESTAMPTZOID, -1, InvalidOid, 8,
-									TimestampTzGetDatum(nowValueTime), false, true);
 
 		/* Make params for all the BSONs - we have 2 per insert - objectId/insertDoc */
 		int expectedNumParams = Min(list_length(inserts), BatchWriteSubTransactionCount);
@@ -571,8 +586,11 @@ DoMultiInsertWithoutTransactionId(MongoCollection *collection, List *inserts, Oi
 
 			Expr *documentParam = CreateBsonParam(paramIndex, paramListInfo, insertDoc);
 			paramIndex++;
-			List *values = list_make4(shardKeyConst, objectidParam, documentParam,
-									  nowValue);
+
+			List *values = CreateValuesListForInsert(shardKeyConst, objectidParam,
+													 documentParam,
+													 collection->
+													 mongoDataCreationTimeVarAttrNumber);
 
 			valuesList = lappend(valuesList, values);
 			insertCount++;
@@ -580,8 +598,22 @@ DoMultiInsertWithoutTransactionId(MongoCollection *collection, List *inserts, Oi
 		}
 
 		paramListInfo->numParams = paramIndex;
-		Query *query = CreateInsertQuery(collection, shardOid, valuesList);
-		uint64_t rowsProcessed = RunInsertQuery(query, paramListInfo);
+
+		uint64_t rowsProcessed = 0;
+		if (shardOid == InvalidOid)
+		{
+			Query *query = CreateInsertQuery(collection, shardOid,
+											 valuesList);
+			rowsProcessed = RunInsertQuery(query, paramListInfo);
+		}
+		else
+		{
+			ThrowIfWriteCommandNotAllowed();
+
+			PlannedStmt *queryPlan = CreateLocalShardInsertPlan(collection,
+																shardOid, valuesList);
+			rowsProcessed = ExecuteLocalShardInsertPlan(queryPlan, paramListInfo);
+		}
 
 		/* Merge inner batchResult with outer batchResult */
 		batchResult->rowsInserted += rowsProcessed;
@@ -600,7 +632,7 @@ DoMultiInsertWithoutTransactionId(MongoCollection *collection, List *inserts, Oi
 		MemoryContextSwitchTo(oldContext);
 		ErrorData *errorData = CopyErrorDataAndFlush();
 
-		/* Abort the inner transaction */
+		/* Abort inner transaction */
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldContext);
 		CurrentResourceOwner = oldOwner;
@@ -612,27 +644,21 @@ DoMultiInsertWithoutTransactionId(MongoCollection *collection, List *inserts, Oi
 		}
 
 		int errorCode = errorData->sqlerrcode;
-		const char *errorCodeStr = unpack_sql_state(errorCode);
 		if (EreportCodeIsDocumentDBError(errorCode))
 		{
 			/*
 			 * TODO: Since there is no mapping from PG error to mongo error today in engine,
 			 * we can't deduce the mongo specific error code.
 			 */
-			ereport(LOG, (
-						errmsg(
-							"Optimistic Batch Insert failed. Retrying with single insert. documentDB errorCode %s",
-							errorCodeStr)));
+			elog_unredacted(
+				"Optimistic Batch Insert failed. Retrying with single insert. documentDB errorCode %d",
+				errorCode);
 		}
 		else
 		{
-			ereport(LOG, (
-						errmsg(
-							"Optimistic Batch Insert failed. Retrying with single insert. SQL Error %s",
-							errorCodeStr),
-						errdetail_log(
-							"Optimistic Batch Insert failed. Retrying with single insert. SQL Error %s",
-							errorCodeStr)));
+			elog_unredacted(
+				"Optimistic Batch Insert failed. Retrying with single insert. SQL Error %d",
+				errorCode);
 		}
 	}
 	PG_END_TRY();
@@ -678,7 +704,7 @@ DoSingleInsert(MongoCollection *collection,
 		MemoryContextSwitchTo(oldContext);
 		ErrorData *errorData = CopyErrorDataAndFlush();
 
-		/* Abort the inner transaction */
+		/* Abort inner transaction */
 		RollbackAndReleaseCurrentSubTransaction();
 		CurrentResourceOwner = oldOwner;
 
@@ -779,7 +805,9 @@ DoBatchInsertNoTransactionId(MongoCollection *collection, BatchInsertionSpec *ba
 		{
 			/* For each iteration of the loop, commit prior work */
 			bool setSnapshot = true;
-			CommitWriteProcedureAndReacquireCollectionLock(collection, setSnapshot);
+			CommitWriteProcedureAndReacquireCollectionLock(collection,
+														   batchSpec->insertShardOid,
+														   setSnapshot);
 		}
 
 		if (list_length(insertions) > 1 && !hasBatchedInsertFailed)
@@ -867,20 +895,39 @@ ProcessInsertion(MongoCollection *collection,
 		 * have that call INSERT - we can just do that directly from the coordinator (which probably
 		 * saves one query parsing and planning per document).
 		 */
-		ParamListInfo paramListInfo = makeParamList(2);
-		paramListInfo->numParams = 2;
 		Const *shardKeyConst = makeConst(INT8OID, -1, InvalidOid, 8,
 										 Int64GetDatum(shardKeyHash), false, true);
+
+		List *singleInsertList = NULL;
+		uint64_t insertResult = 0;
+
+		ParamListInfo paramListInfo = makeParamList(2);
+		paramListInfo->numParams = 2;
 		Expr *objectidParam = CreateBsonParam(0, paramListInfo, objectIdPtr);
 		Expr *documentParam = CreateBsonParam(1, paramListInfo, insertDoc);
-		TimestampTz nowValueTime = GetCurrentTimestamp();
-		Const *nowValue = makeConst(TIMESTAMPTZOID, -1, InvalidOid, 8,
-									TimestampTzGetDatum(nowValueTime), false, true);
-		List *singleInsertList = list_make4(shardKeyConst, objectidParam, documentParam,
-											nowValue);
-		Query *query = CreateInsertQuery(collection, optionalInsertShardOid, list_make1(
-											 singleInsertList));
-		uint64_t insertResult = RunInsertQuery(query, paramListInfo);
+
+		singleInsertList = CreateValuesListForInsert(shardKeyConst, objectidParam,
+													 documentParam,
+													 collection->
+													 mongoDataCreationTimeVarAttrNumber);
+
+		if (optionalInsertShardOid == InvalidOid)
+		{
+			Query *query = CreateInsertQuery(collection, optionalInsertShardOid,
+											 list_make1(
+												 singleInsertList));
+			insertResult = RunInsertQuery(query, paramListInfo);
+		}
+		else
+		{
+			ThrowIfWriteCommandNotAllowed();
+
+			PlannedStmt *queryPlan = CreateLocalShardInsertPlan(collection,
+																optionalInsertShardOid,
+																list_make1(
+																	singleInsertList));
+			insertResult = ExecuteLocalShardInsertPlan(queryPlan, paramListInfo);
+		}
 		pfree(paramListInfo);
 		list_free_deep(singleInsertList);
 		return insertResult;
@@ -899,13 +946,15 @@ CommandInsertCore(PG_FUNCTION_ARGS, bool isTransactional, MemoryContext allocCon
 {
 	if (PG_ARGISNULL(0))
 	{
-		ereport(ERROR, (errmsg("database name cannot be NULL")));
+		ereport(ERROR, (errmsg("Database name must not be NULL value")));
 	}
 
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("insert document cannot be NULL")));
 	}
+
+	ThrowIfServerOrTransactionReadOnly();
 
 	Datum databaseNameDatum = PG_GETARG_DATUM(0);
 	pgbson *insertSpec = PG_GETARG_PGBSON(1);
@@ -936,20 +985,20 @@ CommandInsertCore(PG_FUNCTION_ARGS, bool isTransactional, MemoryContext allocCon
 	/* we first validate insert command BSON and build a specification */
 	BatchInsertionSpec *batchSpec = BuildBatchInsertionSpec(&insertCommandIter,
 															insertDocs);
-
+	ReportInsertFeatureUsage(list_length(batchSpec->documents));
 	BatchInsertionResult batchResult;
 	batchResult.resultMemoryContext = allocContext;
 	MemoryContextSwitchTo(oldContext);
 	if (list_length(batchSpec->documents) == 0)
 	{
-		/* If there's no documents to insert exit and don't create the collection */
+		/* Don't create the collection if there are no documents to insert */
 		batchResult.rowsInserted = 0;
 		batchResult.ok = 1;
 		batchResult.writeErrors = NIL;
 	}
 	else
 	{
-		/* open the collection */
+		/* open collection */
 		Datum collectionNameDatum = CStringGetTextDatum(batchSpec->collectionName);
 		MongoCollection *collection =
 			GetMongoCollectionByNameDatum(databaseNameDatum, collectionNameDatum,
@@ -966,7 +1015,7 @@ CommandInsertCore(PG_FUNCTION_ARGS, bool isTransactional, MemoryContext allocCon
 																   RowExclusiveLock);
 		}
 
-		/* do the inserts */
+		/* execute data inserts */
 		ProcessBatchInsertion(collection, batchSpec, transactionId, &batchResult,
 							  isTransactional);
 	}
@@ -1098,6 +1147,7 @@ command_insert_worker(PG_FUNCTION_ARGS)
 							"Explicit shardOid must be set - this is a server bug")));
 	}
 
+	ThrowIfServerOrTransactionReadOnly();
 	AllowNestedDistributionInCurrentTransaction();
 	pgbsonelement element = { 0 };
 	PgbsonToSinglePgbsonElement(insertInternalSpec, &element);
@@ -1126,7 +1176,7 @@ command_insert_worker(PG_FUNCTION_ARGS)
 
 
 /*
- * InsertDocument inserts a document into a collection.
+ * InsertDocument adds a new document into the specified collection.
  */
 bool
 InsertDocument(uint64 collectionId, const char *shardTableName,
@@ -1180,20 +1230,24 @@ InsertDocument(uint64 collectionId, const char *shardTableName,
 
 /*
  * Inserts a document with the given shardKeyValue and object_id, and on conflict
- * with the _id index, replaces the document (Similar to upsert behavior)
+ * with the _id index, reapplies the update on the conflicting document (Similar to upsert behavior)
  */
 bool
 InsertOrReplaceDocument(uint64 collectionId, const char *shardTableName, int64
 						shardKeyValue,
-						pgbson *objectId, pgbson *document)
+						pgbson *objectId, pgbson *document,
+						const bson_value_t *updateSpecValue)
 {
 	StringInfoData query;
-	const int argCount = 3;
-	Oid argTypes[3];
-	Datum argValues[3];
+	const int argCount = 4;
+	Oid argTypes[4];
+	Datum argValues[4];
 	int spiStatus PG_USED_FOR_ASSERTS_ONLY = 0;
+	uint64 planId;
 
 	SPI_connect();
+
+	pgbson *updateSpecDoc = BsonValueToDocumentPgbson(updateSpecValue);
 
 	initStringInfo(&query);
 	appendStringInfo(&query, "INSERT INTO %s.", ApiDataSchemaName);
@@ -1212,21 +1266,70 @@ InsertOrReplaceDocument(uint64 collectionId, const char *shardTableName, int64
 							 "%s.bson_from_bytea($3))",
 					 CoreSchemaName, CoreSchemaName);
 
-	if (shardTableName != NULL && shardTableName[0] != '\0')
+	if (EnableUpdateBsonDocument && IsClusterVersionAtleast(DocDB_V0, 109, 0))
 	{
-		/* Direct shard - we need to extract tableId_shardId as a suffix */
-		/* Prefix length is the length of documents_ */
-		const int prefixLength = 10;
-		const char *shardSuffix = shardTableName + prefixLength;
-		appendStringInfo(&query, " ON CONFLICT ON CONSTRAINT collection_pk_%s"
-								 " DO UPDATE set document = %s.bson_from_bytea($3)",
-						 shardSuffix, CoreSchemaName);
+		planId = QUERY_ID_INSERT_OR_REPLACE_NEW;
+
+		if (shardTableName != NULL && shardTableName[0] != '\0')
+		{
+			/* Direct shard - we need to extract tableId_shardId as a suffix */
+			/* Prefix length is the length of documents_ */
+			const int prefixLength = 10;
+			const char *shardSuffix = shardTableName + prefixLength;
+			appendStringInfo(&query, " ON CONFLICT ON CONSTRAINT collection_pk_%s"
+									 " DO UPDATE SET document ="
+									 " COALESCE(%s.update_bson_document("
+									 " %s.documents_%s.document, %s.bson_from_bytea($4), '{}'::%s.bson, NULL::%s.bson, NULL::%s.bson, NULL::TEXT),"
+									 " %s.documents_%s.document)",
+							 shardSuffix, ApiInternalSchemaNameV2, ApiDataSchemaName,
+							 shardSuffix, CoreSchemaName, CoreSchemaName, CoreSchemaName,
+							 CoreSchemaName, ApiDataSchemaName,
+							 shardSuffix);
+		}
+		else
+		{
+			appendStringInfo(&query,
+							 " ON CONFLICT ON CONSTRAINT collection_pk_" UINT64_FORMAT
+							 " DO UPDATE SET document ="
+							 " COALESCE(%s.update_bson_document(%s.documents_"UINT64_FORMAT
+							 ".document, %s.bson_from_bytea($4), '{}'::%s.bson, NULL::%s.bson, NULL::%s.bson, NULL::TEXT),"
+							 " %s.documents_"UINT64_FORMAT ".document)",
+							 collectionId, ApiInternalSchemaNameV2, ApiDataSchemaName,
+							 collectionId,
+							 CoreSchemaName, CoreSchemaName, CoreSchemaName,
+							 CoreSchemaName, ApiDataSchemaName, collectionId);
+		}
 	}
 	else
 	{
-		appendStringInfo(&query, " ON CONFLICT ON CONSTRAINT collection_pk_" UINT64_FORMAT
-						 " DO UPDATE set document = %s.bson_from_bytea($3)", collectionId,
-						 CoreSchemaName);
+		planId = QUERY_ID_INSERT_OR_REPLACE;
+
+		if (shardTableName != NULL && shardTableName[0] != '\0')
+		{
+			/* Direct shard - we need to extract tableId_shardId as a suffix */
+			/* Prefix length is the length of documents_ */
+			const int prefixLength = 10;
+			const char *shardSuffix = shardTableName + prefixLength;
+			appendStringInfo(&query, " ON CONFLICT ON CONSTRAINT collection_pk_%s"
+									 " DO UPDATE set document = COALESCE( (%s.bson_update_document(%s.documents_%s.document, %s.bson_from_bytea($4), '{}'::%s.bson)).newDocument, %s.documents_%s.document)",
+							 shardSuffix, ApiInternalSchemaName, ApiDataSchemaName,
+							 shardSuffix, CoreSchemaName, CoreSchemaName,
+							 ApiDataSchemaName,
+							 shardSuffix);
+		}
+		else
+		{
+			appendStringInfo(&query,
+							 " ON CONFLICT ON CONSTRAINT collection_pk_" UINT64_FORMAT
+							 " DO UPDATE set document = COALESCE( (%s.bson_update_document(%s.documents_"
+							 UINT64_FORMAT
+							 ".document, %s.bson_from_bytea($4), '{}'::%s.bson)).newDocument, %s.documents_"UINT64_FORMAT
+							 ".document)",
+							 collectionId, ApiInternalSchemaName, ApiDataSchemaName,
+							 collectionId,
+							 CoreSchemaName, CoreSchemaName, ApiDataSchemaName,
+							 collectionId);
+		}
 	}
 
 	argTypes[0] = INT8OID;
@@ -1235,10 +1338,11 @@ InsertOrReplaceDocument(uint64 collectionId, const char *shardTableName, int64
 	argValues[1] = PointerGetDatum(CastPgbsonToBytea(objectId));
 	argTypes[2] = BYTEAOID;
 	argValues[2] = PointerGetDatum(CastPgbsonToBytea(document));
+	argTypes[3] = BYTEAOID;
+	argValues[3] = PointerGetDatum(CastPgbsonToBytea(updateSpecDoc));
 
 	SPIPlanPtr plan = GetSPIQueryPlanWithLocalShard(collectionId, shardTableName,
-													QUERY_ID_INSERT_OR_REPLACE,
-													query.data, argTypes,
+													planId, query.data, argTypes,
 													argCount);
 
 	spiStatus = SPI_execute_plan(plan, argValues, NULL, false, 1);
@@ -1340,89 +1444,24 @@ CreateInsertQuery(MongoCollection *collection, Oid shardOid, List *valuesLists)
 	query->querySource = QSRC_ORIGINAL;
 	query->canSetTag = true;
 
-	/* Make the base table RTE */
-	RangeTblEntry *rte = makeNode(RangeTblEntry);
-	List *colNames = list_make4(makeString("shard_key_value"), makeString("object_id"),
-								makeString("document"),
-								makeString("creation_time"));
-
-	/* If "creation_time" is the fifth column, then we should include "change_description" in the RTE. */
-	if (collection->mongoDataCreationTimeVarAttrNumber == 5)
-	{
-		colNames = ModifyTableColumnNames(colNames);
-	}
-
-	rte->rtekind = RTE_RELATION;
-	rte->relid = collection->relationId;
-
-	/* If there is a shardOid and we can thunk directly to the shard,
-	 * then set it. This will point the insert to the shard directly and avoid
-	 * going through citus distributed planning.
-	 */
-	if (shardOid != InvalidOid)
-	{
-		rte->relid = shardOid;
-	}
-
-	rte->alias = rte->eref = makeAlias("collection", colNames);
-	rte->lateral = false;
-	rte->inFromCl = false;
-	rte->relkind = RELKIND_RELATION;
-	rte->functions = NIL;
-	rte->inh = true;
 #if PG_VERSION_NUM >= 160000
-	RTEPermissionInfo *permInfo = addRTEPermissionInfo(&query->rteperminfos, rte);
-	permInfo->requiredPerms = ACL_INSERT;
+	RangeTblEntry *rte = CreateBaseTableRteForInsert(collection, shardOid,
+													 &query->rteperminfos);
 #else
-	rte->requiredPerms = ACL_INSERT;
+	RangeTblEntry *rte = CreateBaseTableRteForInsert(collection, shardOid, NULL);
 #endif
 
-	rte->rellockmode = RowExclusiveLock;
-	query->rtable = lappend(query->rtable, rte);
+	RangeTblEntry *valuesRte = CreateValueRteForInsert(collection, valuesLists);
+
+	query->rtable = list_make2(rte, valuesRte);
 	query->resultRelation = 1;
-
-	/* Make the VALUES RTE */
-	List *valuesColNames = list_make4(makeString("shard_key_value"),
-									  makeString("object_id"),
-									  makeString("document"),
-									  makeString("creation_time"));
-	RangeTblEntry *valuesRte = makeNode(RangeTblEntry);
-	valuesRte->rtekind = RTE_VALUES;
-	valuesRte->alias = valuesRte->eref = makeAlias("values", valuesColNames);
-	valuesRte->lateral = false;
-	valuesRte->inFromCl = false;
-	valuesRte->values_lists = valuesLists;
-	valuesRte->inh = false;
-	valuesRte->inFromCl = true;
-
-	valuesRte->coltypes = list_make4_oid(INT8OID, BsonTypeId(), BsonTypeId(),
-										 TIMESTAMPTZOID);
-	valuesRte->coltypmods = list_make4_int(-1, -1, -1, -1);
-	valuesRte->colcollations = list_make4_oid(InvalidOid, InvalidOid, InvalidOid,
-											  InvalidOid);
-	query->rtable = lappend(query->rtable, valuesRte);
 
 	RangeTblRef *valuesRteRef = makeNode(RangeTblRef);
 	valuesRteRef->rtindex = 2;
 	List *fromList = list_make1(valuesRteRef);
 
 	query->jointree = makeFromExpr(fromList, NULL);
-
-	/* Now create the targetlist */
-	query->targetList = list_make4(
-		makeTargetEntry((Expr *) makeVar(2, 1, INT8OID, -1, InvalidOid, 0),
-						DOCUMENT_DATA_TABLE_SHARD_KEY_VALUE_VAR_ATTR_NUMBER,
-						"shard_key_value", false),
-		makeTargetEntry((Expr *) makeVar(2, 2, BsonTypeId(), -1, InvalidOid, 0),
-						DOCUMENT_DATA_TABLE_OBJECT_ID_VAR_ATTR_NUMBER, "object_id",
-						false),
-		makeTargetEntry((Expr *) makeVar(2, 3, BsonTypeId(), -1, InvalidOid, 0),
-						DOCUMENT_DATA_TABLE_DOCUMENT_VAR_ATTR_NUMBER, "document",
-						false),
-		makeTargetEntry((Expr *) makeVar(2, 4, TIMESTAMPTZOID, -1, InvalidOid, 0),
-						collection->mongoDataCreationTimeVarAttrNumber, "creation_time",
-						false)
-		);
+	query->targetList = CreateTargetListForInsert(collection);
 
 	/* In order to use a portal & SPI we create a returning list of a const */
 	query->returningList = list_make1(
@@ -1434,7 +1473,7 @@ CreateInsertQuery(MongoCollection *collection, Oid shardOid, List *valuesLists)
 
 
 /*
- * Executes the Insert query and returns the number of results processed.
+ * Executes the Insert query and returns the total count of processed results.
  */
 static uint64_t
 RunInsertQuery(Query *insertQuery, ParamListInfo paramListInfo)
@@ -1475,4 +1514,279 @@ RunInsertQuery(Query *insertQuery, ParamListInfo paramListInfo)
 	}
 
 	return numRowsProcessed;
+}
+
+
+/*
+ * CreateLocalShardInsertPlan
+ *
+ * Creates a PlannedStmt for inserting into a local shard table directly.
+ * This avoids planning phase.
+ *
+ * Returns:
+ *   PlannedStmt* - The planned statement ready for execution.
+ */
+static PlannedStmt *
+CreateLocalShardInsertPlan(MongoCollection *collection, Oid shardOid,
+						   List *valuesLists)
+{
+	const Cost startupCost = 0.0; /* No startup cost for VALUES scan */
+	const Cost totalCost = 0.0125; /* Arbitrary small cost for the VALUES scan */
+	const Cardinality planRows = list_length(valuesLists);
+	int planWidth = get_relation_data_width(shardOid, NULL);
+	const Index relationRelId = 1; /* RTE index for the base table */
+	const Index valueListRelId = 2; /* RTE index for the VALUES list */
+
+	PlannedStmt *stmt = makeNode(PlannedStmt);
+#if PG_VERSION_NUM >= 160000
+	RangeTblEntry *relationRte = CreateBaseTableRteForInsert(collection, shardOid,
+															 &stmt->permInfos);
+#else
+	RangeTblEntry *relationRte = CreateBaseTableRteForInsert(collection, shardOid, NULL);
+#endif
+	RangeTblEntry *valuesRte = CreateValueRteForInsert(collection, valuesLists);
+	List *targetList = CreateTargetListForInsert(collection);
+
+
+	/* Create the ValuesScan node for the VALUES RTE */
+	ValuesScan *vscan = makeNode(ValuesScan);
+	vscan->scan.scanrelid = valueListRelId;
+	vscan->values_lists = copyObject(valuesRte->values_lists);
+	valuesRte->values_lists = NULL;
+
+	Plan *vplan = &vscan->scan.plan;
+	vplan->startup_cost = startupCost;
+	vplan->total_cost = totalCost;
+	vplan->plan_rows = planRows;
+	vplan->plan_width = planWidth;
+	vplan->targetlist = targetList;
+
+	/* Create the ModifyTable node for the insert operation */
+	ModifyTable *mt = makeNode(ModifyTable);
+	mt->operation = CMD_INSERT;
+	mt->canSetTag = true;
+	mt->resultRelations = list_make1_int(relationRelId);
+	mt->plan.lefttree = (Plan *) vscan;
+	mt->plan.total_cost = totalCost;
+	mt->plan.plan_rows = planRows;
+	mt->plan.plan_width = planWidth;
+	mt->nominalRelation = relationRelId;
+
+	/* Fill in the PlannedStmt */
+	stmt->commandType = CMD_INSERT;
+	stmt->canSetTag = true;
+	stmt->planTree = (Plan *) mt;
+	stmt->rtable = list_make2(relationRte, valuesRte);
+	stmt->resultRelations = list_make1_int(relationRelId);
+	stmt->relationOids = list_make1_oid(relationRte->relid);
+
+	return stmt;
+}
+
+
+/*
+ * Executes a local insert plan for a sharded table using the provided PlannedStmt.
+ * Returns the number of rows processed.
+ */
+static uint64_t
+ExecuteLocalShardInsertPlan(PlannedStmt *queryPlan, ParamListInfo paramListInfo)
+{
+	ScanDirection scanDirection = ForwardScanDirection;
+	QueryEnvironment *queryEnv = create_queryEnv();
+	int eflags = 0;
+
+	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
+													   "DocumentDBExecutePlan",
+													   ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
+	DestReceiver *receiver = CreateDestReceiver(DestNone);
+
+	/* Create a QueryDesc for the query */
+	QueryDesc *queryDesc = CreateQueryDesc(queryPlan, "",
+										   GetActiveSnapshot(), InvalidSnapshot,
+										   receiver, paramListInfo,
+										   queryEnv, 0);
+
+	ExecutorStart(queryDesc, eflags);
+
+	ExecutorRun_Compat(queryDesc, scanDirection, 0L, true);
+
+	uint64_t numRowsProcessed = queryDesc->estate->es_processed;
+
+	ExecutorFinish(queryDesc);
+	ExecutorEnd(queryDesc);
+
+	FreeQueryDesc(queryDesc);
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextDelete(localContext);
+
+	return numRowsProcessed;
+}
+
+
+/* indicates the presence of a creation_time column in the table, either at attribute number 4 or 5 */
+static inline List *
+CreateValuesListForInsert(Const *shardKey, Expr *objectId, Expr *document, AttrNumber
+						  creationTimeVarAttNum)
+{
+	if (creationTimeVarAttNum != -1)
+	{
+		TimestampTz nowValueTime = (TimestampTz) 000000000000000LL;  /* "2000-01-01 00:00:00+00" */
+		Const *nowValue = makeConst(TIMESTAMPTZOID, -1, InvalidOid, 8,
+									TimestampTzGetDatum(nowValueTime), false, true);
+		return list_make4(shardKey, objectId, document, nowValue);
+	}
+	else
+	{
+		return list_make3(shardKey, objectId, document);
+	}
+}
+
+
+/* Build RangeTblEntry for base table */
+static inline RangeTblEntry *
+CreateBaseTableRteForInsert(MongoCollection *collection, Oid shardOid,
+							List **optionalPermInfos)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	List *colNames = list_make3(makeString("shard_key_value"), makeString("object_id"),
+								makeString("document"));
+
+
+	if (collection->mongoDataCreationTimeVarAttrNumber == 4)
+	{
+		colNames = lappend(colNames, makeString("creation_time"));
+	}
+	else if (collection->mongoDataCreationTimeVarAttrNumber == 5)
+	{
+		/* If "creation_time" is the fifth column, then we should include "change_description" in the RTE. */
+		colNames = ModifyTableColumnNames(colNames);
+	}
+
+	rte->rtekind = RTE_RELATION;
+	rte->relid = collection->relationId;
+
+	/* If there is a shardOid and we can thunk directly to the shard,
+	 * then set it. This will point the insert to the shard directly and avoid
+	 * going through citus distributed planning.
+	 */
+	if (shardOid != InvalidOid)
+	{
+		rte->relid = shardOid;
+	}
+
+	rte->alias = rte->eref = makeAlias("collection", colNames);
+	rte->lateral = false;
+	rte->inFromCl = false;
+	rte->relkind = RELKIND_RELATION;
+	rte->functions = NIL;
+	rte->inh = true;
+	rte->rellockmode = RowExclusiveLock;
+
+#if PG_VERSION_NUM >= 160000
+	RTEPermissionInfo *permInfo = addRTEPermissionInfo(optionalPermInfos, rte);
+	permInfo->requiredPerms = ACL_INSERT;
+#else
+	rte->requiredPerms = ACL_INSERT;
+#endif
+
+	return rte;
+}
+
+
+/* Build RangeTblEntry for values */
+static inline RangeTblEntry *
+CreateValueRteForInsert(MongoCollection *collection, List *valuesLists)
+{
+	/* Build the VALUES RTE */
+	List *valuesColNames = list_make3(makeString("shard_key_value"),
+									  makeString("object_id"),
+									  makeString("document"));
+
+	if (collection->mongoDataCreationTimeVarAttrNumber != -1)
+	{
+		valuesColNames = lappend(valuesColNames, makeString("creation_time"));
+	}
+
+	RangeTblEntry *valuesRte = makeNode(RangeTblEntry);
+	valuesRte->rtekind = RTE_VALUES;
+	valuesRte->alias = valuesRte->eref = makeAlias("values", valuesColNames);
+	valuesRte->lateral = false;
+	valuesRte->inFromCl = true;
+	valuesRte->values_lists = valuesLists;
+	valuesRte->inh = false;
+
+	/* Set column types and widths */
+	if (collection->mongoDataCreationTimeVarAttrNumber != -1)
+	{
+		valuesRte->coltypes = list_make4_oid(INT8OID, BsonTypeId(), BsonTypeId(),
+											 TIMESTAMPTZOID);
+		valuesRte->coltypmods = list_make4_int(-1, -1, -1, -1);
+		valuesRte->colcollations = list_make4_oid(InvalidOid, InvalidOid, InvalidOid,
+												  InvalidOid);
+	}
+	else
+	{
+		valuesRte->coltypes = list_make3_oid(INT8OID, BsonTypeId(), BsonTypeId());
+		valuesRte->coltypmods = list_make3_int(-1, -1, -1);
+		valuesRte->colcollations = list_make3_oid(InvalidOid, InvalidOid, InvalidOid);
+	}
+
+	return valuesRte;
+}
+
+
+/* Build targetList for insert */
+static inline List *
+CreateTargetListForInsert(MongoCollection *collection)
+{
+	List *targetList = list_make3(
+		makeTargetEntry((Expr *) makeVar(2, 1, INT8OID, -1, InvalidOid, 0),
+						DOCUMENT_DATA_TABLE_SHARD_KEY_VALUE_VAR_ATTR_NUMBER,
+						"shard_key_value", false),
+		makeTargetEntry((Expr *) makeVar(2, 2, BsonTypeId(), -1, InvalidOid, 0),
+						DOCUMENT_DATA_TABLE_OBJECT_ID_VAR_ATTR_NUMBER, "object_id",
+						false),
+		makeTargetEntry((Expr *) makeVar(2, 3, BsonTypeId(), -1, InvalidOid, 0),
+						DOCUMENT_DATA_TABLE_DOCUMENT_VAR_ATTR_NUMBER, "document",
+						false)
+		);
+
+	if (collection->mongoDataCreationTimeVarAttrNumber != -1)
+	{
+		targetList = lappend(targetList,
+							 makeTargetEntry((Expr *) makeVar(2, 4, TIMESTAMPTZOID, -1,
+															  InvalidOid, 0),
+											 collection->
+											 mongoDataCreationTimeVarAttrNumber,
+											 "creation_time", false));
+	}
+
+	return targetList;
+}
+
+
+static inline void
+ReportInsertFeatureUsage(int batchSize)
+{
+	if (batchSize == 1)
+	{
+		ReportFeatureUsage(FEATURE_COMMAND_INSERT_ONE);
+	}
+	else if (batchSize <= 100)
+	{
+		ReportFeatureUsage(FEATURE_COMMAND_INSERT_100);
+	}
+	else if (batchSize <= 500)
+	{
+		ReportFeatureUsage(FEATURE_COMMAND_INSERT_500);
+	}
+	else if (batchSize <= 1000)
+	{
+		ReportFeatureUsage(FEATURE_COMMAND_INSERT_1000);
+	}
+	else
+	{
+		ReportFeatureUsage(FEATURE_COMMAND_INSERT_EXTENDED);
+	}
 }

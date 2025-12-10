@@ -40,6 +40,7 @@
 #include "types/decimal128.h"
 #include "utils/documentdb_errors.h"
 #include "commands/defrem.h"
+#include "opclass/bson_gin_index_types_core.h"
 #include "geospatial/bson_geospatial_common.h"
 #include "geospatial/bson_geospatial_geonear.h"
 #include "geospatial/bson_geospatial_shape_operators.h"
@@ -110,7 +111,8 @@ typedef struct IdFilterWalkerContext
 
 extern bool EnableCollation;
 extern bool EnableLetAndCollationForQueryMatch;
-extern bool EnableIndexOperatorBounds;
+extern bool EnableVariablesSupportForWriteCommands;
+extern bool EnableIdIndexPushdown;
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
@@ -147,6 +149,10 @@ static Expr * CreateFuncExprForQueryOperator(BsonQueryOperatorContext *context, 
 static Const * CreateConstFromBsonValue(const char *path, const bson_value_t *value, const
 										char *collationString);
 static Expr * CreateExprForDollarAll(const char *path,
+									 bson_iter_t *operatorDocIterator,
+									 BsonQueryOperatorContext *context,
+									 const MongoQueryOperator *operator);
+static Expr * ExpandExprForDollarAll(const char *path,
 									 bson_iter_t *operatorDocIterator,
 									 BsonQueryOperatorContext *context,
 									 const MongoQueryOperator *operator);
@@ -216,8 +222,10 @@ pg_attribute_noreturn()
 ThrowInvalidRegexOptions(char c)
 {
 	ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION51108), errmsg(
-						"invalid flag in regex options %c", c),
-					errdetail_log("invalid flag in regex options %c", c)));
+						"Invalid flag detected within the specified regex options %c", c),
+					errdetail_log(
+						"Invalid flag detected within the specified regex options %c",
+						c)));
 }
 
 /* --------------------------------------------------------- */
@@ -246,10 +254,14 @@ bson_query_match(PG_FUNCTION_ARGS)
 	ReplaceBsonQueryOperatorsContext context;
 	memset(&context, 0, sizeof(context));
 
-	/* if EnableEnableLetAndCollationForQueryMatch is off,  */
-	/* the collationString and variableSpec will be ignored  */
 	Node *quals = NULL;
-	if (!EnableLetAndCollationForQueryMatch || PG_NARGS() == 2)
+	bool useQueryMatchWithLetAndCollation = EnableCollation ||
+											EnableLetAndCollationForQueryMatch ||
+											EnableVariablesSupportForWriteCommands;
+
+	/* if useQueryMatchWithLetAndCollation is off,  */
+	/* the collationString and variableSpec will be ignored  */
+	if (!useQueryMatchWithLetAndCollation || PG_NARGS() == 2)
 	{
 		/* Expand the @@ operator into regular BSON operators */
 		OpExpr *queryExpr = makeNode(OpExpr);
@@ -262,7 +274,7 @@ bson_query_match(PG_FUNCTION_ARGS)
 
 		quals = ReplaceBsonQueryOperatorsMutator((Node *) queryExpr, &context);
 	}
-	else if (EnableLetAndCollationForQueryMatch && PG_NARGS() == 4)
+	else if (useQueryMatchWithLetAndCollation && PG_NARGS() == 4)
 	{
 		Const *variableSpecConst = NULL;
 		if (PG_ARGISNULL(2))
@@ -356,7 +368,7 @@ query_match_support(PG_FUNCTION_ARGS)
 				PG_RETURN_POINTER(NULL);
 			}
 
-			pgbson *queryDocument = (pgbson *) DatumGetPointer(constValue->constvalue);
+			pgbson *queryDocument = DatumGetPgBson(constValue->constvalue);
 
 			/* open the Mongo query document */
 			bson_iter_t queryDocIter;
@@ -493,7 +505,7 @@ CreateQualForBsonValueArrayExpression(const bson_value_t *expression)
 	if (expression->value_type != BSON_TYPE_ARRAY)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"expression should be an array")));
+							"Expression must be an array type")));
 	}
 
 	Var *var = makeVar(1, 1, INTERNALOID, -1, DEFAULT_COLLATION_OID, 0);
@@ -546,7 +558,8 @@ CreateQualForBsonValueArrayExpression(const bson_value_t *expression)
  * typically supplied by an @@ operator).
  */
 List *
-CreateQualsForBsonValueTopLevelQuery(const pgbson *query)
+CreateQualsForBsonValueTopLevelQueryIter(bson_iter_t *queryIter,
+										 const char *collationString)
 {
 	Var *var = makeVar(1, 1, INTERNALOID, -1, DEFAULT_COLLATION_OID, 0);
 	BsonQueryOperatorContext context = { 0 };
@@ -557,9 +570,12 @@ CreateQualsForBsonValueTopLevelQuery(const pgbson *query)
 	context.requiredFilterPathNameHashSet = NULL;
 	context.variableContext = NULL;
 
-	bson_iter_t queryDocIterator;
-	PgbsonInitIterator(query, &queryDocIterator);
-	return CreateQualsFromQueryDocIterator(&queryDocIterator, &context);
+	if (IsCollationApplicable(collationString))
+	{
+		context.collationString = collationString;
+	}
+
+	return CreateQualsFromQueryDocIterator(queryIter, &context);
 }
 
 
@@ -799,7 +815,11 @@ ReplaceBsonQueryOperatorsMutator(Node *node, ReplaceBsonQueryOperatorsContext *c
 	else if (IsA(node, FuncExpr))
 	{
 		FuncExpr *funcExpr = (FuncExpr *) node;
-		if (EnableLetAndCollationForQueryMatch &&
+
+		bool useQueryMatchWithLetAndCollation = EnableCollation ||
+												EnableLetAndCollationForQueryMatch ||
+												EnableVariablesSupportForWriteCommands;
+		if (useQueryMatchWithLetAndCollation &&
 			funcExpr->funcid == BsonQueryMatchWithLetAndCollationFunctionId())
 		{
 			Node *queryNode = lsecond(funcExpr->args);
@@ -836,7 +856,7 @@ ReplaceBsonQueryOperatorsMutator(Node *node, ReplaceBsonQueryOperatorsContext *c
 					}
 				}
 
-				Const *variableSpecConst = variableSpecConst = (Const *) variableSpecNode;
+				Const *variableSpecConst = (Const *) variableSpecNode;
 
 				char *collationString = NULL;
 				Const *collationConst = (Const *) collationStringNode;
@@ -894,7 +914,7 @@ ReplaceBsonQueryOperatorsMutator(Node *node, ReplaceBsonQueryOperatorsContext *c
 			varno++;
 
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(rteCell);
-			if (!IsResolvableMongoCollectionBasedRTE(rte, context->boundParams))
+			if (!IsResolvableDocumentDbCollectionBasedRTE(rte, context->boundParams))
 			{
 				continue;
 			}
@@ -972,7 +992,7 @@ ExpandBsonQueryOperator(OpExpr *queryOpExpr, Node *queryNode,
 		return (Expr *) queryOpExpr;
 	}
 
-	pgbson *queryDocument = (pgbson *) DatumGetPointer(queryConst->constvalue);
+	pgbson *queryDocument = DatumGetPgBson(queryConst->constvalue);
 
 	/* open the Mongo query document */
 	bson_iter_t queryDocIter;
@@ -1005,7 +1025,7 @@ ExpandBsonQueryOperator(OpExpr *queryOpExpr, Node *queryNode,
 			bool hasShardKeyFilters = false;
 			if (collection->shardKey != NULL)
 			{
-				/* extract the shard_key_value filter for the given collection */
+				/* Retrieve the shard_key_value filter applicable to the specified collection */
 				bson_value_t queryDocValue = ConvertPgbsonToBsonValue(queryDocument);
 				bool areShardKeysCollationAware = false;
 				Expr *shardKeyFilters =
@@ -1116,8 +1136,23 @@ IsValidBsonDocumentForDollarInOrNinOp(const bson_value_t *value)
 void
 ValidateQueryDocument(pgbson *queryDocument)
 {
+	bson_value_t queryValue = ConvertPgbsonToBsonValue(queryDocument);
+	return ValidateQueryDocumentValue(&queryValue);
+}
+
+
+void
+ValidateQueryDocumentValue(const bson_value_t *value)
+{
+	if (value->value_type != BSON_TYPE_DOCUMENT)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("Validate query must be given a document - not: %s",
+							   BsonTypeName(value->value_type))));
+	}
+
 	bson_iter_t queryDocIter;
-	PgbsonInitIterator(queryDocument, &queryDocIter);
+	BsonValueInitIterator(value, &queryDocIter);
 
 	BsonQueryOperatorContext context = {
 		.documentExpr = (Expr *) MakeSimpleDocumentVar(),
@@ -1323,7 +1358,7 @@ CreateBoolExprFromLogicalExpression(bson_iter_t *queryDocIterator,
 		if (!BsonValueIsNumberOrBool(value) || BsonValueAsInt32(value) != 1)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("%s must be an integer value of 1",
+							errmsg("%s must always be an integer value of exactly 1",
 								   operatorType == QUERY_OPERATOR_ALWAYS_TRUE ?
 								   "$alwaysTrue" : "$alwaysFalse")));
 		}
@@ -1341,7 +1376,7 @@ CreateBoolExprFromLogicalExpression(bson_iter_t *queryDocIterator,
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 							errmsg(
-								"argument to $sampleRate must be a numeric type"),
+								"The operator $sampleRate requires an argument of numeric data type."),
 							errdetail_log("argument to $sampleRate is: %s",
 										  BsonValueToJsonForLogging(sampleRate))));
 		}
@@ -1413,7 +1448,7 @@ CreateBoolExprFromLogicalExpression(bson_iter_t *queryDocIterator,
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 							errmsg(
-								"$text is not allowed in this context")));
+								"$text cannot be used in this specific context")));
 		}
 
 		if (context->inputType != MongoQueryOperatorInputType_Bson)
@@ -1423,7 +1458,7 @@ CreateBoolExprFromLogicalExpression(bson_iter_t *queryDocIterator,
 								"$text can only be applied to the top-level document")));
 		}
 
-		/* Special case for $text */
+		/* Special handling required for operator text */
 		const char *path = "";
 		BsonValidateTextQuery(bson_iter_value(queryDocIterator));
 		return CreateFuncExprForQueryOperator(context,
@@ -1462,7 +1497,7 @@ CreateBoolExprFromLogicalExpression(bson_iter_t *queryDocIterator,
 	if (bson_iter_type(queryDocIterator) != BSON_TYPE_ARRAY)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"%s must be an array",
+							"Expected 'array' type for %s",
 							mongoOperatorName)));
 	}
 
@@ -1563,7 +1598,7 @@ CreateBoolExprFromLogicalExpression(bson_iter_t *queryDocIterator,
 		TargetListContainsGeonearOp(context->targetEntries))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"geo $near must be top-level expr")));
+							"$geoNear must appear at the top level of the expression")));
 	}
 
 	return (Expr *) logicalExpr;
@@ -1631,7 +1666,7 @@ ValidateIfIteratorValueUndefined(bson_iter_t *iter, bool isInMatchExpression)
 								"InMatchExpression equality cannot be undefined")));
 		}
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"cannot compare to undefined")));
+							"Comparison with undefined value is not allowed")));
 	}
 }
 
@@ -1779,7 +1814,7 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 										bool *regexFound,
 										bson_value_t **options)
 {
-	/* get query operator type */
+	/* Retrieve query operator category */
 	const char *mongoOperatorName = bson_iter_key(operatorDocIterator);
 	const MongoQueryOperator *operator =
 		GetMongoQueryOperatorByMongoOpName(mongoOperatorName, context->inputType);
@@ -1802,7 +1837,8 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 			if (!BSON_ITER_HOLDS_ARRAY(operatorDocIterator))
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-								errmsg("%s needs an array", mongoOperatorName)));
+								errmsg("Expected 'array' type for %s",
+									   mongoOperatorName)));
 			}
 
 			bson_iter_t arrayIterator;
@@ -1833,6 +1869,14 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 				}
 			}
 
+			if (numValues == 0 && context->simplifyOperators)
+			{
+				/* $in: [] is alwaysFalse; $nin: [] is alwaysTrue */
+				bool isNull = false;
+				return (Expr *) makeBoolConst(
+					operator->operatorType == QUERY_OPERATOR_IN ? false : true, isNull);
+			}
+
 			if (numValues == 1 && context->simplifyOperators &&
 				!hasRegex)
 			{
@@ -1858,11 +1902,9 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 				 * on them, we need a ScalarArrayOpExpr - do this with a custom bson type
 				 * that we can then remove in the relpathlist to avoid runtime evaluation
 				 */
-				if (EnableIndexOperatorBounds && context->simplifyOperators &&
+				if (context->simplifyOperators &&
 					context->coerceOperatorExprIfApplicable &&
 					context->inputType == MongoQueryOperatorInputType_Bson &&
-					(IsClusterVersionAtLeastPatch(DocDB_V0, 101, 1) ||
-					 IsClusterVersionAtleast(DocDB_V0, 102, 0)) &&
 					operator->operatorType == QUERY_OPERATOR_IN &&
 					!hasRegex)
 				{
@@ -1913,7 +1955,8 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 			if (!BSON_ITER_HOLDS_ARRAY(operatorDocIterator))
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-								errmsg("%s needs an array", mongoOperatorName)));
+								errmsg("Expected 'array' type for %s",
+									   mongoOperatorName)));
 			}
 
 			bson_iter_t arrayIterator;
@@ -1926,6 +1969,13 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 					ValidateIfIteratorValueUndefined(&arrayIterator,
 													 isInMatchExpression);
 				}
+			}
+
+			if (context->simplifyOperators &&
+				context->inputType == MongoQueryOperatorInputType_Bson)
+			{
+				return ExpandExprForDollarAll(path, operatorDocIterator,
+											  context, operator);
 			}
 
 			return CreateExprForDollarAll(path, operatorDocIterator,
@@ -1965,7 +2015,7 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 				else if (doubleValue < 0)
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-										"Failed to parse $size. Expected a non-negative number in: $size: %s",
+										"Parsing of operator $size failed. A non-negative value was expected in operator $size: %s",
 										BsonValueToJsonForLogging(value))));
 				}
 			}
@@ -2002,8 +2052,9 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 				if (!IsDoubleAFixedInteger(doubleValue))
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-									errmsg("Invalid numerical type code %s",
-										   BsonValueToJsonForLogging(typeIdValue))));
+									errmsg(
+										"Unsupported or invalid numerical type code %s",
+										BsonValueToJsonForLogging(typeIdValue))));
 				}
 
 				/* try to resolve the type */
@@ -2032,9 +2083,10 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 						if (!IsDoubleAFixedInteger(doubleValue))
 						{
 							ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-											errmsg("Invalid numerical type code %s",
-												   BsonValueToJsonForLogging(
-													   typeIdArrayValue))));
+											errmsg(
+												"Unsupported or invalid numerical type code %s",
+												BsonValueToJsonForLogging(
+													typeIdArrayValue))));
 						}
 
 						/* try to resolve the type */
@@ -2045,13 +2097,18 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 					{
 						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 										errmsg(
-											"type must be represented as a number or a string")));
+											"The specified type must be expressed either in numerical form or as a textual string.")));
 					}
 				}
 
 				if (!typeArrayHasElements)
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
+
+					                /* Compatibility Notice: The text in this error string is copied verbatim
+					                 * from MongoDB output to maintain compatibility with
+					                 * existing tools and scripts that rely on specific error message formats.
+					                 * Modifying this text may cause unexpected behavior in dependent systems. */
 									errmsg("%s must match at least one type", path)));
 				}
 			}
@@ -2059,7 +2116,7 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 								errmsg(
-									"type must be represented as a number or a string")));
+									"The specified type must be expressed either in numerical form or as a textual string.")));
 			}
 
 			return CreateFuncExprForSimpleQueryOperator(operatorDocIterator,
@@ -2167,7 +2224,7 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 				if (!bson_iter_next(&checkIterator))
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-										"$not cannot be empty")));
+										"Operator $not must not be left empty")));
 				}
 
 				/*
@@ -2234,7 +2291,7 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 		case QUERY_OPERATOR_TEXT:
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg(
-								"$text operator is not yet implemented")));
+								"$text operator functionality not implemented yet")));
 		}
 
 		case QUERY_OPERATOR_WITHIN:
@@ -2243,7 +2300,10 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 			if (!BSON_ITER_HOLDS_DOCUMENT(operatorDocIterator))
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-								errmsg("geometry must be an object")));
+								errmsg(
+									"Expected 'document' type for Geometry but found '%s' instead",
+									BsonTypeName(
+										bson_iter_type(operatorDocIterator)))));
 			}
 
 			const bson_value_t *value = bson_iter_value(operatorDocIterator);
@@ -2269,7 +2329,10 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 			if (!BSON_ITER_HOLDS_DOCUMENT(operatorDocIterator))
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-								errmsg("geometry must be an object")));
+								errmsg(
+									"Expected 'document' type for Geometry but found '%s' instead",
+									BsonTypeName(
+										bson_iter_type(operatorDocIterator)))));
 			}
 
 			const bson_value_t *value = bson_iter_value(operatorDocIterator);
@@ -2286,10 +2349,10 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 				ereport(ERROR, (
 							errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 							errmsg(
-								"$geoIntersect not supported with provided geometry: %s",
+								"$geoIntersect is not supported with the given geometry input: %s",
 								BsonValueToJsonForLogging(value)),
 							errdetail_log(
-								"$geoIntersect not supported with provided geometry.")));
+								"$geoIntersect is not supported with the given geometry input.")));
 			}
 
 			ShapeOperatorInfo *opInfo = palloc0(sizeof(ShapeOperatorInfo));
@@ -2313,7 +2376,7 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 								errmsg(
-									"$%s is not allowed in this context",
+									"%s cannot be used in this particular context",
 									mongoOperatorName)));
 			}
 
@@ -2364,13 +2427,12 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 				if (!bson_iter_next(&refIterator))
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-										"unknown operator: %s",
+										"Unrecognized operator specified: %s",
 										mongoOperatorName),
-									errdetail_log("unknown operator: %s",
+									errdetail_log("Unrecognized operator specified: %s",
 												  mongoOperatorName)));
 				}
 
-				/*a special case for DBRef */
 				/*If queryDoc is a string like {'$id': '', '$ref': ''}, treat it as a DBRef as well */
 				if ((isRef && strcmp(bson_iter_key(&refIterator), "$id") == 0) ||
 					(!isRef && strcmp(bson_iter_key(&refIterator), "$ref") == 0))
@@ -2384,22 +2446,24 @@ CreateOpExprFromOperatorDocIteratorCore(bson_iter_t *operatorDocIterator,
 							&refIterator)[0] != '$')
 					{
 						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION55), errmsg(
-											"The DBRef $ref field must be followed by a $id field")));
+											"The $ref field should always be directly followed by $id field.")));
 					}
 					else
 					{
 						ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-											"unknown operator: %s", mongoOperatorName),
-										errdetail_log("unknown operator: %s",
-													  mongoOperatorName)));
+											"Unrecognized operator specified: %s",
+											mongoOperatorName),
+										errdetail_log(
+											"Unrecognized operator specified: %s",
+											mongoOperatorName)));
 					}
 				}
 			}
 
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-								"unknown operator: %s",
+								"Unrecognized operator specified: %s",
 								mongoOperatorName),
-							errdetail_log("unknown operator: %s",
+							errdetail_log("Unrecognized operator specified: %s",
 										  mongoOperatorName)));
 		}
 	}
@@ -2472,7 +2536,7 @@ CreateExprForBitwiseQueryOperators(bson_iter_t *operatorDocIterator,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 								errmsg(
-									"Cannot represent as a 32-bit integer: %s: %s.0",
+									"Unable to store as a 32-bit integer: %s: %s.0",
 									operator->mongoOperatorName,
 									BsonValueToJsonForLogging(
 										operatorDocValue)),
@@ -2494,7 +2558,7 @@ CreateExprForBitwiseQueryOperators(bson_iter_t *operatorDocIterator,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 								errmsg(
-									"Cannot represent as a 32-bit integer: %s: %s.0",
+									"Unable to store as a 32-bit integer: %s: %s.0",
 									operator->mongoOperatorName,
 									BsonValueToJsonForLogging(
 										operatorDocValue)),
@@ -2509,11 +2573,11 @@ CreateExprForBitwiseQueryOperators(bson_iter_t *operatorDocIterator,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 								errmsg(
-									"Expected a positive number in: %s: %d.0",
+									"A positive number was expected in the following context: %s: %d.0",
 									operator->mongoOperatorName,
 									intVal),
 								errdetail_log(
-									"Expected a positive number in: %s: %d.0",
+									"A positive number was expected in the following context: %s: %d.0",
 									operator->mongoOperatorName,
 									intVal)));
 			}
@@ -2531,12 +2595,12 @@ CreateExprForBitwiseQueryOperators(bson_iter_t *operatorDocIterator,
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 								errmsg(
-									"Expected an integer: %s: %s",
+									"Expected value of integer type: %s: %s",
 									operator->mongoOperatorName,
 									BsonValueToJsonForLogging(
 										operatorDocValue)),
 								errdetail_log(
-									"Expected an integer: %s: %s",
+									"Expected value of integer type: %s: %s",
 									operator->mongoOperatorName,
 									BsonTypeName(operatorDocValue->value_type))));
 			}
@@ -2546,7 +2610,7 @@ CreateExprForBitwiseQueryOperators(bson_iter_t *operatorDocIterator,
 			if (intVal < 0)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE), errmsg(
-									"Expected a positive number in: %s: %d.0",
+									"A positive number was expected in the following context: %s: %d.0",
 									operator->mongoOperatorName,
 									intVal)));
 			}
@@ -2564,7 +2628,7 @@ CreateExprForBitwiseQueryOperators(bson_iter_t *operatorDocIterator,
 			if (intVal < 0)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE), errmsg(
-									"Expected a positive number in: %s: %d.0",
+									"A positive number was expected in the following context: %s: %d.0",
 									operator->mongoOperatorName,
 									intVal)));
 			}
@@ -2720,6 +2784,178 @@ CreateConstFromBsonValue(const char *path, const bson_value_t *value,
 
 	pgbson *bson = PgbsonWriterGetPgbson(&writer);
 	return MakeBsonConst(bson);
+}
+
+
+/*
+ * For $all, expand it into an AND of the constituent expressions.
+ * This will let the planner do the optimizations for index pushdown and
+ * evaluations.
+ */
+static Expr *
+ExpandExprForDollarAll(const char *path,
+					   bson_iter_t *operatorDocIterator,
+					   BsonQueryOperatorContext *context,
+					   const MongoQueryOperator *operator)
+{
+	bson_iter_t arrayIterator;
+
+	/* open array of elements (or documents in case of $all : [{$elemMatch : {}}...] ) and validate it. */
+	bson_iter_recurse(operatorDocIterator, &arrayIterator);
+	bool foundObject = false;
+	bool foundElement = false;
+	bool foundElemMatch = false;
+
+	List *allElements = NIL;
+	const MongoQueryOperator *equalOp = GetMongoQueryOperatorByQueryOperatorType(
+		QUERY_OPERATOR_EQ,
+		context->
+		inputType);
+
+	const MongoQueryOperator *regexOp = GetMongoQueryOperatorByQueryOperatorType(
+		QUERY_OPERATOR_REGEX,
+		context->
+		inputType);
+	while (bson_iter_next(&arrayIterator))
+	{
+		const bson_value_t *value = bson_iter_value(&arrayIterator);
+
+		if (value->value_type == BSON_TYPE_REGEX)
+		{
+			if (foundObject)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+									"$all/$elemMatch has to be consistent")));
+			}
+
+			foundElement = true;
+			Expr *allExpr = CreateFuncExprForQueryOperator(context, path, regexOp, value);
+			allElements = lappend(allElements, allExpr);
+			continue;
+		}
+		else if (value->value_type != BSON_TYPE_DOCUMENT)
+		{
+			if (foundObject)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+									"$all/$elemMatch has to be consistent")));
+			}
+
+			foundElement = true;
+			Expr *allExpr = CreateFuncExprForQueryOperator(context, path, equalOp, value);
+			allElements = lappend(allElements, allExpr);
+			continue;
+		}
+
+		/* We know it's a document at this point */
+		/* if an empty document. Consider it as foundElement. */
+		if (IsBsonValueEmptyDocument(value))
+		{
+			if (foundObject)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+									"$all/$elemMatch has to be consistent")));
+			}
+
+			foundElement = true;
+			Expr *allExpr = CreateFuncExprForQueryOperator(context, path, equalOp, value);
+			allElements = lappend(allElements, allExpr);
+			continue;
+		}
+
+		pgbsonelement singleElement;
+		if (!TryGetBsonValueToPgbsonElement(value, &singleElement))
+		{
+			/* It's a document but not an operator - treat as element but track that it's not with
+			 * an object
+			 */
+			if (foundObject)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+									"$all/$elemMatch has to be consistent")));
+			}
+
+			foundElement = true;
+			Expr *allExpr = CreateFuncExprForQueryOperator(context, path, equalOp, value);
+			allElements = lappend(allElements, allExpr);
+			continue;
+		}
+
+		/* it is expression of form {path : value}, Consider it as foundElement. */
+		if (singleElement.pathLength > 0 && singleElement.path[0] != '$')
+		{
+			if (foundObject)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+									"$all/$elemMatch has to be consistent")));
+			}
+
+			/* It's an element, treat it as $eq on the value */
+			foundElement = true;
+			Expr *allExpr = CreateFuncExprForQueryOperator(context, path, equalOp, value);
+			allElements = lappend(allElements, allExpr);
+			continue;
+		}
+
+		const MongoQueryOperator *keyOp = GetMongoQueryOperatorByMongoOpName(
+			singleElement.path,
+			context->
+			inputType);
+		MongoQueryOperatorType operatorType = keyOp->operatorType;
+
+		if (operatorType == QUERY_OPERATOR_AND || operatorType == QUERY_OPERATOR_OR ||
+			operatorType == QUERY_OPERATOR_NOR || operatorType == QUERY_OPERATOR_NOT)
+		{
+			if (foundObject)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+									"$all/$elemMatch has to be consistent")));
+			}
+			foundElement = true;
+			Expr *allExpr = CreateFuncExprForQueryOperator(context, path, equalOp, value);
+			allElements = lappend(allElements, allExpr);
+			continue;
+		}
+
+		if (foundElement)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+								"no $ expressions in $all")));
+		}
+		else if (foundElemMatch && keyOp->operatorType != QUERY_OPERATOR_ELEMMATCH)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+								"$all/$elemMatch has to be consistent")));
+		}
+		else if (keyOp->operatorType != QUERY_OPERATOR_ELEMMATCH)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+								"no $ expressions in $all")));
+		}
+		else
+		{
+			Expr *allExpr = CreateFuncExprForQueryOperator(context, path, keyOp,
+														   &singleElement.bsonValue);
+			allElements = lappend(allElements, allExpr);
+			foundElemMatch = true;
+		}
+
+		foundObject = true;
+	}
+
+	if (list_length(allElements) == 0)
+	{
+		/* $all of empty array is false */
+		return (Expr *) makeBoolConst(false, false);
+	}
+
+	if (list_length(allElements) == 1)
+	{
+		/* If there is a single element remaining, return it immediately without further processing */
+		return (Expr *) linitial(allElements);
+	}
+
+	return make_ands_explicit(allElements);
 }
 
 
@@ -2885,7 +3121,7 @@ GetCollectionReferencedByDocumentVar(Expr *documentExpr,
 
 	/* find the FROM ApiSchema.collection(...) clause to which document refers */
 	RangeTblEntry *rte = rt_fetch(documentVar->varno, currentQuery->rtable);
-	if (!IsResolvableMongoCollectionBasedRTE(rte, boundParams))
+	if (!IsResolvableDocumentDbCollectionBasedRTE(rte, boundParams))
 	{
 		return NULL;
 	}
@@ -2906,7 +3142,7 @@ GetCollectionReferencedByDocumentVar(Expr *documentExpr,
 static MongoCollection *
 GetCollectionForRTE(RangeTblEntry *rte, ParamListInfo boundParams)
 {
-	Assert(IsResolvableMongoCollectionBasedRTE(rte, boundParams));
+	Assert(IsResolvableDocumentDbCollectionBasedRTE(rte, boundParams));
 
 	RangeTblFunction *rangeTableFunc = linitial(rte->functions);
 	FuncExpr *funcExpr = (FuncExpr *) rangeTableFunc->funcexpr;
@@ -2945,7 +3181,7 @@ CreateNonShardedShardKeyValueFilter(int collectionVarno, const
 /*
  * Creates a basic object_id <op> <value> op_expr for a given collection var.
  */
-static Expr *
+Expr *
 MakeSimpleIdExpr(const bson_value_t *filterValue, Index collectionVarno, Oid operatorId)
 {
 	pgbson *qualValue = BsonValueToDocumentPgbson(filterValue);
@@ -2964,6 +3200,47 @@ MakeSimpleIdExpr(const bson_value_t *filterValue, Index collectionVarno, Oid ope
 										   (Expr *) documentIdConst, InvalidOid,
 										   InvalidOid);
 	return documentIdFilter;
+}
+
+
+Expr *
+MakeLowerBoundIdExpr(const bson_value_t *filterValue, Index collectionVarno)
+{
+	bson_value_t minBound = { 0 };
+
+	if (filterValue->value_type == BSON_TYPE_MAXKEY)
+	{
+		minBound.value_type = BSON_TYPE_MINKEY;
+	}
+	else
+	{
+		minBound = GetLowerBound(filterValue->value_type);
+	}
+
+	return MakeSimpleIdExpr(&minBound, collectionVarno,
+							BsonGreaterThanEqualOperatorId());
+}
+
+
+Expr *
+MakeUpperBoundIdExpr(const bson_value_t *filterValue, Index collectionVarno)
+{
+	/* Since btree doesn't do type bracketing - apply type bracketing here */
+	bool isUpperBoundInclusive = false;
+	bson_value_t maxBound = { 0 };
+	if (filterValue->value_type == BSON_TYPE_MINKEY)
+	{
+		isUpperBoundInclusive = true;
+		maxBound.value_type = BSON_TYPE_MAXKEY;
+	}
+	else
+	{
+		maxBound = GetUpperBound(filterValue->value_type,
+								 &isUpperBoundInclusive);
+	}
+	return MakeSimpleIdExpr(&maxBound, collectionVarno,
+							isUpperBoundInclusive ?
+							BsonLessThanEqualOperatorId() : BsonLessThanOperatorId());
 }
 
 
@@ -3054,6 +3331,16 @@ CheckAndAddIdFilter(List *opArgs, IdFilterWalkerContext *context,
 														  context->collectionVarno,
 														  BsonGreaterThanOperatorId());
 				context->idQuals = lappend(context->idQuals, documentIdFilter);
+
+				/* Since btree doesn't do type bracketing - apply type bracketing here */
+				if (EnableIdIndexPushdown)
+				{
+					documentIdFilter =
+						MakeUpperBoundIdExpr(&qualElement.bsonValue,
+											 context->collectionVarno);
+					context->idQuals = lappend(context->idQuals, documentIdFilter);
+				}
+
 				return;
 			}
 
@@ -3063,6 +3350,14 @@ CheckAndAddIdFilter(List *opArgs, IdFilterWalkerContext *context,
 														  context->collectionVarno,
 														  BsonLessThanOperatorId());
 				context->idQuals = lappend(context->idQuals, documentIdFilter);
+
+				/* Since btree doesn't do type bracketing - apply type bracketing here */
+				if (EnableIdIndexPushdown)
+				{
+					documentIdFilter = MakeLowerBoundIdExpr(&qualElement.bsonValue,
+															context->collectionVarno);
+					context->idQuals = lappend(context->idQuals, documentIdFilter);
+				}
 				return;
 			}
 
@@ -3073,6 +3368,16 @@ CheckAndAddIdFilter(List *opArgs, IdFilterWalkerContext *context,
 														  context->collectionVarno,
 														  BsonGreaterThanEqualOperatorId());
 				context->idQuals = lappend(context->idQuals, documentIdFilter);
+
+				/* Since btree doesn't do type bracketing - apply type bracketing here */
+				if (EnableIdIndexPushdown)
+				{
+					documentIdFilter =
+						MakeUpperBoundIdExpr(&qualElement.bsonValue,
+											 context->collectionVarno);
+					context->idQuals = lappend(context->idQuals, documentIdFilter);
+				}
+
 				return;
 			}
 
@@ -3082,6 +3387,15 @@ CheckAndAddIdFilter(List *opArgs, IdFilterWalkerContext *context,
 														  context->collectionVarno,
 														  BsonLessThanEqualOperatorId());
 				context->idQuals = lappend(context->idQuals, documentIdFilter);
+
+				/* Since btree doesn't do type bracketing - apply type bracketing here */
+				if (EnableIdIndexPushdown)
+				{
+					documentIdFilter = MakeLowerBoundIdExpr(&qualElement.bsonValue,
+															context->collectionVarno);
+					context->idQuals = lappend(context->idQuals, documentIdFilter);
+				}
+
 				return;
 			}
 
@@ -3276,7 +3590,7 @@ ValidateOrderbyExpressionAndGetIsAscending(pgbson *orderby)
 	if (!BsonValueIsNumber(&orderingElement.bsonValue))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-						errmsg("Invalid sort direction %s",
+						errmsg("Sort direction value %s is not valid",
 							   BsonValueToJsonForLogging(
 								   &orderingElement.bsonValue))));
 	}
@@ -3285,7 +3599,7 @@ ValidateOrderbyExpressionAndGetIsAscending(pgbson *orderby)
 	if (sortOrder != 1 && sortOrder != -1)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-						errmsg("Invalid sort direction %s",
+						errmsg("Sort direction value %s is not valid",
 							   BsonValueToJsonForLogging(
 								   &orderingElement.bsonValue))));
 	}
@@ -3353,7 +3667,7 @@ CreateExprForDollarRegex(bson_iter_t *currIter, bson_value_t **options,
 			strlen(regexBsonValue->value.v_regex.options) != 0)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION51074), errmsg(
-								"options set in both $regex and $options")));
+								"Options are specified in both the $regex operator and the $options operator")));
 		}
 
 		Expr *qual = CreateFuncExprForRegexOperator(*options, regexBsonValue, context,
@@ -3380,7 +3694,7 @@ CreateExprForDollarRegex(bson_iter_t *currIter, bson_value_t **options,
 				strlen(regexBsonValue->value.v_regex.options) != 0)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION51075), errmsg(
-									"options set in both $regex and $options")));
+									"Options are specified in both the $regex and the $options")));
 			}
 
 			bson_value_t *optionsBsonVal = (bson_value_t *) bson_iter_value(&optionsIter);
@@ -3470,7 +3784,7 @@ CreateExprForDollarMod(bson_iter_t *operatorDocIterator,
 			if (divisor == 0)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-									"divisor cannot be 0")));
+									"divide by 0 is not allowed")));
 			}
 		}
 	}
@@ -3560,10 +3874,10 @@ SortAndWriteInt32BsonTypeArray(const bson_value_t *bsonArray, pgbson_writer *wri
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 									errmsg(
-										"Expected an integer: %s: %s", opName,
+										"Expected value of integer type: %s: %s", opName,
 										BsonValueToJsonForLogging(element)),
 									errdetail_log(
-										"Expected an integer in operator: %s, found:%s",
+										"Expected value of integer type in operator: %s, found:%s",
 										opName,
 										BsonTypeName(element->value_type))));
 					break;
@@ -3574,10 +3888,11 @@ SortAndWriteInt32BsonTypeArray(const bson_value_t *bsonArray, pgbson_writer *wri
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 									errmsg(
-										"bit positions cannot be represented as a 32-bit signed integer: %s.0",
+										"Expected an integer but got '%s' type for element %s.0",
+										BsonTypeName(element->value_type),
 										BsonValueToJsonForLogging(element)),
 									errdetail_log(
-										"bit positions of type %s cannot be represented as a 32-bit signed integer",
+										"Expected an integer but got '%s' type",
 										BsonTypeName(element->value_type))));
 					break;
 				}
@@ -3656,7 +3971,7 @@ ValidateOptionsArgument(const bson_value_t *argBsonValue)
 	if (argBsonValue->value_type != BSON_TYPE_UTF8)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"$options has to be a string")));
+							"Expected 'string' type for $options parameter")));
 	}
 
 	/* Only options which mongo supports are i, m, x, s, u*/
@@ -3687,7 +4002,7 @@ ValidateRegexArgument(const bson_value_t *argBsonValue)
 		argBsonValue->value_type != BSON_TYPE_REGEX)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"$regex has to be a string")));
+							"$regex must be provided with a string value")));
 	}
 
 	/* Validate options when input type is BSON_TYPE_REGEX. */
@@ -3714,7 +4029,7 @@ ValidateRegexArgument(const bson_value_t *argBsonValue)
 		strlen(argBsonValue->value.v_utf8.str) < argBsonValue->value.v_utf8.len)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"Regular expression cannot contain an embedded null byte")));
+							"A regular expression is not allowed to include an embedded null byte")));
 	}
 }
 
@@ -3803,7 +4118,17 @@ TryProcessOrIntoDollarIn(BsonQueryOperatorContext *context,
 
 		pgbson *value = DatumGetPgBson(argConst->constvalue);
 		pgbsonelement valueElement;
-		PgbsonToSinglePgbsonElement(value, &valueElement); /* TODO: collation support */
+
+		if (IsCollationApplicable(context->collationString))
+		{
+			/* we can safely ignore any appended collation string here */
+			/* as it will be appended when creating the funcExpr */
+			PgbsonToSinglePgbsonElementWithCollation(value, &valueElement);
+		}
+		else
+		{
+			PgbsonToSinglePgbsonElement(value, &valueElement);
+		}
 
 		StringView currentPath = {
 			.length = valueElement.pathLength, .string = valueElement.path
@@ -3990,7 +4315,7 @@ TryOptimizeDollarOrExpr(BsonQueryOperatorContext *context,
 
 	if (!StringViewEquals(&singlePathExistsFalse, &singlePathEqualsNull))
 	{
-		/* Not the same path */
+		/* Paths do not match */
 		return NULL;
 	}
 
@@ -4195,7 +4520,7 @@ ParseBsonValueForNearAndCreateOpExpr(bson_iter_t *operatorDocIterator,
 		if (isGeonear)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-							errmsg("Too many geoNear expressions")));
+							errmsg("Excessive number of geoNear query expressions")));
 		}
 	}
 
@@ -4209,9 +4534,7 @@ ParseBsonValueForNearAndCreateOpExpr(bson_iter_t *operatorDocIterator,
 		ereport(ERROR,
 				(errcode(ERRCODE_DOCUMENTDB_LOCATION5626500),
 				 errmsg(
-					 "$geoNear, $near, and $nearSphere are not allowed in this context, "
-					 "as these operators require sorting geospatial data. If you do not need sort, "
-					 "consider using $geoWithin instead.")));
+					 "$near, $nearSphere and $geoNear cannot be used here. Use $geoWithin instead.")));
 	}
 
 	GeonearRequest *request = ParseGeonearRequest(queryDoc);

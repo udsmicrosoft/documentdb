@@ -14,6 +14,7 @@
 #include "bson_init.h"
 #include "utils/feature_counter.h"
 #include "documentdb_api_init.h"
+#include "index_am/roaring_bitmap_adapter.h"
 
 PG_MODULE_MAGIC;
 
@@ -45,9 +46,13 @@ _PG_init(void)
 	}
 
 	InstallBsonMemVTables();
+
+	RegisterRoaringBitmapHooks();
 	InitApiConfigurations("documentdb", "documentdb");
 	InitializeSharedMemoryHooks();
 	MarkGUCPrefixReserved("documentdb");
+
+	InitializeBackgroundWorkerJobAllowedCommands();
 	InitializeDocumentDBBackgroundWorker("pg_documentdb", "documentdb", "documentdb");
 
 	InstallDocumentDBApiPostgresHooks();

@@ -108,8 +108,11 @@ typedef struct
 	/* Whether the query should retain an expanded target list*/
 	bool expandTargetList;
 
-	/* Whether or not the query is a streamable cursor */
+	/* Whether or not the query requires a persisted cursor */
 	bool requiresPersistentCursor;
+
+	/* Whether or not the stage can handle a single batch cursor */
+	bool isSingleRowResult;
 
 	/* The namespace 'db.coll' associated with this query */
 	const char *namespaceName;
@@ -126,7 +129,7 @@ typedef struct
 	/* The number of nested levels (incremented by MigrateSubQuery) */
 	int numNestedLevels;
 
-	/* The database associated with this request */
+	/* The database name associated with this request */
 	text *databaseNameDatum;
 
 	/* The collection name associated with this request (if applicable) */
@@ -198,7 +201,7 @@ Aggref * CreateMultiArgAggregate(Oid aggregateFunctionId, List *args, List *argT
 List * ExtractAggregationStages(const bson_value_t *pipelineValue,
 								AggregationPipelineBuildContext *context);
 Query * GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView,
-							   pg_uuid_t *collectionUuid,
+							   pg_uuid_t *collectionUuid, const bson_value_t *indexHint,
 							   AggregationPipelineBuildContext *context);
 Query * GenerateBaseAgnosticQuery(text *databaseDatum,
 								  AggregationPipelineBuildContext *context);
@@ -278,9 +281,9 @@ Query * HandleMerge(const bson_value_t *existingValue, Query *query,
 Query * HandleOut(const bson_value_t *existingValue, Query *query,
 				  AggregationPipelineBuildContext *context);
 
-/* atlas vector search related aggregation stages */
-Query * HandleMongoNativeVectorSearch(const bson_value_t *existingValue, Query *query,
-									  AggregationPipelineBuildContext *context);
+/* Native vector search related aggregation stages */
+Query * HandleNativeVectorSearch(const bson_value_t *existingValue, Query *query,
+								 AggregationPipelineBuildContext *context);
 
 /* Metadata based query generators */
 Query * GenerateConfigDatabaseQuery(AggregationPipelineBuildContext *context);

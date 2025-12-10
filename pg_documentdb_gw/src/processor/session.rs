@@ -7,16 +7,17 @@
  */
 
 use crate::{
-    context::ConnectionContext,
+    context::{ConnectionContext, RequestContext},
     error::{DocumentDBError, Result},
-    requests::Request,
     responses::Response,
 };
 
 pub async fn end_sessions(
-    request: &Request<'_>,
+    request_context: &mut RequestContext<'_>,
     context: &mut ConnectionContext,
 ) -> Result<Response> {
+    let request = request_context.payload;
+
     let store = context.service_context.transaction_store();
     for value in request
         .document()
@@ -39,6 +40,7 @@ pub async fn end_sessions(
         // Remove all cursors for the session
         context
             .service_context
+            .cursor_store()
             .invalidate_cursors_by_session(session_id)
             .await
     }

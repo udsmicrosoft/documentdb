@@ -37,27 +37,28 @@
 /* --------------------------------------------------------- */
 
 /*
- * Custom FRAMEOPTION flags relevant to mongo $setWindowFields stage.
+ * Custom FRAMEOPTION flags relevant to $setWindowFields stage.
  *
  * Note: Make sure these flag values adhere to the existing FRAMEOPTION flags defined in PG
  * nodes/parsenodes.h and no flag should overlap with existing flags.
  */
-typedef enum FRAMEOPTION_MONGO
+typedef enum FRAMEOPTION_DOCUMENTDB
 {
-	FRAMEOPTION_MONGO_INVALID = 0x0,
-	FRAMEOPTION_MONGO_RANGE_UNITS = 0x1000000,
-	FRAMEOPTION_MONGO_UNKNOWN_FIELDS = 0x2000000
-} FRAMEOPTION_MONGO;
+	FRAMEOPTION_DOCUMENTDB_INVALID = 0x0,
+	FRAMEOPTION_DOCUMENTDB_RANGE_UNITS = 0x1000000,
+	FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS = 0x2000000
+} FRAMEOPTION_DOCUMENTDB;
 
-#define FRAMEOPTION_MONGO_ONLY (FRAMEOPTION_MONGO_RANGE_UNITS | \
-								FRAMEOPTION_MONGO_UNKNOWN_FIELDS)
+#define FRAMEOPTION_DOCUMENTDB_ONLY (FRAMEOPTION_DOCUMENTDB_RANGE_UNITS | \
+									 FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS)
 
-/* Default Frame options for mongodb are documents window with unbounded preceding and unboudnded following */
-#define FRAMEOPTION_MONGO_SETWINDOWFIELDS_DEFAULT (FRAMEOPTION_NONDEFAULT | \
-												   FRAMEOPTION_ROWS | \
-												   FRAMEOPTION_START_UNBOUNDED_PRECEDING | \
-												   FRAMEOPTION_BETWEEN | \
-												   FRAMEOPTION_END_UNBOUNDED_FOLLOWING)
+/* Default Frame options for DocumentDB - documents window with unbounded preceding and unboudnded following */
+#define FRAMEOPTION_DOCUMENTDB_SETWINDOWFIELDS_DEFAULT (FRAMEOPTION_NONDEFAULT | \
+														FRAMEOPTION_ROWS | \
+														FRAMEOPTION_START_UNBOUNDED_PRECEDING \
+														| \
+														FRAMEOPTION_BETWEEN | \
+														FRAMEOPTION_END_UNBOUNDED_FOLLOWING)
 
 /* $setWindowFields `sort` options, required for the validation against different combinations
  * with range/documents based windows or window aggregation operators.
@@ -144,7 +145,8 @@ static TargetEntry * UpdateWindowOperatorAndFrameOptions(const
 static void UpdatePartitionAndSortClauses(Query *query, Expr *docExpr,
 										  Expr *partitionByExpr,
 										  List *sortByClauses, int allFrameOptions,
-										  ParseState *pstate);
+										  ParseState *pstate,
+										  const char *collationString);
 static bool IsPartitionByOnShardKey(const bson_value_t *partitionByValue,
 									const MongoCollection *collection);
 static void ThrowInvalidFrameOptions(void);
@@ -397,8 +399,8 @@ EnsureValidWindowSpec(int frameOptions)
 {
 	if ((frameOptions & FRAMEOPTION_ROWS) != FRAMEOPTION_ROWS &&
 		(frameOptions & FRAMEOPTION_RANGE) != FRAMEOPTION_RANGE &&
-		(frameOptions & FRAMEOPTION_MONGO_UNKNOWN_FIELDS) ==
-		FRAMEOPTION_MONGO_UNKNOWN_FIELDS)
+		(frameOptions & FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS) ==
+		FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS)
 	{
 		/* Only unknwon fields are provided */
 		ereport(ERROR, (
@@ -415,29 +417,30 @@ EnsureValidWindowSpec(int frameOptions)
 	}
 
 	if ((frameOptions & FRAMEOPTION_ROWS) == FRAMEOPTION_ROWS &&
-		(frameOptions & FRAMEOPTION_MONGO_UNKNOWN_FIELDS) ==
-		FRAMEOPTION_MONGO_UNKNOWN_FIELDS)
+		(frameOptions & FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS) ==
+		FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS)
 	{
 		/* Document window with unknown fields */
 		ThrowExtraInvalidFrameOptions("documents", "");
 	}
 
 	if ((frameOptions & FRAMEOPTION_RANGE) == FRAMEOPTION_RANGE &&
-		(frameOptions & FRAMEOPTION_MONGO_UNKNOWN_FIELDS) ==
-		FRAMEOPTION_MONGO_UNKNOWN_FIELDS)
+		(frameOptions & FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS) ==
+		FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS)
 	{
 		/* Range window with unknown field */
 		ThrowExtraInvalidFrameOptions("range", "besides 'unit'");
 	}
 
-	if ((frameOptions & FRAMEOPTION_MONGO_RANGE_UNITS) == FRAMEOPTION_MONGO_RANGE_UNITS &&
+	if ((frameOptions & FRAMEOPTION_DOCUMENTDB_RANGE_UNITS) ==
+		FRAMEOPTION_DOCUMENTDB_RANGE_UNITS &&
 		(frameOptions & FRAMEOPTION_RANGE) != FRAMEOPTION_RANGE)
 	{
 		/* Units without range */
 		ereport(ERROR, (
 					errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 					errmsg(
-						"Window bounds can only specify 'unit' with range-based bounds.")));
+						"The 'unit' parameter is valid only when bounds are defined using a range-based specification.")));
 	}
 }
 
@@ -468,7 +471,8 @@ EnsureSortRequirements(int frameOptions, WindowOperatorContext *context)
 		if (sortByLength != 1)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5339902),
-							errmsg("Range-based bounds require sortBy a single field")));
+							errmsg(
+								"Expected a single sort by field for range-based window")));
 		}
 
 		SetWindowFieldSortOption *sortField = (SetWindowFieldSortOption *) linitial(
@@ -480,7 +484,7 @@ EnsureSortRequirements(int frameOptions, WindowOperatorContext *context)
 			 * generic failed to parse
 			 */
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("Range-based bounds require an ascending sortBy")));
+							errmsg("Expected ascending sortBy field definition")));
 		}
 	}
 	else if (sortByLength == 0)
@@ -492,7 +496,7 @@ EnsureSortRequirements(int frameOptions, WindowOperatorContext *context)
 		{
 			/* Must be supplied for a bounded document window */
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5339901),
-							errmsg("Document-based bounds require a sortBy")));
+							errmsg("Missing sortBy field for document-based window")));
 		}
 	}
 }
@@ -513,7 +517,7 @@ HandleSetWindowFields(const bson_value_t *existingValue, Query *query,
 /*
  * $setWindowFields aggregation stage handler.
  * This function constructs the query AST for Window aggregation operators over a partition defined by the $setWindowFields spec.
- * MongoDB spec is:
+ * The spec is of the form:
  * {
  *     $setWindowFields:{
  *         partitionBy: <expression>,
@@ -614,7 +618,7 @@ HandleSetWindowFieldsCore(const bson_value_t *existingValue,
 				ereport(ERROR, (
 							errcode(ERRCODE_DOCUMENTDB_TYPEMISMATCH),
 							errmsg(
-								"An expression used to partition cannot evaluate to value of type array")));
+								"A partition expression cannot be evaluated to yield an array type value")));
 			}
 
 			/* If partitionBy is on the shard key expression and the base table is still the rte
@@ -695,10 +699,10 @@ HandleSetWindowFieldsCore(const bson_value_t *existingValue,
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_UNKNOWNBSONFIELD),
 							errmsg(
-								"BSON field '$setWindowFields.%s' is an unknown field.",
+								"The BSON field '$setWindowFields.%s' is not recognized as a valid field.",
 								key),
 							errdetail_log(
-								"BSON field '$setWindowFields.%s' is an unknown field.",
+								"The BSON field '$setWindowFields.%s' is not recognized as a valid field.",
 								key)));
 		}
 	}
@@ -732,22 +736,23 @@ HandleSetWindowFieldsCore(const bson_value_t *existingValue,
 		if (output.pathLength == 0)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION40352),
-							errmsg("FieldPath cannot be constructed with empty string")));
+							errmsg("FieldPath cannot be created from an empty string")));
 		}
 
 		if (output.path[0] == '$')
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION16410),
 							errmsg(
-								"FieldPath field names may not start with '$'. Consider using $getField or $setField.")));
+								"FieldPath field names are not allowed to begin with the operators symbol '$'; consider using $getField or $setField instead.")));
 		}
 
 		if (output.bsonValue.value_type != BSON_TYPE_DOCUMENT)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("The field '%s' must be an object", output.path),
+							errmsg("Expected 'document' type for '%s'",
+								   output.path),
 							errdetail_log(
-								"$setWindowField output field must be an object")));
+								"The $setWindowField output field is required to be an object type.")));
 		}
 
 		winRef++;
@@ -788,7 +793,8 @@ HandleSetWindowFieldsCore(const bson_value_t *existingValue,
 		 * Note: All resjunk entries should be followed by non-resjunk entries added above for window functions.
 		 */
 		UpdatePartitionAndSortClauses(query, docExpr, partitionExpr, sortOptions,
-									  allFrameOptions, parseState);
+									  allFrameOptions, parseState,
+									  context->collationString);
 
 		/*
 		 * Migrate to subquery and merge results of all window functions back to document
@@ -864,8 +870,11 @@ UpdateWindowOperatorAndFrameOptions(const bson_value_t *windowOpValue,
 		else
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("Window function found an unknown argument: %s", key),
-							errdetail_log("Window function found an unknown argument")));
+							errmsg(
+								"The window function detected an unrecognized argument: %s",
+								key),
+							errdetail_log(
+								"The window function detected an unrecognized argument")));
 		}
 	}
 
@@ -884,7 +893,8 @@ UpdateWindowOperatorAndFrameOptions(const bson_value_t *windowOpValue,
 		if (windowValue.bsonValue.value_type != BSON_TYPE_DOCUMENT)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("'window' field must be an object")));
+							errmsg(
+								"The 'window' field is required to be a valid object")));
 		}
 
 		UpdateWindowOptions(&windowValue, windowClause, context, &frameOptions);
@@ -893,12 +903,12 @@ UpdateWindowOperatorAndFrameOptions(const bson_value_t *windowOpValue,
 	if (frameOptions == 0)
 	{
 		/* If no frame options are set, then default to document unbounded, unbounded */
-		frameOptions = FRAMEOPTION_MONGO_SETWINDOWFIELDS_DEFAULT;
+		frameOptions = FRAMEOPTION_DOCUMENTDB_SETWINDOWFIELDS_DEFAULT;
 	}
 	*allFrameOptions |= frameOptions;
 
 	/* In the window frameOptions strip documentdb specific options */
-	windowClause->frameOptions = frameOptions & (~FRAMEOPTION_MONGO_ONLY);
+	windowClause->frameOptions = frameOptions & (~FRAMEOPTION_DOCUMENTDB_ONLY);
 
 	/* entry should not remain NULL at this point */
 	Assert(entry != NULL);
@@ -914,7 +924,8 @@ static void
 UpdatePartitionAndSortClauses(Query *query, Expr *docExpr,
 							  Expr *partitionByExpr,
 							  List *sortOptions, int allFrameOptions,
-							  ParseState *pstate)
+							  ParseState *pstate,
+							  const char *collationString)
 {
 	bool resjunk = true;
 
@@ -944,15 +955,15 @@ UpdatePartitionAndSortClauses(Query *query, Expr *docExpr,
 	if (sortOptions != NIL && list_length(sortOptions) > 0)
 	{
 		/*
-		 * In MongoDB all the sort clauses are common for all the window definitions.
+		 * The sort clauses are common for all the window definitions.
 		 * So we decide here which ORDER BY function is needed to be called based on the all
 		 * window definitions.
 		 * If all windows are document based : BsonOrderBy
 		 * If 1/more range windows : BsonOrderByPartition
 		 */
 		bool isRangeWindow = (allFrameOptions & FRAMEOPTION_RANGE) == FRAMEOPTION_RANGE;
-		bool isTimeRangeWindow = (allFrameOptions & FRAMEOPTION_MONGO_RANGE_UNITS) ==
-								 FRAMEOPTION_MONGO_RANGE_UNITS;
+		bool isTimeRangeWindow = (allFrameOptions & FRAMEOPTION_DOCUMENTDB_RANGE_UNITS) ==
+								 FRAMEOPTION_DOCUMENTDB_RANGE_UNITS;
 
 		ListCell *lc;
 		foreach(lc, sortOptions)
@@ -960,17 +971,41 @@ UpdatePartitionAndSortClauses(Query *query, Expr *docExpr,
 			SetWindowFieldSortOption *sortOption =
 				(SetWindowFieldSortOption *) lfirst(lc);
 			List *args = NIL;
+			bool applyCollationToSort = IsCollationApplicable(collationString);
+
 			Oid sortFunctionOid = InvalidOid;
 			if (isRangeWindow)
 			{
-				sortFunctionOid = BsonOrderByPartitionFunctionOid();
-				args = list_make3(docExpr, sortOption->sortSpecConst,
-								  MakeBoolValueConst(isTimeRangeWindow));
+				if (applyCollationToSort)
+				{
+					Const *collationConst = MakeTextConst(collationString, strlen(
+															  collationString));
+					sortFunctionOid = BsonOrderByPartitionWithCollationFunctionOid();
+					args = list_make4(docExpr, sortOption->sortSpecConst,
+									  MakeBoolValueConst(isTimeRangeWindow),
+									  collationConst);
+				}
+				else
+				{
+					sortFunctionOid = BsonOrderByPartitionFunctionOid();
+					args = list_make3(docExpr, sortOption->sortSpecConst,
+									  MakeBoolValueConst(isTimeRangeWindow));
+				}
 			}
 			else
 			{
-				sortFunctionOid = BsonOrderByFunctionOid();
-				args = list_make2(docExpr, sortOption->sortSpecConst);
+				if (applyCollationToSort)
+				{
+					Const *collationConst = MakeTextConst(collationString, strlen(
+															  collationString));
+					sortFunctionOid = BsonOrderByWithCollationFunctionOid();
+					args = list_make3(docExpr, sortOption->sortSpecConst, collationConst);
+				}
+				else
+				{
+					sortFunctionOid = BsonOrderByFunctionOid();
+					args = list_make2(docExpr, sortOption->sortSpecConst);
+				}
 			}
 			Expr *expr = (Expr *) makeFuncExpr(sortFunctionOid, BsonTypeId(), args,
 											   InvalidOid, InvalidOid,
@@ -978,10 +1013,23 @@ UpdatePartitionAndSortClauses(Query *query, Expr *docExpr,
 
 			SortBy *sortBy = makeNode(SortBy);
 			sortBy->location = -1;
-			sortBy->sortby_dir = sortOption->isAscending ? SORTBY_ASC : SORTBY_DESC;
 			sortBy->sortby_nulls = sortOption->isAscending ? SORTBY_NULLS_FIRST :
 								   SORTBY_NULLS_LAST;
 			sortBy->node = (Node *) expr;
+
+			if (applyCollationToSort)
+			{
+				sortBy->sortby_dir = SORTBY_USING;
+				sortBy->useOp = sortOption->isAscending ?
+								list_make2(makeString(ApiInternalSchemaNameV2),
+										   makeString("<<<")) :
+								list_make2(makeString(ApiInternalSchemaNameV2),
+										   makeString(">>>"));
+			}
+			else
+			{
+				sortBy->sortby_dir = sortOption->isAscending ? SORTBY_ASC : SORTBY_DESC;
+			}
 
 			TargetEntry *sortEntry = makeTargetEntry((Expr *) sortBy->node,
 													 pstate->p_next_resno++,
@@ -1016,7 +1064,8 @@ EnsureValidUnitOffsetAndGetInterval(const bson_value_t *value, DateUnit dateUnit
 	if (!IsBsonValueFixedInteger(value))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("With 'unit', range-based bounds must be an integer")));
+						errmsg(
+							"When using 'unit', the bounds in a range must be specified as an integer value")));
 	}
 
 	int64 offset = labs(BsonValueAsInt64(value));
@@ -1040,8 +1089,8 @@ ParseAndSetFrameOption(const bson_value_t *value, WindowClause *windowClause,
 	const char *frameName = isDocumentFrame ? "documents" : "range";
 
 	uint32 index = 0;
-	bson_value_t boundsInterval[2] = {
-		{ 0 }, { 0 }
+	bson_value_t boundsInterval[3] = {
+		{ 0 }, { 0 }, { 0 }
 	};
 	while (bson_iter_next(&frameIter))
 	{
@@ -1059,13 +1108,15 @@ ParseAndSetFrameOption(const bson_value_t *value, WindowClause *windowClause,
 			{
 				ereport(ERROR, (
 							errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("Numeric document-based bounds must be an integer")));
+							errmsg(
+								"The numeric boundaries specified for the document must be provided as an integer value.")));
 			}
 			else
 			{
 				ereport(ERROR, (
 							errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("Range-based bounds expression must be a number")));
+							errmsg(
+								"Bounds expression in range must be a numeric value")));
 			}
 		}
 		else if (frameValue->value_type == BSON_TYPE_UTF8)
@@ -1093,7 +1144,7 @@ ParseAndSetFrameOption(const bson_value_t *value, WindowClause *windowClause,
 				ereport(ERROR, (
 							errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 							errmsg(
-								"Window bounds must be 'unbounded', 'current', or a number.")));
+								"The window boundaries value must be either 'unbounded', 'current', or a specific numeric value.")));
 			}
 		}
 		else
@@ -1110,7 +1161,7 @@ ParseAndSetFrameOption(const bson_value_t *value, WindowClause *windowClause,
 					ereport(ERROR, (
 								errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 								errmsg(
-									"Numeric document-based bounds must be an integer")));
+									"The numeric boundaries specified for the document must be provided as an integer value.")));
 				}
 
 				/* Make the frame value positive, we set the `isPreceding` based on negative value
@@ -1124,7 +1175,7 @@ ParseAndSetFrameOption(const bson_value_t *value, WindowClause *windowClause,
 			{
 				/* Set the range based frame offsets */
 				bool isTimeBasedRangeWindow = (*frameOptions &
-											   FRAMEOPTION_MONGO_RANGE_UNITS);
+											   FRAMEOPTION_DOCUMENTDB_RANGE_UNITS);
 				Oid inRangeFunctionOid = isTimeBasedRangeWindow ?
 										 BsonInRangeIntervalFunctionId() :
 										 BsonInRangeNumericFunctionId();
@@ -1152,7 +1203,7 @@ ParseAndSetFrameOption(const bson_value_t *value, WindowClause *windowClause,
 				}
 
 				/**
-				 * Range-based bounds require an ascending sortBy. Thus we set the inRangeAsc and inRangeNullsFirst always set to be true
+				 * Expected ascending sortBy field definition. Thus we set the inRangeAsc and inRangeNullsFirst always set to be true
 				 */
 				windowClause->inRangeAsc = true;
 				windowClause->inRangeNullsFirst = true;
@@ -1186,8 +1237,9 @@ ParseAndSetFrameOption(const bson_value_t *value, WindowClause *windowClause,
 	{
 		ereport(ERROR, (
 					errcode(ERRCODE_DOCUMENTDB_LOCATION5339900),
-					errmsg("Lower bound must not exceed upper bound: %s",
-						   BsonValueToJsonForLogging(value)),
+					errmsg(
+						"The lower boundary should never be greater than the specified upper boundary: %s",
+						BsonValueToJsonForLogging(value)),
 					errdetail_log("Lower bound must not exceed upper bound.")));
 	}
 
@@ -1244,7 +1296,7 @@ ThrowInvalidFrameOptions()
 	ereport(ERROR, (
 				errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 				errmsg(
-					"Window bounds can specify either 'documents' or 'unit', not both.")));
+					"Window bounds may only define either 'documents' or 'unit', but never both.")));
 }
 
 
@@ -1255,10 +1307,11 @@ ThrowExtraInvalidFrameOptions(const char * str1, const char * str2)
 {
 	ereport(ERROR, (
 				errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-				errmsg("'window' field that specifies %s cannot have other fields %s",
-					   str1, str2),
+				errmsg(
+					"The 'window' field specifying %s is not allowed to be used together with other fields %s.",
+					str1, str2),
 				errdetail_log(
-					"'window' field that specifies %s cannot have other fields %s",
+					"The 'window' field specifying %s is not allowed to be used together with other fields %s.",
 					str1, str2)));
 }
 
@@ -1268,18 +1321,20 @@ pg_attribute_noreturn()
 ThrowInvalidWindowValue(const char * windowType, const bson_value_t * value)
 {
 	ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-					errmsg("Window bounds must be a 2-element array: %s: %s",
-						   windowType,
-						   BsonValueToJsonForLogging(value)),
-					errdetail_log("Window bounds must be a 2-element array: %s: %s",
-								  windowType,
-								  BsonTypeName(value->value_type))));
+					errmsg(
+						"Window bounds should consist of exactly two elements in the array: %s: %s",
+						windowType,
+						BsonValueToJsonForLogging(value)),
+					errdetail_log(
+						"Window bounds should consist of exactly two elements in the array: %s: %s",
+						windowType,
+						BsonTypeName(value->value_type))));
 }
 
 
 /*
  * Update the window options for the given window operator and update the window clause
- * MongoDB spec of window operator is as follows:
+ * Spec of window operator is as follows:
  * {... window: { documnets: [start, end] }}
  * {... window: { range: [start, end], <unit: "unit">}}
  *
@@ -1317,24 +1372,25 @@ UpdateWindowOptions(const pgbsonelement *element, WindowClause *windowClause,
 		}
 		else if (strcmp(windowKey, "unit") == 0)
 		{
-			*frameOptions |= FRAMEOPTION_MONGO_RANGE_UNITS;
+			*frameOptions |= FRAMEOPTION_DOCUMENTDB_RANGE_UNITS;
 			if (windowValue->value_type != BSON_TYPE_UTF8)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-								errmsg("'unit' must be a string")));
+								errmsg(
+									"The parameter 'unit' needs to be provided as a string value.")));
 			}
 			dateUnit = GetDateUnitFromString(windowValue->value.v_utf8.str);
 
 			if (dateUnit == DateUnit_Invalid)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-								errmsg("unknown time unit value: %s",
+								errmsg("Unrecognized value for time unit: %s",
 									   windowValue->value.v_utf8.str)));
 			}
 		}
 		else
 		{
-			*frameOptions |= FRAMEOPTION_MONGO_UNKNOWN_FIELDS;
+			*frameOptions |= FRAMEOPTION_DOCUMENTDB_UNKNOWN_FIELDS;
 		}
 	}
 
@@ -1377,10 +1433,11 @@ UpdateWindowAggregationOperator(const pgbsonelement *element,
 			{
 				ereport(ERROR, (
 							errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
-							errmsg("Window operator %s is not supported yet",
+							errmsg("The window operator %s is currently unsupported",
 								   element->path),
-							errdetail_log("Window operator %s is not supported yet",
-										  element->path)));
+							errdetail_log(
+								"The window operator %s is currently unsupported",
+								element->path)));
 			}
 
 			knownOperator = true;
@@ -1548,12 +1605,14 @@ ParseIntegralDerivativeExpression(const bson_value_t *opValue,
 	if (!list_length(context->sortOptions))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("%s requires a sortBy", operatorName)));
+						errmsg("%s requires a sortBy",
+							   operatorName)));
 	}
 	else if (list_length(context->sortOptions) > 1)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("%s requires a non-compound sortBy", operatorName)));
+						errmsg("%s needs a non-compound sortBy parameter",
+							   operatorName)));
 	}
 	else
 	{
@@ -1586,16 +1645,17 @@ ParseIntegralDerivativeExpression(const bson_value_t *opValue,
 				if (unit == DateUnit_Invalid)
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-									errmsg("unknown time unit value: %s",
+									errmsg("Unrecognized value for time unit: %s",
 										   value->value.v_utf8.str),
-									errdetail_log("unknown time unit value: %s",
+									errdetail_log("Unrecognized value for time unit: %s",
 												  value->value.v_utf8.str)));
 				}
 				else if (unit < DateUnit_Week)
 				{
 					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5490710), errmsg(
-										"unit must be 'week' or smaller"),
-									errdetail_log("unit must be 'week' or smaller")));
+										"The specified unit must be 'week' or a smaller time interval"),
+									errdetail_log(
+										"The specified unit must be 'week' or a smaller time interval")));
 				}
 				Datum interval = GetIntervalFromDateUnitAndAmount(unit, 1);
 				float8 secondsInInterval = DatumGetFloat8(DirectFunctionCall2(
@@ -1607,7 +1667,8 @@ ParseIntegralDerivativeExpression(const bson_value_t *opValue,
 			else
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-								errmsg("%s got unexpected argument: %s", operatorName,
+								errmsg("%s received an unexpected argument: %s",
+									   operatorName,
 									   key)));
 			}
 		}
@@ -1617,7 +1678,7 @@ ParseIntegralDerivativeExpression(const bson_value_t *opValue,
 		ereport(ERROR, (
 					errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 					errmsg(
-						"%s requires an 'input' expression", operatorName)));
+						"%s needs a valid 'input' expression", operatorName)));
 	}
 	if (bson_iter_next(&iterSortSpec))
 	{
@@ -1634,7 +1695,8 @@ ParseIntegralDerivativeExpression(const bson_value_t *opValue,
 	else
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("%s requires a non-compound sortBy", operatorName)));
+						errmsg("%s needs a non-compound sortBy parameter",
+							   operatorName)));
 	}
 }
 
@@ -1676,7 +1738,8 @@ HandleDollarCountWindowOperator(const bson_value_t *opValue,
 	if (!IsBsonValueEmptyDocument(opValue))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
-						errmsg("$count only accepts an empty object as input")));
+						errmsg(
+							"$count can only receive an empty object as its valid input")));
 	}
 
 	bson_value_t newOpValue =
@@ -1935,20 +1998,21 @@ ValidateInputForRankFunctions(const bson_value_t *opValue,
 	if (context->isWindowPresent)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5371601),
-						errmsg("Rank style window functions take no other arguments")));
+						errmsg(
+							"Rank-style window functions do not accept any additional arguments")));
 	}
 
 	if (!IsBsonValueEmptyDocument(opValue))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5371603),
-						errmsg("(None) must be specified with '{}' as the value")));
+						errmsg("A value of '{}' must be explicitly assigned to (None)")));
 	}
 
 	if (list_length(context->sortOptions) != 1)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5371602),
 						errmsg(
-							"%s must be specified with a top level sortBy expression with exactly one element",
+							"%s must be provided along with a top-level sortBy expression that contains exactly one element",
 							opName)));
 	}
 }
@@ -1974,7 +2038,7 @@ HandleDollarExpMovingAvgWindowOperator(const bson_value_t *opValue,
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 						errmsg(
-							"$expMovingAvg requires an explicit 'sortBy'")));
+							"'sortBy' parameters must be specified for $shift")));
 	}
 
 	/* $expMovingAvg is not support window parameter*/
@@ -2052,7 +2116,7 @@ HandleDollarLinearFillWindowOperator(const bson_value_t *opValue,
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION605001),
 						errmsg(
-							"$linearFill must be specified with a top level sortBy expression with exactly one element")));
+							"$linearFill requires specifying a top-level sortBy expression that contains exactly one element")));
 	}
 	if (context->isWindowPresent)
 	{
@@ -2167,13 +2231,14 @@ HandleDollarShiftWindowOperator(const bson_value_t *opValue,
 	if (context->isWindowPresent)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("$shift does not accept a 'window' field")));
+						errmsg(
+							"The $shift operator cannot be used with the 'window' field")));
 	}
 
 	if (context->sortOptions == NIL || list_length(context->sortOptions) < 1)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("'$shift' requires a sortBy")));
+						errmsg("'sortBy' parameters must be specified for $shift")));
 	}
 
 	WindowFunc *windowFunc = makeNode(WindowFunc);
@@ -2240,7 +2305,8 @@ ParseInputDocumentForDollarShift(const bson_value_t *opValue, bson_value_t *outp
 	if (opValue->value_type != BSON_TYPE_DOCUMENT)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("Argument to $shift must be an object")));
+						errmsg(
+							"The operator $shift requires its argument to be an object")));
 	}
 
 	bson_iter_t docIter;
@@ -2263,20 +2329,21 @@ ParseInputDocumentForDollarShift(const bson_value_t *opValue, bson_value_t *outp
 		else
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("Unknown argument in $shift")));
+							errmsg("Unrecognized argument found in parameter shift")));
 		}
 	}
 
 	if (output->value_type == BSON_TYPE_EOD)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("$shift requires an 'output' expression.")));
+						errmsg("Operator $shift needs an 'output' expression.")));
 	}
 
 	if (by->value_type == BSON_TYPE_EOD)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("$shift requires 'by' as an integer value.")));
+						errmsg(
+							"The shift operator requires the 'by' parameter to be provided as an integer value.")));
 	}
 
 	if (defaultValue->value_type == BSON_TYPE_EOD)
@@ -2288,14 +2355,15 @@ ParseInputDocumentForDollarShift(const bson_value_t *opValue, bson_value_t *outp
 	if (!IsBsonValue32BitInteger(by, checkFixedInteger))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("'$shift:by' field must be an integer, but found by: %s",
-							   BsonValueToJsonForLogging(by)),
+						errmsg(
+							"The parameter $shift:by requires an integer value, but received: %s",
+							BsonValueToJsonForLogging(by)),
 						errdetail_log(
-							"'$shift:by' field must be an integer, but found by: %s",
+							"The parameter $shift:by requires an integer value, but received: %s",
 							BsonValueToJsonForLogging(by))));
 	}
 
-	/* by value should be a 32 bit integer */
+	/* The value provided must be a 32-bit integer type */
 	by->value.v_int32 = BsonValueAsInt32WithRoundingMode(by,
 														 ConversionRoundingMode_Floor);
 	by->value_type = BSON_TYPE_INT32;
@@ -2308,7 +2376,7 @@ ParseInputDocumentForDollarShift(const bson_value_t *opValue, bson_value_t *outp
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
 						errmsg(
-							"'$shift:default' expression must yield a constant value.")));
+							"Expression '$shift:default' is required to produce a constant value.")));
 	}
 
 	pfree(expressionData);
@@ -2572,8 +2640,10 @@ ValidteForMaxNMinNNAccumulators(const bson_value_t *opValue, const char *opName)
 	if (opValue->value_type != BSON_TYPE_DOCUMENT)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5787900),
-						errmsg("specification must be an object; found %s: %s", opName,
-							   BsonValueToJsonForLogging(opValue)),
+						errmsg(
+							"Specification should be an object type; encountered %s: %s",
+							opName,
+							BsonValueToJsonForLogging(opValue)),
 						errdetail_log(
 							"specification must be an object; opname: %s type found: %s",
 							opName,
@@ -2598,8 +2668,10 @@ ValidteForMaxNMinNNAccumulators(const bson_value_t *opValue, const char *opName)
 		else
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5787901),
-							errmsg("%s found an unknown argument: %s", opName, key),
-							errdetail_log("%s found an unknown argument", opName)));
+							errmsg("%s encountered an unrecognized argument value: %s",
+								   opName, key),
+							errdetail_log("%s encountered an unrecognized argument",
+										  opName)));
 		}
 	}
 
@@ -2609,8 +2681,8 @@ ValidteForMaxNMinNNAccumulators(const bson_value_t *opValue, const char *opName)
 	if (input.value_type == BSON_TYPE_EOD)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION5787907),
-						errmsg("%s requires an 'input' field", opName),
-						errdetail_log("%s requires an 'input' field", opName)));
+						errmsg("%s needs to have an 'input' field", opName),
+						errdetail_log("%s needs to have an 'input' field", opName)));
 	}
 
 	if (elementsToFetch.value_type == BSON_TYPE_EOD)
@@ -2860,7 +2932,8 @@ HandleDollarConstFillWindowOperator(const bson_value_t *opValue,
 	if (!context->enableInternalWindowOperator)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-						errmsg("Unrecognized window function, $_internal_constFill.")));
+						errmsg(
+							"Unrecognized window function called: $_internal_constFill.")));
 	}
 	WindowFunc *windowFunc = makeNode(WindowFunc);
 	windowFunc->winfnoid = BsonConstFillFunctionOid();

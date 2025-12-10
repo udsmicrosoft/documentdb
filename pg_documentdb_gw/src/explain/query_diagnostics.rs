@@ -77,7 +77,10 @@ pub fn is_output_count(output: &str, query_catalog: &QueryCatalog) -> bool {
         return true;
     }
 
-    if output.contains(query_catalog.output_count_regex()) {
+    if output.contains(query_catalog.output_bson_count_aggregate())
+        || output.contains(query_catalog.output_bson_command_count_aggregate())
+        || output.contains(query_catalog.output_count_regex())
+    {
         return true;
     }
 
@@ -129,6 +132,18 @@ pub fn get_index_conditions(
             .captures_iter(input),
         query_catalog,
     )
+}
+
+pub fn get_sort_conditions(input: &str, query_catalog: &QueryCatalog) -> Option<RawDocumentBuf> {
+    Regex::new(query_catalog.single_index_condition_regex())
+        .expect("static input")
+        .captures(input)
+        .and_then(|capture| capture.get(3))
+        .and_then(|opt| {
+            hex::decode(opt.as_str())
+                .ok()
+                .and_then(|f| RawDocumentBuf::from_bytes(f).ok())
+        })
 }
 
 fn get_operator(input: &str) -> &'static str {

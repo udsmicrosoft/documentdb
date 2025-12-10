@@ -9,10 +9,13 @@
 use std::path::Path;
 
 use serde::Deserialize;
-use tokio::fs::File;
+use std::fs::File;
 
 use super::SetupConfiguration;
-use crate::error::{DocumentDBError, Result};
+use crate::{
+    configuration::CertificateOptions,
+    error::{DocumentDBError, Result},
+};
 
 // Configurations which are populated statically on process start
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -23,8 +26,7 @@ pub struct DocumentDBSetupConfiguration {
     pub blocked_role_prefixes: Vec<String>,
 
     // Gateway listener configuration
-    #[serde(default)]
-    pub use_local_host: bool,
+    pub use_local_host: Option<bool>,
     pub gateway_listen_port: Option<u16>,
 
     // Postgres configuration
@@ -34,34 +36,26 @@ pub struct DocumentDBSetupConfiguration {
     pub postgres_database: Option<String>,
 
     #[serde(default)]
-    pub allow_transaction_snapshot: bool,
+    pub allow_transaction_snapshot: Option<bool>,
     pub transaction_timeout_secs: Option<u64>,
     pub cursor_timeout_secs: Option<u64>,
-
-    pub enforce_ssl_tcp: bool,
-    pub certificate_options: Option<CertificateOptions>,
+    pub certificate_options: CertificateOptions,
 
     #[serde(default)]
     pub dynamic_configuration_file: String,
     pub dynamic_configuration_refresh_interval_secs: Option<u32>,
-
     pub postgres_command_timeout_secs: Option<u64>,
-}
+    pub postgres_startup_wait_time_seconds: Option<u64>,
 
-#[derive(Debug, Deserialize, Default, Clone)]
-#[serde(rename_all = "PascalCase")]
-pub struct CertificateOptions {
-    pub cert_type: String,
-    pub file_path: String,
-    pub key_file_path: String,
-    pub ca_path: Option<String>,
+    // Runtime configuration
+    pub async_runtime_worker_threads: Option<usize>,
 }
 
 impl DocumentDBSetupConfiguration {
-    pub async fn new(config_path: &Path) -> Result<Self> {
-        let config_file = File::open(config_path).await?;
-        serde_json::from_reader(config_file.into_std().await).map_err(|e| {
-            DocumentDBError::internal_error(format!("Failed to parse configuration file: {}", e))
+    pub fn new(config_path: &Path) -> Result<Self> {
+        let config_file = File::open(config_path)?;
+        serde_json::from_reader(config_file).map_err(|e| {
+            DocumentDBError::internal_error(format!("Failed to parse configuration file: {e}"))
         })
     }
 }
@@ -108,15 +102,11 @@ impl SetupConfiguration for DocumentDBSetupConfiguration {
     }
 
     fn use_local_host(&self) -> bool {
-        self.use_local_host
+        self.use_local_host.unwrap_or(false)
     }
 
     fn gateway_listen_port(&self) -> u16 {
-        self.gateway_listen_port.unwrap_or(27017)
-    }
-
-    fn enforce_ssl_tcp(&self) -> bool {
-        self.enforce_ssl_tcp
+        self.gateway_listen_port.unwrap_or(10260)
     }
 
     fn blocked_role_prefixes(&self) -> &[String] {
@@ -127,8 +117,8 @@ impl SetupConfiguration for DocumentDBSetupConfiguration {
         self.postgres_command_timeout_secs.unwrap_or(120)
     }
 
-    fn certificate_options(&self) -> Option<CertificateOptions> {
-        self.certificate_options.clone()
+    fn certificate_options(&self) -> &CertificateOptions {
+        &self.certificate_options
     }
 
     fn node_host_name(&self) -> &str {
@@ -139,5 +129,17 @@ impl SetupConfiguration for DocumentDBSetupConfiguration {
         self.application_name
             .as_deref()
             .unwrap_or("DocumentDBGateway")
+    }
+
+    fn postgres_startup_wait_time_seconds(&self) -> u64 {
+        self.postgres_startup_wait_time_seconds.unwrap_or(60)
+    }
+
+    fn async_runtime_worker_threads(&self) -> usize {
+        self.async_runtime_worker_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+        })
     }
 }
