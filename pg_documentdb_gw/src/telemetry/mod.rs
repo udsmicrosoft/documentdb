@@ -3,11 +3,32 @@
  *
  * src/telemetry/mod.rs
  *
+ * Telemetry infrastructure for the DocumentDB gateway.
+ * Provides OpenTelemetry-based metrics, tracing, and logging.
+ *
  *-------------------------------------------------------------------------
  */
 
 pub mod client_info;
+pub mod config;
+pub mod context_propagation;
 pub mod event_id;
+pub mod logging;
+pub mod metrics;
+pub mod telemetry_manager;
+pub mod tracing;
+
+// Re-export commonly used types
+pub use config::{TelemetryConfig, TelemetryOptions};
+pub use context_propagation::{extract_context_from_comment, format_trace_comment};
+pub use logging::{LoggingConfig, LoggingOptions};
+pub use metrics::{MetricsConfig, MetricsOptions, OtelTelemetryProvider};
+pub use telemetry_manager::TelemetryManager;
+pub use tracing::{TracingConfig, TracingOptions};
+
+use async_trait::async_trait;
+use dyn_clone::{clone_trait_object, DynClone};
+use either::Either;
 
 use crate::{
     context::ConnectionContext,
@@ -16,26 +37,29 @@ use crate::{
     requests::{request_tracker::RequestTracker, Request},
     responses::{CommandError, Response},
 };
-use async_trait::async_trait;
-use dyn_clone::{clone_trait_object, DynClone};
-use either::Either;
 
-// TelemetryProvider takes care of emitting events and metrics
-// for tracking the gateway.
+/// Telemetry provider for request metrics and events.
+///
+/// Implementations:
+/// - [`OtelTelemetryProvider`] (OSS): OpenTelemetry metrics + span attributes
+/// - `GenevaTelemetryProvider` (Native): Geneva/Fluent logging
 #[expect(clippy::too_many_arguments)]
 #[async_trait]
 pub trait TelemetryProvider: Send + Sync + DynClone {
-    // Emits an event for every CRUD request dispatched to backend
+    /// Emit telemetry for a completed request.
+    ///
+    /// * `activity_id` - Gateway correlation ID. OSS: span attribute. Native: log field.
+    /// * `user_agent` - Client driver info from handshake. OSS: span attribute. Native: log + metric.
     async fn emit_request_event(
         &self,
-        _: &ConnectionContext,
-        _: &Header,
-        _: Option<&Request<'_>>,
-        _: Either<&Response, (&CommandError, usize)>,
-        _: String,
-        _: &RequestTracker,
-        _: &str,
-        _: &str,
+        connection_context: &ConnectionContext,
+        header: &Header,
+        request: Option<&Request<'_>>,
+        response: Either<&Response, (&CommandError, usize)>,
+        collection: String,
+        request_tracker: &RequestTracker,
+        activity_id: &str,
+        user_agent: &str,
     );
 }
 

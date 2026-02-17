@@ -52,6 +52,7 @@ pub struct RequestInfo<'a> {
     collection: Option<&'a str>,
     pub session_id: Option<&'a [u8]>,
     read_concern: ReadConcern,
+    comment: Option<&'a str>,
 }
 
 impl RequestInfo<'_> {
@@ -63,6 +64,7 @@ impl RequestInfo<'_> {
             collection: None,
             session_id: None,
             read_concern: ReadConcern::default(),
+            comment: None,
         }
     }
 
@@ -81,6 +83,10 @@ impl RequestInfo<'_> {
 
     pub fn read_concern(&self) -> &ReadConcern {
         &self.read_concern
+    }
+
+    pub fn comment(&self) -> Option<&str> {
+        self.comment
     }
 }
 
@@ -359,6 +365,7 @@ impl<'a> Request<'a> {
         let mut isolation_level = None;
         let mut collection = None;
         let mut read_concern = ReadConcern::default();
+        let mut comment = None;
 
         let collection_field = self.collection_field();
         for entry in self.document() {
@@ -417,6 +424,9 @@ impl<'a> Request<'a> {
                     }
                 }
                 "$readPreference" => ReadPreference::parse(v.as_document())?,
+                "comment" => {
+                    comment = v.as_str();
+                }
                 key if collection_field.contains(&key) => {
                     // Aggregate needs special handling because having '1' as a collection is valid
                     collection = if collection_field[0] == "aggregate" {
@@ -453,6 +463,7 @@ impl<'a> Request<'a> {
             transaction_info,
             db,
             read_concern,
+            comment,
         })
     }
 

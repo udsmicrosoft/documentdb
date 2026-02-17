@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::{
     configuration::{CertificateOptions, SetupConfiguration},
     error::{DocumentDBError, Result},
+    telemetry::config::TelemetryOptions,
 };
 
 // Configurations which are populated statically on process start
@@ -48,6 +49,10 @@ pub struct DocumentDBSetupConfiguration {
 
     // Runtime configuration
     pub async_runtime_worker_threads: Option<usize>,
+
+    // Telemetry configuration (optional, falls back to env vars if not present)
+    #[serde(default)]
+    pub telemetry_options: Option<TelemetryOptions>,
 
     // Unix domain socket configuration
     // If specified with a non-empty path, Unix socket is enabled at that path.
@@ -85,6 +90,11 @@ impl DocumentDBSetupConfiguration {
         }
 
         Ok(config)
+    }
+
+    /// Returns the telemetry options from the configuration, if present.
+    pub fn telemetry_options(&self) -> Option<&TelemetryOptions> {
+        self.telemetry_options.as_ref()
     }
 }
 
