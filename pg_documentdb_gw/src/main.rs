@@ -7,7 +7,6 @@
  */
 
 use std::{env, path::PathBuf, sync::Arc};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use documentdb_gateway::{
     configuration::{DocumentDBSetupConfiguration, PgConfiguration, SetupConfiguration},
@@ -19,7 +18,9 @@ use documentdb_gateway::{
     service::TlsProvider,
     shutdown_controller::SHUTDOWN_CONTROLLER,
     startup::{create_postgres_object, get_service_context, get_system_connection_pool},
+    telemetry::{OtelTelemetryProvider, TelemetryConfig, TelemetryManager, TelemetryProvider},
 };
+use opentelemetry::KeyValue;
 
 use tokio::signal;
 
@@ -36,13 +37,6 @@ fn main() {
     let setup_configuration =
         DocumentDBSetupConfiguration::new(&cfg_file).expect("Failed to load configuration.");
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    tracing::info!("Starting server with configuration: {setup_configuration:?}");
-
     // Create Tokio runtime with configured worker threads
     let async_runtime_worker_threads = setup_configuration.async_runtime_worker_threads();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -51,13 +45,29 @@ fn main() {
         .build()
         .expect("Failed to create Tokio runtime");
 
-    tracing::info!("Created Tokio runtime with {async_runtime_worker_threads} worker threads");
-
-    // Run the async main logic
+    // Run the async main logic (telemetry init must happen inside runtime)
     runtime.block_on(start_gateway(setup_configuration));
 }
 
 async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
+    // Initialize telemetry inside the async runtime (OTLP exporter requires it)
+    let telemetry_config = TelemetryConfig::new(setup_configuration.telemetry_options());
+    let attributes = vec![
+        KeyValue::new("service.name", telemetry_config.service_name()),
+        KeyValue::new("service.version", telemetry_config.service_version()),
+    ];
+
+    let (telemetry_manager, telemetry_initialized) =
+        match TelemetryManager::init_telemetry(telemetry_config, attributes) {
+            Ok(manager) => (Some(manager), true),
+            Err(e) => {
+                eprintln!("Failed to initialize OpenTelemetry: {e}");
+                (None, false)
+            }
+        };
+
+    tracing::info!("Starting server with configuration: {setup_configuration:?}");
+
     let shutdown_token = SHUTDOWN_CONTROLLER.token();
 
     tokio::spawn(async move {
@@ -121,7 +131,18 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
         tls_provider,
     );
 
-    run_gateway::<DocumentDBDataClient>(service_context, None, shutdown_token)
+    let telemetry: Option<Box<dyn TelemetryProvider>> = if telemetry_initialized {
+        Some(Box::new(OtelTelemetryProvider::new()))
+    } else {
+        None
+    };
+    run_gateway::<DocumentDBDataClient>(service_context, telemetry, shutdown_token)
         .await
         .unwrap();
+
+    if let Some(manager) = telemetry_manager {
+        if let Err(err) = manager.shutdown() {
+            eprintln!("Failed to shutdown telemetry manager: {err}");
+        }
+    }
 }

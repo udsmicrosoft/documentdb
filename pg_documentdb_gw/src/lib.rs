@@ -36,6 +36,7 @@ use tokio::{
 };
 use tokio_openssl::SslStream;
 use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::{
@@ -47,7 +48,7 @@ use crate::{
     responses::{CommandError, Response},
     telemetry::{
         client_info::parse_client_info, error_code_to_status_code, event_id::EventId,
-        TelemetryProvider,
+        extract_context_from_comment, TelemetryProvider,
     },
 };
 
@@ -606,6 +607,16 @@ where
     Ok(response)
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        activity_id = %activity_id,
+        operation = tracing::field::Empty,
+        db = tracing::field::Empty,
+        collection = tracing::field::Empty,
+        user_agent = tracing::field::Empty,
+    )
+)]
 async fn handle_message<T, S>(
     connection_context: &mut ConnectionContext,
     header: &Header,
@@ -646,6 +657,20 @@ where
     request_tracker.record_duration(RequestIntervalKind::FormatRequest, format_request_start);
 
     let request_info = request.extract_common()?;
+
+    // Extract trace context from request comment field if present
+    // This links the gateway span to the client's distributed trace
+    if let Some(comment) = request_info.comment() {
+        if let Some(parent_ctx) = extract_context_from_comment(comment) {
+            tracing::Span::current().set_parent(parent_ctx);
+        }
+    }
+
+    // Now that we've parsed the request, record the operation details in the span
+    let current_span = tracing::Span::current();
+    current_span.record("operation", request.request_type().to_string());
+    current_span.record("db", request_info.db().unwrap_or(""));
+    current_span.record("collection", request_info.collection().unwrap_or(""));
     let request_context = RequestContext {
         activity_id,
         payload: &request,

@@ -42,8 +42,15 @@ tokio-postgres = { version = "0.7.10", features = [
 ] }
 serde = { version = "1.0.125", features = ["derive", "rc"] }
 uuid = { version = "1.12.1", features = ["v4"] }
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 tracing = "0.1.41"
+tracing-opentelemetry = "0.31.0"
+tracing-appender = "0.2"
+opentelemetry = { version = "0.30", features = ["metrics", "logs", "trace"] }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "metrics", "logs", "trace"] }
+opentelemetry-semantic-conventions = "0.30"
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "metrics", "logs", "trace"] }
+opentelemetry-appender-tracing = "0.30.1"
 notify = "6"
 dashmap = { version = "6.1.0", default-features = false, features = ["inline"] }
 

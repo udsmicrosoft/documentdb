@@ -7,6 +7,7 @@
  */
 use bson::{spec::ElementType, RawBsonRef};
 use std::sync::Arc;
+use tracing::instrument;
 
 use crate::{
     bson::convert_to_bool,
@@ -18,6 +19,7 @@ use crate::{
     responses::{PgResponse, Response},
 };
 
+#[instrument(skip_all)]
 pub async fn process_delete(
     request_context: &RequestContext<'_>,
     connection_context: &ConnectionContext,
@@ -38,6 +40,7 @@ pub async fn process_delete(
         .await
 }
 
+#[instrument(skip_all)]
 pub async fn process_find(
     request_context: &RequestContext<'_>,
     connection_context: &ConnectionContext,
@@ -51,6 +54,7 @@ pub async fn process_find(
     Ok(Response::Pg(response))
 }
 
+#[instrument(skip_all)]
 pub async fn process_insert(
     request_context: &RequestContext<'_>,
     connection_context: &ConnectionContext,
@@ -74,6 +78,7 @@ pub async fn process_insert(
         .await
 }
 
+#[instrument(skip_all)]
 pub async fn process_aggregate(
     request_context: &RequestContext<'_>,
     connection_context: &ConnectionContext,
@@ -86,6 +91,7 @@ pub async fn process_aggregate(
     Ok(Response::Pg(response))
 }
 
+#[instrument(skip_all)]
 pub async fn process_update(
     request_context: &RequestContext<'_>,
     connection_context: &ConnectionContext,
@@ -142,6 +148,7 @@ pub async fn process_validate(
         .await
 }
 
+#[instrument(skip_all)]
 pub async fn process_find_and_modify(
     request_context: &RequestContext<'_>,
     connection_context: &ConnectionContext,
