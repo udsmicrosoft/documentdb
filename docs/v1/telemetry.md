@@ -30,6 +30,7 @@ Telemetry is configured via environment variables or `SetupConfiguration.json`. 
 | `OTEL_TRACING_ENABLED` | `false` | Enable distributed tracing |
 | `OTEL_METRICS_ENABLED` | `true` | Enable metrics export |
 | `OTEL_LOGGING_ENABLED` | `true` | Enable log export via OTLP |
+| `OTEL_LOGS_CONSOLE_ENABLED` | `true` | Enable console (stdout) logging |
 | `OTEL_TRACES_SAMPLER_ARG` | `0.1` | Trace sampling ratio (0.0–1.0) |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | Metrics export interval (ms) |
 | `RUST_LOG` | `info` | Log level (`error`, `warn`, `info`, `debug`, `trace`) |
@@ -150,9 +151,17 @@ Child spans are created for internal processing steps (query execution, cursor m
 
 ### Distributed Trace Context
 
-MongoDB wire protocol doesn't support HTTP-style trace headers. To enable end-to-end tracing, the gateway supports W3C trace context propagation via the MongoDB `comment` field:
+MongoDB wire protocol doesn't support HTTP-style trace headers. To enable end-to-end tracing, the gateway supports W3C trace context propagation via the MongoDB `comment` field. The comment can be either a BSON document or a JSON string:
 
-**1. Client passes trace context in the comment:**
+**1. Client passes trace context in the comment (BSON document — recommended):**
+```javascript
+db.collection.find(
+  { status: "active" },
+  { comment: { traceparent: "00-abc123def456-789abc-01" } }
+)
+```
+
+**Or as a JSON string (also supported):**
 ```javascript
 db.collection.find(
   { status: "active" },
@@ -174,6 +183,7 @@ Telemetry never impacts gateway availability:
 - If the OTel collector is unreachable at startup, the gateway logs a warning and continues without telemetry.
 - If the collector becomes unavailable at runtime, export batches are dropped without affecting request processing.
 - Metrics and logs are enabled by default; tracing is opt-in (`OTEL_TRACING_ENABLED=false` by default).
+- Console logging is enabled by default (`OTEL_LOGS_CONSOLE_ENABLED=true`), so the gateway always writes logs to stdout even without a collector. OTLP log export is additive — when enabled, logs are sent to both the console and the collector.
 
 ## Testing Locally
 
