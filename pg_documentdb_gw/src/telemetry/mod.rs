@@ -26,9 +26,23 @@ pub use metrics::{MetricsConfig, MetricsOptions, OtelTelemetryProvider};
 pub use telemetry_manager::TelemetryManager;
 pub use tracing::{TracingConfig, TracingOptions};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use async_trait::async_trait;
 use dyn_clone::{clone_trait_object, DynClone};
 use either::Either;
+
+static TRACING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Returns whether distributed tracing is enabled.
+/// Used to skip trace context extraction when tracing is off.
+pub fn is_tracing_enabled() -> bool {
+    TRACING_ENABLED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_tracing_enabled(enabled: bool) {
+    TRACING_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 use crate::{
     context::ConnectionContext,

@@ -78,6 +78,7 @@ impl TelemetryManager {
 
         if let Some(ref provider) = tracer_provider {
             global::set_tracer_provider(provider.clone());
+            super::set_tracing_enabled(true);
             let tracer = provider.tracer(env!("CARGO_CRATE_NAME"));
             let otel_trace_layer = OpenTelemetryLayer::new(tracer)
                 .with_filter(logging::get_env_filter(&config.logging().level()))
