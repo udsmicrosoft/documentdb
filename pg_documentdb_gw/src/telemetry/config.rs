@@ -125,6 +125,13 @@ impl TelemetryConfig {
     pub fn logging(&self) -> &LoggingConfig {
         &self.logging
     }
+
+    /// Returns true if any telemetry signal (tracing, metrics, or logging) is enabled.
+    pub fn any_signal_enabled(&self) -> bool {
+        self.tracing.tracing_enabled()
+            || self.metrics.metrics_enabled()
+            || self.logging.logging_enabled()
+    }
 }
 
 #[cfg(test)]

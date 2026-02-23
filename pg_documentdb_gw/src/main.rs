@@ -57,14 +57,17 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
         KeyValue::new("service.version", telemetry_config.service_version()),
     ];
 
-    let (telemetry_manager, telemetry_initialized) =
+    let (telemetry_manager, telemetry_initialized) = if telemetry_config.any_signal_enabled() {
         match TelemetryManager::init_telemetry(telemetry_config, attributes) {
             Ok(manager) => (Some(manager), true),
             Err(e) => {
                 eprintln!("Failed to initialize OpenTelemetry: {e}");
                 (None, false)
             }
-        };
+        }
+    } else {
+        (None, false)
+    };
 
     tracing::info!("Starting server with configuration: {setup_configuration:?}");
 
