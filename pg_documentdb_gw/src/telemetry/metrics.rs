@@ -252,10 +252,6 @@ impl OtelTelemetryProvider {
             .unwrap_or_else(|| "unknown".to_string());
 
         let db_name = request.and_then(|r| r.db().ok()).unwrap_or("unknown");
-        let db_system = KeyValue::new("db.system.name", "documentdb");
-        let db_operation = KeyValue::new("db.operation.name", operation);
-        let db_collection = KeyValue::new("db.collection.name", collection.to_string());
-        let db_namespace = KeyValue::new("db.namespace", db_name.to_string());
 
         let duration_to_secs =
             |ns: i64| -> f64 { Duration::from_nanos(ns.max(0) as u64).as_secs_f64() };
@@ -263,26 +259,16 @@ impl OtelTelemetryProvider {
         let duration_ns =
             request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest);
 
-        // Build attributes based on success/failure
-        let base_attrs: Vec<KeyValue> = match &response {
-            Either::Left(_) => {
-                vec![
-                    db_system.clone(),
-                    db_operation.clone(),
-                    db_collection.clone(),
-                    db_namespace.clone(),
-                ]
-            }
-            Either::Right((err, _)) => {
-                vec![
-                    db_system.clone(),
-                    db_operation.clone(),
-                    db_collection.clone(),
-                    db_namespace.clone(),
-                    KeyValue::new("error.type", err.code.to_string()),
-                ]
-            }
-        };
+        // Build attributes based on success/failure — no cloning needed
+        let mut base_attrs: Vec<KeyValue> = vec![
+            KeyValue::new("db.system.name", "documentdb"),
+            KeyValue::new("db.operation.name", operation),
+            KeyValue::new("db.collection.name", collection.to_string()),
+            KeyValue::new("db.namespace", db_name.to_string()),
+        ];
+        if let Either::Right((err, _)) = &response {
+            base_attrs.push(KeyValue::new("error.type", err.code.to_string()));
+        }
 
         // Record operation count and total duration
         self.operations_count.add(1, &base_attrs);
@@ -303,36 +289,34 @@ impl OtelTelemetryProvider {
         self.response_size_total
             .add(response_size_bytes, &base_attrs);
 
-        // Record PostgreSQL phase breakdown (duration totals)
-        let pg_begin_ns = request_tracker
-            .get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction);
-        if pg_begin_ns > 0 {
-            let mut attrs = base_attrs.clone();
-            attrs.push(KeyValue::new(
-                "db.operation.phase",
-                "postgres_begin_transaction",
-            ));
-            self.operation_duration_total
-                .add(duration_to_secs(pg_begin_ns), &attrs);
-        }
+        // Record PostgreSQL phase breakdown (duration totals).
+        // Build phase attrs by appending to a reference of base_attrs to avoid cloning.
+        let mut phase_attrs = Vec::with_capacity(base_attrs.len() + 1);
 
-        let pg_exec_ns =
-            request_tracker.get_interval_elapsed_time(RequestIntervalKind::ProcessRequest);
-        if pg_exec_ns > 0 {
-            let mut attrs = base_attrs.clone();
-            attrs.push(KeyValue::new("db.operation.phase", "postgres_execution"));
-            self.operation_duration_total
-                .add(duration_to_secs(pg_exec_ns), &attrs);
-        }
+        let mut record_phase = |phase: &'static str, ns: i64| {
+            if ns > 0 {
+                phase_attrs.clear();
+                phase_attrs.extend_from_slice(&base_attrs);
+                phase_attrs.push(KeyValue::new("db.operation.phase", phase));
+                self.operation_duration_total
+                    .add(duration_to_secs(ns), &phase_attrs);
+            }
+        };
 
-        let pg_commit_ns = request_tracker
-            .get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction);
-        if pg_commit_ns > 0 {
-            let mut attrs = base_attrs.clone();
-            attrs.push(KeyValue::new("db.operation.phase", "postgres_commit"));
-            self.operation_duration_total
-                .add(duration_to_secs(pg_commit_ns), &attrs);
-        }
+        record_phase(
+            "postgres_begin_transaction",
+            request_tracker
+                .get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
+        );
+        record_phase(
+            "postgres_execution",
+            request_tracker.get_interval_elapsed_time(RequestIntervalKind::ProcessRequest),
+        );
+        record_phase(
+            "postgres_commit",
+            request_tracker
+                .get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
+        );
     }
 }
 
