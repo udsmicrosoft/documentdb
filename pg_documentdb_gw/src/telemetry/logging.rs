@@ -27,7 +27,7 @@ use crate::{
 // ============================================================================
 
 const DEFAULT_LOGGING_ENABLED: bool = true;
-const DEFAULT_CONSOLE_ENABLED: bool = false;
+const DEFAULT_CONSOLE_ENABLED: bool = true;
 const DEFAULT_MAX_QUEUE_SIZE: usize = 4096;
 const DEFAULT_LOG_MAX_EXPORT_BATCH_SIZE: usize = 256;
 const DEFAULT_LOG_EXPORT_INTERVAL_MS: u64 = 5000;
@@ -122,7 +122,7 @@ impl LoggingConfig {
             .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string())
     }
 
-    /// Whether console logging is enabled. Fallback: JSON > OTEL_LOGS_CONSOLE_ENABLED > false.
+    /// Whether console logging is enabled. Fallback: JSON > OTEL_LOGS_CONSOLE_ENABLED > true.
     pub fn console_enabled(&self) -> bool {
         self.console_enabled
             .or_else(|| env_var("OTEL_LOGS_CONSOLE_ENABLED"))
