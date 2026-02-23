@@ -53,6 +53,7 @@ pub struct RequestInfo<'a> {
     pub session_id: Option<&'a [u8]>,
     read_concern: ReadConcern,
     comment: Option<&'a str>,
+    traceparent: Option<&'a str>,
 }
 
 impl RequestInfo<'_> {
@@ -65,6 +66,7 @@ impl RequestInfo<'_> {
             session_id: None,
             read_concern: ReadConcern::default(),
             comment: None,
+            traceparent: None,
         }
     }
 
@@ -87,6 +89,10 @@ impl RequestInfo<'_> {
 
     pub fn comment(&self) -> Option<&str> {
         self.comment
+    }
+
+    pub fn traceparent(&self) -> Option<&str> {
+        self.traceparent
     }
 }
 
@@ -366,6 +372,7 @@ impl<'a> Request<'a> {
         let mut collection = None;
         let mut read_concern = ReadConcern::default();
         let mut comment = None;
+        let mut traceparent = None;
 
         let collection_field = self.collection_field();
         for entry in self.document() {
@@ -425,7 +432,12 @@ impl<'a> Request<'a> {
                 }
                 "$readPreference" => ReadPreference::parse(v.as_document())?,
                 "comment" => {
-                    comment = v.as_str();
+                    // Comment can be a string (JSON with traceparent) or a BSON document
+                    if let Some(s) = v.as_str() {
+                        comment = Some(s);
+                    } else if let Some(doc) = v.as_document() {
+                        traceparent = doc.get_str("traceparent").ok();
+                    }
                 }
                 key if collection_field.contains(&key) => {
                     // Aggregate needs special handling because having '1' as a collection is valid
@@ -464,6 +476,7 @@ impl<'a> Request<'a> {
             db,
             read_concern,
             comment,
+            traceparent,
         })
     }
 

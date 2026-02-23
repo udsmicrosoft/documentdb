@@ -40,9 +40,16 @@ pub fn extract_context_from_comment(comment: &str) -> Option<Context> {
     // Handle parsing errors gracefully - don't fail requests for malformed trace context
     let json: Value = serde_json::from_str(comment).ok()?;
     let traceparent = json.get("traceparent")?.as_str()?;
+    parse_traceparent(traceparent)
+}
 
-    // Parse W3C traceparent format: version-trace_id-span_id-flags
-    // Reference: https://www.w3.org/TR/trace-context/#traceparent-header
+/// Parse a W3C traceparent string into an OpenTelemetry context.
+///
+/// Format: `00-{trace_id}-{span_id}-{flags}`
+/// Reference: <https://www.w3.org/TR/trace-context/#traceparent-header>
+///
+/// Returns `None` for invalid traceparent values.
+pub fn parse_traceparent(traceparent: &str) -> Option<Context> {
     let parts: Vec<&str> = traceparent.split('-').collect();
     if parts.len() != 4 || parts[0] != "00" {
         return None;

@@ -20,7 +20,7 @@ pub mod tracing;
 
 // Re-export commonly used types
 pub use config::{TelemetryConfig, TelemetryOptions};
-pub use context_propagation::{extract_context_from_comment, format_trace_comment};
+pub use context_propagation::{extract_context_from_comment, format_trace_comment, parse_traceparent};
 pub use logging::{LoggingConfig, LoggingOptions};
 pub use metrics::{MetricsConfig, MetricsOptions, OtelTelemetryProvider};
 pub use telemetry_manager::TelemetryManager;

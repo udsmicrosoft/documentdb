@@ -48,7 +48,7 @@ use crate::{
     responses::{CommandError, Response},
     telemetry::{
         client_info::parse_client_info, error_code_to_status_code, event_id::EventId,
-        extract_context_from_comment, is_tracing_enabled, TelemetryProvider,
+        extract_context_from_comment, is_tracing_enabled, parse_traceparent, TelemetryProvider,
     },
 };
 
@@ -660,11 +660,18 @@ where
 
     // Extract trace context from request comment field if present
     // This links the gateway span to the client's distributed trace
+    // Supports both BSON document { traceparent: "00-..." } and JSON string formats
     if is_tracing_enabled() {
-        if let Some(comment) = request_info.comment() {
-            if let Some(parent_ctx) = extract_context_from_comment(comment) {
-                tracing::Span::current().set_parent(parent_ctx);
-            }
+        let parent_ctx = request_info
+            .traceparent()
+            .and_then(parse_traceparent)
+            .or_else(|| {
+                request_info
+                    .comment()
+                    .and_then(extract_context_from_comment)
+            });
+        if let Some(ctx) = parent_ctx {
+            tracing::Span::current().set_parent(ctx);
         }
     }
 
