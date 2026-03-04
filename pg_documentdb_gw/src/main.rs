@@ -18,7 +18,7 @@ use documentdb_gateway::{
     service::TlsProvider,
     shutdown_controller::SHUTDOWN_CONTROLLER,
     startup::{create_postgres_object, get_service_context, get_system_connection_pool},
-    telemetry::{OtelTelemetryProvider, TelemetryConfig, TelemetryManager, TelemetryProvider},
+    telemetry::{OtelTelemetryProvider, TelemetryConfig, TelemetryManager, TelemetryProvider, register_pool_metrics},
 };
 use opentelemetry::KeyValue;
 
@@ -139,6 +139,15 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
     } else {
         None
     };
+
+    // Register connection pool metrics (gauges updated by background task).
+    // Guards must be held alive for the duration of the gateway.
+    let _pool_metric_guards = if telemetry_initialized {
+        Some(register_pool_metrics(service_context.clone()))
+    } else {
+        None
+    };
+
     run_gateway::<DocumentDBDataClient>(service_context, telemetry, shutdown_token)
         .await
         .unwrap();

@@ -6,6 +6,7 @@
  *-------------------------------------------------------------------------
  */
 
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use either::Either;
@@ -19,6 +20,7 @@ use serde::Deserialize;
 
 use crate::{
     context::ConnectionContext,
+    context::ServiceContext,
     error::{DocumentDBError, Result},
     protocol::header::Header,
     requests::{request_tracker::RequestTracker, Request, RequestIntervalKind},
@@ -188,6 +190,144 @@ pub fn create_metrics_provider(
     Ok(Some(meter_provider))
 }
 
+// ============================================================================
+// Connection Pool Metrics
+// ============================================================================
+
+/// Snapshot of a single connection pool's state (sync-safe for gauge callbacks).
+#[derive(Clone, Default)]
+struct PoolSnapshot {
+    identifier: String,
+    max_size: usize,
+    size: usize,
+    available: usize,
+    waiting: usize,
+}
+
+/// Registers observable gauges for connection pool metrics.
+///
+/// Spawns a background task that periodically snapshots pool stats from the
+/// `PoolManager`. The gauge callbacks read the latest snapshot synchronously.
+///
+/// The returned `_PoolMetricGuards` must be kept alive for the gauges to remain active.
+pub fn register_pool_metrics(service_context: ServiceContext) -> PoolMetricGuards {
+    let snapshots: Arc<StdRwLock<Vec<PoolSnapshot>>> = Arc::new(StdRwLock::new(Vec::new()));
+
+    // Background task: snapshot pool stats every 5 seconds
+    let sc = service_context;
+    let snap_writer = snapshots.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let stats = sc.connection_pool_manager().report_pool_stats().await;
+            let new_snapshots: Vec<PoolSnapshot> = stats
+                .iter()
+                .map(|s| {
+                    let status = s.status();
+                    PoolSnapshot {
+                        identifier: s.identifier().to_string(),
+                        max_size: status.max_size,
+                        size: status.size,
+                        available: status.available,
+                        waiting: status.waiting,
+                    }
+                })
+                .collect();
+            if let Ok(mut lock) = snap_writer.write() {
+                *lock = new_snapshots;
+            }
+        }
+    });
+
+    let meter = global::meter("documentdb_gateway");
+
+    let snap = snapshots.clone();
+    let max_gauge = meter
+        .u64_observable_gauge("db.client.connection.max")
+        .with_description("Maximum pool connections")
+        .with_callback(move |observer| {
+            if let Ok(lock) = snap.read() {
+                for pool in lock.iter() {
+                    observer.observe(
+                        pool.max_size as u64,
+                        &[KeyValue::new("pool.name", pool.identifier.clone())],
+                    );
+                }
+            }
+        })
+        .build();
+
+    let snap = snapshots.clone();
+    let active_gauge = meter
+        .u64_observable_gauge("db.client.connection.active")
+        .with_description("Active (in-use) pool connections")
+        .with_callback(move |observer| {
+            if let Ok(lock) = snap.read() {
+                for pool in lock.iter() {
+                    let active = pool.size.saturating_sub(pool.available);
+                    observer.observe(
+                        active as u64,
+                        &[KeyValue::new("pool.name", pool.identifier.clone())],
+                    );
+                }
+            }
+        })
+        .build();
+
+    let snap = snapshots.clone();
+    let idle_gauge = meter
+        .u64_observable_gauge("db.client.connection.idle")
+        .with_description("Idle (available) pool connections")
+        .with_callback(move |observer| {
+            if let Ok(lock) = snap.read() {
+                for pool in lock.iter() {
+                    observer.observe(
+                        pool.available as u64,
+                        &[KeyValue::new("pool.name", pool.identifier.clone())],
+                    );
+                }
+            }
+        })
+        .build();
+
+    let snap = snapshots.clone();
+    let waiting_gauge = meter
+        .u64_observable_gauge("db.client.connection.waiting")
+        .with_description("Tasks waiting for a pool connection")
+        .with_callback(move |observer| {
+            if let Ok(lock) = snap.read() {
+                for pool in lock.iter() {
+                    observer.observe(
+                        pool.waiting as u64,
+                        &[KeyValue::new("pool.name", pool.identifier.clone())],
+                    );
+                }
+            }
+        })
+        .build();
+
+    PoolMetricGuards {
+        _max: max_gauge,
+        _active: active_gauge,
+        _idle: idle_gauge,
+        _waiting: waiting_gauge,
+    }
+}
+
+/// Holds observable gauge handles to keep them alive.
+/// Drop this struct to stop pool metrics collection.
+pub struct PoolMetricGuards {
+    _max: opentelemetry::metrics::ObservableGauge<u64>,
+    _active: opentelemetry::metrics::ObservableGauge<u64>,
+    _idle: opentelemetry::metrics::ObservableGauge<u64>,
+    _waiting: opentelemetry::metrics::ObservableGauge<u64>,
+}
+
+// ============================================================================
+// Request Metrics
+// ============================================================================
+
 /// Records request-level metrics using low-memory Counters.
 ///
 /// See: https://opentelemetry.io/docs/specs/semconv/database/database-metrics/
@@ -259,7 +399,7 @@ impl OtelTelemetryProvider {
         let duration_ns =
             request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest);
 
-        // Build attributes based on success/failure — no cloning needed
+        // Build attributes — static strings avoid allocation, dynamic values use to_string()
         let mut base_attrs: Vec<KeyValue> = vec![
             KeyValue::new("db.system.name", "documentdb"),
             KeyValue::new("db.operation.name", operation),

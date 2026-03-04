@@ -22,7 +22,7 @@ pub mod tracing;
 pub use config::{TelemetryConfig, TelemetryOptions};
 pub use context_propagation::{extract_context_from_comment, format_trace_comment, parse_traceparent};
 pub use logging::{LoggingConfig, LoggingOptions};
-pub use metrics::{MetricsConfig, MetricsOptions, OtelTelemetryProvider};
+pub use metrics::{MetricsConfig, MetricsOptions, OtelTelemetryProvider, PoolMetricGuards, register_pool_metrics};
 pub use telemetry_manager::TelemetryManager;
 pub use tracing::{TracingConfig, TracingOptions};
 
