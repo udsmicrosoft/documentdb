@@ -349,6 +349,14 @@ pub struct OtelTelemetryProvider {
     request_size_total: Counter<u64>,
     /// Total response payload bytes.
     response_size_total: Counter<u64>,
+    /// Documents returned (find, aggregate, getMore).
+    documents_returned: Counter<u64>,
+    /// Documents inserted.
+    documents_inserted: Counter<u64>,
+    /// Documents updated.
+    documents_updated: Counter<u64>,
+    /// Documents deleted.
+    documents_deleted: Counter<u64>,
 }
 
 impl OtelTelemetryProvider {
@@ -375,6 +383,26 @@ impl OtelTelemetryProvider {
                 .u64_counter("db.client.response.size.total")
                 .with_description("Total size of database client response payloads")
                 .with_unit("By")
+                .build(),
+            documents_returned: meter
+                .u64_counter("db.client.documents.returned")
+                .with_description("Documents returned by read operations")
+                .with_unit("{document}")
+                .build(),
+            documents_inserted: meter
+                .u64_counter("db.client.documents.inserted")
+                .with_description("Documents inserted")
+                .with_unit("{document}")
+                .build(),
+            documents_updated: meter
+                .u64_counter("db.client.documents.updated")
+                .with_description("Documents updated")
+                .with_unit("{document}")
+                .build(),
+            documents_deleted: meter
+                .u64_counter("db.client.documents.deleted")
+                .with_description("Documents deleted")
+                .with_unit("{document}")
                 .build(),
         }
     }
@@ -457,6 +485,62 @@ impl OtelTelemetryProvider {
             request_tracker
                 .get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
         );
+
+        // Record document throughput counters based on operation type
+        if let Some(req) = request {
+            if let Either::Left(resp) = &response {
+                self.record_document_counts(req, resp, &base_attrs);
+            }
+        }
+    }
+
+    /// Extract document counts from the response based on operation type.
+    fn record_document_counts(
+        &self,
+        request: &Request<'_>,
+        response: &Response,
+        attrs: &[KeyValue],
+    ) {
+        let doc = match response.as_raw_document() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        use crate::requests::RequestType;
+        match request.request_type() {
+            RequestType::Find | RequestType::Aggregate | RequestType::GetMore => {
+                // Cursor responses: { cursor: { firstBatch/nextBatch: [...] } }
+                if let Ok(cursor) = doc.get_document("cursor") {
+                    let batch_len = cursor
+                        .get_array("firstBatch")
+                        .or_else(|_| cursor.get_array("nextBatch"))
+                        .map(|arr| arr.into_iter().count() as u64)
+                        .unwrap_or(0);
+                    if batch_len > 0 {
+                        self.documents_returned.add(batch_len, attrs);
+                    }
+                }
+            }
+            RequestType::Insert => {
+                // Insert response: { n: <count> }
+                if let Ok(n) = doc.get_i32("n") {
+                    self.documents_inserted.add(n.max(0) as u64, attrs);
+                }
+            }
+            RequestType::Update | RequestType::FindAndModify => {
+                // Update response: { nModified: <count> }
+                if let Ok(n) = doc.get_i32("nModified") {
+                    self.documents_updated.add(n.max(0) as u64, attrs);
+                }
+            }
+            RequestType::Delete => {
+                // Delete response: { n: <count> }
+                if let Ok(n) = doc.get_i32("n") {
+                    self.documents_deleted.add(n.max(0) as u64, attrs);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
