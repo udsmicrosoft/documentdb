@@ -108,6 +108,8 @@ export OTEL_TRACES_SAMPLER_ARG=1.0  # 100% sampling for debugging
 
 Metrics follow the [OTel Database Client Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/database/database-metrics/):
 
+### Request Metrics
+
 | Metric | Type | Unit | Description |
 |--------|------|------|-------------|
 | `db.client.operation.duration.total` | Counter | seconds | Total operation duration |
@@ -115,7 +117,29 @@ Metrics follow the [OTel Database Client Semantic Conventions](https://opentelem
 | `db.client.request.size.total` | Counter | bytes | Total request payload size |
 | `db.client.response.size.total` | Counter | bytes | Total response payload size |
 
-Each metric includes the following attributes:
+### Document Throughput Metrics
+
+| Metric | Type | Unit | Description |
+|--------|------|------|-------------|
+| `db.client.documents.returned` | Counter | documents | Documents returned (find, aggregate, getMore) |
+| `db.client.documents.inserted` | Counter | documents | Documents inserted |
+| `db.client.documents.updated` | Counter | documents | Documents updated |
+| `db.client.documents.deleted` | Counter | documents | Documents deleted |
+
+### Connection Pool Metrics
+
+| Metric | Type | Unit | Description |
+|--------|------|------|-------------|
+| `db.client.connection.max` | Gauge | connections | Maximum pool connections |
+| `db.client.connection.active` | Gauge | connections | In-use pool connections |
+| `db.client.connection.idle` | Gauge | connections | Available pool connections |
+| `db.client.connection.waiting` | Gauge | connections | Tasks waiting for a connection |
+
+Pool metrics include a `pool.name` attribute identifying the pool (e.g., `system_auth`, `system_requests`, user data pools).
+
+### Metric Attributes
+
+Each request metric includes the following attributes:
 
 | Attribute | Description |
 |-----------|-------------|
