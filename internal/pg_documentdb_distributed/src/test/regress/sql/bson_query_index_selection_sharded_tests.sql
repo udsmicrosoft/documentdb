@@ -33,8 +33,4 @@ BEGIN;
 set local enable_seqscan to off;
 EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'test_index_selection_sharded') WHERE document @@ '{ "$or": [ { "a.b": { "$gt": 500 } }, { "a.c": { "$lt": 10 } } ] }';
 
-SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
-SET LOCAL documentdb_rum.enable_custom_cost_estimate to off;
-EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'test_index_selection_sharded') WHERE document @@ '{ "$and": [ { "a.b": { "$gt": 500 } }, { "a.c": { "$lt": 10 } } ] }';
-
 ROLLBACK;

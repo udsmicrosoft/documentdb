@@ -67,7 +67,11 @@ Check constraints:
 SELECT * FROM documentdb_api.create_indexes_background('db', NULL);
 psql:sql/create_indexes_background_core.sql:27: ERROR:  Argument value must not be NULL
 SELECT * FROM documentdb_api.create_indexes_background(NULL, '{}');
-psql:sql/create_indexes_background_core.sql:28: ERROR:  dbName cannot be NULL
+                                                                                   retval                                                                                   | ok | requests 
+---------------------------------------------------------------------
+ { "raw" : { "defaultShard" : { "ok" : { "$numberInt" : "0" }, "errmsg" : "$db must be specified.", "code" : { "$numberInt" : "2600" } } }, "ok" : { "$numberInt" : "0" } } | f  | { }
+(1 row)
+
 SELECT * FROM documentdb_api.create_indexes_background('db', '{"createIndexes": "collection_6", "unknown_field": []}');
                                                                                                         retval                                                                                                         | ok | requests 
 ---------------------------------------------------------------------

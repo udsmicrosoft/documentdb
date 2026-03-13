@@ -53,9 +53,6 @@ typedef enum RumLibraryLoadOptions
 	RumLibraryLoadOption_RequireDocumentDBRum = 2,
 } RumLibraryLoadOptions;
 
-
-typedef bool (*CanOrderInIndexScan)(IndexScanDesc scan);
-
 extern RumLibraryLoadOptions DocumentDBRumLibraryLoadOption;
 void LoadRumRoutine(void);
 
@@ -64,22 +61,35 @@ IndexScanDesc extension_rumbeginscan_core(Relation rel, int nkeys, int norderbys
 void extension_rumendscan_core(IndexScanDesc scan, IndexAmRoutine *coreRoutine);
 void extension_rumrescan_core(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 							  ScanKey orderbys, int norderbys,
-							  IndexAmRoutine *coreRoutine,
-							  GetMultikeyStatusFunc multiKeyStatusFunc,
-							  CanOrderInIndexScan indexScanOrderedFunc);
+							  IndexAmRoutine *coreRoutine);
 int64 extension_rumgetbitmap_core(IndexScanDesc scan, TIDBitmap *tbm,
 								  IndexAmRoutine *coreRoutine);
 bool extension_rumgettuple_core(IndexScanDesc scan, ScanDirection direction,
 								IndexAmRoutine *coreRoutine);
 
+typedef List *(*BoundaryQualsSelectorFunc)(IndexPath *indexPath, int32_t *num_sa_scans);
 
+typedef void (*OrderedCostEstimateCoreFunc)(PlannerInfo *root, IndexPath *path, double
+											loop_count,
+											Cost *indexStartupCost, Cost *indexTotalCost,
+											Selectivity *indexSelectivity,
+											double *indexCorrelation,
+											double *indexPages,
+											double *totalNumTuples,
+											Selectivity *boundarySelectivity,
+											int *numBoundaryQuals,
+											double *dataPagesProportionFetched,
+											BoundaryQualsSelectorFunc
+											boundaryQualsSelector);
 void extension_rumcostestimate_core(PlannerInfo *root, IndexPath *path, double
 									loop_count,
 									Cost *indexStartupCost, Cost *indexTotalCost,
 									Selectivity *indexSelectivity,
 									double *indexCorrelation,
 									double *indexPages, IndexAmRoutine *coreRoutine,
-									bool forceIndexPushdownCostToZero);
+									bool forceIndexPushdownCostToZero,
+									OrderedCostEstimateCoreFunc
+									orderedCostEstimateCoreFunc);
 
 IndexBuildResult * extension_rumbuild_core(Relation heapRelation, Relation indexRelation,
 										   struct IndexInfo *indexInfo,
@@ -106,4 +116,14 @@ void ExplainRawCompositeScan(Relation index_rel, List *indexQuals, List *indexOr
 							 ScanDirection indexScanDir, struct ExplainState *es);
 
 void ExplainRegularIndexScan(IndexScanDesc scan, struct ExplainState *es);
+
+void LogReportedIndexCosts(Oid relOid, struct ExplainState *es);
+void ResetReportedIndexCosts(void);
+void RecordCostEstimateForIndex(Oid indexOid, Oid relOid, Cost indexStartupCost,
+								Cost indexTotalCost, Selectivity indexSelectivity,
+								double indexCorrelation, double indexPages, double
+								totalIndexPages, double totalIndexTuples,
+								double boundarySelectivity,
+								int numBoundaryQuals, double
+								dataPagesProportionFetched);
 #endif

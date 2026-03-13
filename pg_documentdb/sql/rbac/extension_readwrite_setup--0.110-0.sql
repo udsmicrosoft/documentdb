@@ -52,6 +52,7 @@ GRANT EXECUTE ON FUNCTION documentdb_api_v2.create_indexes_background(text, __CO
 GRANT EXECUTE ON FUNCTION documentdb_api_v2.insert(text, __CORE_SCHEMA_V2__.bson, __CORE_SCHEMA_V2__.bsonsequence, text) TO documentdb_readwrite_role;
 GRANT EXECUTE ON FUNCTION documentdb_api_v2.delete(text, __CORE_SCHEMA_V2__.bson, __CORE_SCHEMA_V2__.bsonsequence, text) TO documentdb_readwrite_role;
 GRANT EXECUTE ON FUNCTION documentdb_api_v2.rename_collection(text, text, text, boolean) TO documentdb_readwrite_role;
+GRANT EXECUTE ON FUNCTION documentdb_api_v2.rename_collection(__CORE_SCHEMA_V2__.bson) TO documentdb_readwrite_role;
 GRANT EXECUTE ON FUNCTION documentdb_api_v2.insert_one(text, text, __CORE_SCHEMA_V2__.bson, text) TO documentdb_readwrite_role;
 GRANT EXECUTE ON FUNCTION documentdb_api_v2.aggregate_cursor_first_page(text, __CORE_SCHEMA_V2__.bson, bigint) TO documentdb_readwrite_role;
 GRANT EXECUTE ON FUNCTION documentdb_api_v2.update(text, __CORE_SCHEMA_V2__.bson, __CORE_SCHEMA_V2__.bsonsequence, text) TO documentdb_readwrite_role;

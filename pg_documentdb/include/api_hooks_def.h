@@ -17,8 +17,11 @@
 #include <access/amapi.h>
 #include <nodes/parsenodes.h>
 #include <nodes/pathnodes.h>
+#include <utils/memutils.h>
 
 #include "metadata/collection.h"
+#include "update/update_hooks.h"
+
 
 /* Section: General Extension points */
 
@@ -174,15 +177,6 @@ typedef const char *(*TryGetShardNameForUnshardedCollection_HookType)(Oid relati
 extern TryGetShardNameForUnshardedCollection_HookType
 	try_get_shard_name_for_unsharded_collection_hook;
 
-/*
- * Hook for creating an update tracker if tracking is enabled.
- */
-typedef BsonUpdateTracker *(*CreateBsonUpdateTracker_HookType)(void);
-extern CreateBsonUpdateTracker_HookType create_update_tracker_hook;
-
-typedef pgbson *(*BuildUpdateDescription_HookType)(BsonUpdateTracker *);
-extern BuildUpdateDescription_HookType build_update_description_hook;
-
 typedef const char *(*GetDistributedApplicationName_HookType)(void);
 extern GetDistributedApplicationName_HookType get_distributed_application_name_hook;
 
@@ -192,8 +186,8 @@ extern IsNtoReturnSupported_HookType is_n_to_return_supported_hook;
 typedef bool (*EnsureMetadataTableReplicated_HookType)(const char *);
 extern EnsureMetadataTableReplicated_HookType ensure_metadata_table_replicated_hook;
 
-typedef void (*PostSetupCluster_HookType)(bool, bool (shouldUpgradeFunc(void *, int, int,
-																		int)), void *);
+typedef void (*PostSetupCluster_HookType)(bool (shouldUpgradeFunc(void *, int, int,
+																  int)), void *);
 extern PostSetupCluster_HookType post_setup_cluster_hook;
 
 /*
@@ -256,5 +250,39 @@ extern GetOperationCancellationQuery_HookType get_operation_cancellation_query_h
 
 typedef bool (*DefaultEnableCompositeOpClass_HookType)(void);
 extern DefaultEnableCompositeOpClass_HookType default_enable_composite_op_class_hook;
+
+/*
+ * Hook for creating a TTL metrics aggregation context before the TTL purge loop.
+ * The MemoryContext parameter should be used for allocations that need to survive
+ * across batch deletes.
+ *
+ * Returns an opaque context pointer (NULL if metrics collection is disabled).
+ */
+typedef void *(*CreateTtlMetricsContext_HookType)(MemoryContext metricsMemoryContext,
+												  int numTtlIndexEntries);
+extern CreateTtlMetricsContext_HookType create_ttl_metrics_context_hook;
+
+
+/*
+ * Hook for recording a single TTL metric entry after a batch delete.
+ * Called after each batch deletion to pass individual metric values
+ * to the implementation layer for aggregation.
+ */
+typedef void (*RecordTtlMetric_HookType)(void *metricsContext,
+										 uint64 collectionId,
+										 uint64 indexId,
+										 uint64 shardId,
+										 const char *indexName,
+										 double saturationRatio,
+										 double batchDeleteElapsedTimeMs,
+										 uint64 rowsDeleted);
+extern RecordTtlMetric_HookType record_ttl_metric_hook;
+
+
+/*
+ * Hook for finalizing TTL metrics aggregation after the TTL purge loop completes.
+ */
+typedef void (*FinalizeTtlMetrics_HookType)(void *metricsContext);
+extern FinalizeTtlMetrics_HookType finalize_ttl_metrics_hook;
 
 #endif

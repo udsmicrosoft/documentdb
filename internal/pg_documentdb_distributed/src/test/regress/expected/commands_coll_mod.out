@@ -37,7 +37,7 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('commands', '{"cr
 
 -- Top level validations for collMod index options
 SELECT documentdb_api.coll_mod(NULL, 'collModTest', '{"collMod": "collModTest", "index": {}}');
-ERROR:  Database name must not be NULL
+ERROR:  Must specify either index name or key pattern.
 SELECT documentdb_api.coll_mod('commands', NULL, '{"collMod": "collModTest", "index": {}}');
 ERROR:  collection name cannot be NULL
 SELECT documentdb_api.coll_mod('commands', 'collModTest', '{"collMod": "collModTest", "hello": 1}'); -- Unknown field
@@ -187,9 +187,9 @@ SELECT documentdb_api.coll_mod('commands', 'collModTest',
 SELECT * FROM documentdb_api_catalog.collection_indexes
     WHERE (index_spec).index_name = 'b_ttl' AND
     (index_spec).index_expire_after_seconds = 2; -- After update
- collection_id | index_id |                         index_spec                         | index_is_valid 
+ collection_id | index_id |                                                     index_spec                                                      | index_is_valid 
 ---------------------------------------------------------------------
-         25001 |    25003 | (b_ttl,"{ ""b"" : { ""$numberInt"" : ""1"" } }",,,,,2,2,,) | t
+         25001 |    25003 | (b_ttl,"{ ""b"" : { ""$numberInt"" : ""1"" } }",,,,,2,2,,"{ ""enableOrderedIndex"" : { ""$numberInt"" : ""1"" } }") | t
 (1 row)
 
 SELECT pg_sleep(2);

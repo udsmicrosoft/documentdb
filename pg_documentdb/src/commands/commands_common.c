@@ -21,6 +21,7 @@
 #include "io/bson_core.h"
 #include "collation/collation.h"
 #include "commands/commands_common.h"
+#include "commands/parse_error.h"
 #include "utils/error_utils.h"
 #include "utils/documentdb_errors.h"
 #include "aggregation/bson_query.h"
@@ -269,6 +270,64 @@ IsCommonSpecIgnoredField(const char *fieldName)
 									 NumberOfIgnoredFields,
 									 sizeof(char *), CompareStringsCaseInsensitive);
 	return (pItem != NULL);
+}
+
+
+/*
+ * When a BSON parsing loop encounters a "$db" field, this function extracts
+ * the database name and stores it in *databaseNameText if not already set.
+ * If already set, validates that the $db value matches the existing database name.
+ * The iterator must be positioned at the "$db" field.
+ */
+void
+ValidateOrExtractDatabaseNameTextFromSpec(bson_iter_t *iter, text **databaseNameText)
+{
+	uint32_t len = 0;
+	const char *dbName;
+
+	if (*databaseNameText != NULL)
+	{
+		/* Validate that $db matches the database name from the function argument */
+		if (EnableDbNameValidation)
+		{
+			EnsureTopLevelFieldType("$db", iter, BSON_TYPE_UTF8);
+			dbName = bson_iter_utf8(iter, &len);
+			StringView existingDbView = CreateStringViewFromText(*databaseNameText);
+			StringView dbView = CreateStringViewFromStringWithLength(dbName, len);
+			if (!StringViewEquals(&existingDbView, &dbView))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+								errmsg(
+									"$db in body does not match the database in the request: \"%.*s\" vs \"%.*s\"",
+									(int) len, dbName,
+									(int) existingDbView.length,
+									existingDbView.string)));
+			}
+		}
+
+		return;
+	}
+
+	EnsureTopLevelFieldType("$db", iter, BSON_TYPE_UTF8);
+	dbName = bson_iter_utf8(iter, &len);
+	*databaseNameText = cstring_to_text_with_len(dbName, len);
+}
+
+
+/*
+ * Datum-based wrapper around ValidateOrExtractDatabaseNameTextFromSpec for callers
+ * that pass the database name as a Datum (where 0 means unset).
+ */
+void
+ValidateOrExtractDatabaseNameFromSpec(bson_iter_t *iter, Datum *databaseNameDatum)
+{
+	text *dbText = (*databaseNameDatum != (Datum) 0) ?
+				   DatumGetTextP(*databaseNameDatum) : NULL;
+	ValidateOrExtractDatabaseNameTextFromSpec(iter, &dbText);
+	if (*databaseNameDatum == (Datum) 0 && dbText != NULL)
+	{
+		*databaseNameDatum = PointerGetDatum(dbText);
+	}
 }
 
 

@@ -33,4 +33,7 @@ typedef struct DistributedRunCommandResult
 
 /* Private: Feature flag for update tracking */
 typedef struct BsonUpdateTracker BsonUpdateTracker;
+typedef struct BsonUpdateSource BsonUpdateSource;
+typedef enum CommandUpdateType CommandUpdateType;
+
 #endif

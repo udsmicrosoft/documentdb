@@ -20,6 +20,7 @@
 #include <utils/builtins.h>
 
 #include "utils/documentdb_errors.h"
+#include "commands/commands_common.h"
 #include "metadata/collection.h"
 #include "metadata/metadata_cache.h"
 #include "metadata/index.h"
@@ -87,19 +88,14 @@ command_validate(PG_FUNCTION_ARGS)
 {
 	ValidateSpec validateSpec = { 0 };
 
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("Database name must not be NULL")));
-	}
-	validateSpec.databaseName = text_to_cstring(PG_GETARG_TEXT_P(0));
-
 	if (PG_ARGISNULL(1))
 	{
-		ereport(ERROR, (errmsg("The provided namespace value '%s' is not valid.",
-							   validateSpec.databaseName)));
+		ereport(ERROR, (errmsg("The provided namespace value is not valid.")));
 	}
 
 	pgbson *validationBsonSpec = PG_GETARG_PGBSON(1);
+	Datum databaseNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
+
 	bson_iter_t validateIter;
 	PgbsonInitIterator(validationBsonSpec, &validateIter);
 
@@ -119,6 +115,10 @@ command_validate(PG_FUNCTION_ARGS)
 			EnsureTopLevelFieldType("validate", &validateIter, BSON_TYPE_UTF8);
 			validateSpec.collectionName = value->value.v_utf8.str;
 		}
+		else if (StringViewEqualsCString(&keyView, "$db"))
+		{
+			ValidateOrExtractDatabaseNameFromSpec(&validateIter, &databaseNameDatum);
+		}
 		else if (StringViewEqualsCString(&keyView, "full"))
 		{
 			validateSpec.full = BsonValueAsBool(value);
@@ -132,6 +132,12 @@ command_validate(PG_FUNCTION_ARGS)
 			validateSpec.metadata = BsonValueAsBool(value);
 		}
 	}
+
+	if (databaseNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errmsg("Database name must not be NULL")));
+	}
+	validateSpec.databaseName = TextDatumGetCString(databaseNameDatum);
 
 	if (validateSpec.collectionName == NULL || strlen(validateSpec.collectionName) == 0)
 	{

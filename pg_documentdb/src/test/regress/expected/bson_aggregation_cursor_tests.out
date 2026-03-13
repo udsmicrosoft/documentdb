@@ -433,6 +433,19 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pa
                                                                                                                                                                                                                                             |         |                                                                                                                                                                                                                    | f
 (6 rows)
 
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+                                                                                                                filtereddoc                                                                                                                 | docsize |                                                                                                continuationfiltered                                                                                                | persistconnection 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "1" }, { "$numberInt" : "2" } ] } | 1200148 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | t
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "3" }, { "$numberInt" : "4" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "5" }, { "$numberInt" : "6" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "7" }, { "$numberInt" : "8" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "9" }, { "$numberInt" : "10" } ] }         | 1200147 |                                                                                                                                                                                                                    | f
+                                                                                                                                                                                                                                            |         |                                                                                                                                                                                                                    | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 1, pageSize => 100000, pipeline => '{ "": [{ "$match": { "_id": { "$gt": 2 }} }, { "$limit": 1 }]}');
                                                                                                 filtereddoc                                                                                                | docsize | continuationfiltered | persistconnection 
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------+----------------------+-------------------
@@ -583,6 +596,19 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pa
                                                                                                                                                                                                                                             |         |                                                                                                                                                                                                                    | f
 (6 rows)
 
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+                                                                                                                filtereddoc                                                                                                                 | docsize |                                                                                                continuationfiltered                                                                                                | persistconnection 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "1" }, { "$numberInt" : "2" } ] } | 1200148 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "3" }, { "$numberInt" : "4" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "5" }, { "$numberInt" : "6" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "7" }, { "$numberInt" : "8" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "9" }, { "$numberInt" : "10" } ] }         | 1200147 |                                                                                                                                                                                                                    | f
+                                                                                                                                                                                                                                            |         |                                                                                                                                                                                                                    | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 ROLLBACK;
 -- with sharded
 SELECT documentdb_api.shard_collection('db', 'get_aggregation_cursor_test', '{ "_id": "hashed" }', false);
@@ -742,6 +768,19 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pa
                                                                                                                                                                                                                                              |         |                                                                                                                                                                                                                    | f
 (6 rows)
 
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+                                                                                                                 filtereddoc                                                                                                                 | docsize |                                                                                                continuationfiltered                                                                                                | persistconnection 
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "6" }, { "$numberInt" : "4" } ] }  | 1200148 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | t
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "1" }, { "$numberInt" : "8" } ] }  | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "7" }, { "$numberInt" : "2" } ] }  | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "3" }, { "$numberInt" : "10" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "9" }, { "$numberInt" : "5" } ] }           | 1200147 |                                                                                                                                                                                                                    | f
+                                                                                                                                                                                                                                             |         |                                                                                                                                                                                                                    | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 6, pageSize => 2, pipeline => '{ "": [{ "$unwind": "$c" }, { "$limit": 10 }] }', collection_name => 'get_aggregation_cursor_smalldoc_test');
                                                                                                                      filtereddoc                                                                                                                     | docsize |                                                                                                continuationfiltered                                                                                                | persistconnection 
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------------------
@@ -881,6 +920,19 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pa
                                                                                                                                                                                                                                              |         |                                                                                                                                                                                                                    | f
 (6 rows)
 
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+                                                                                                                 filtereddoc                                                                                                                 | docsize |                                                                                                continuationfiltered                                                                                                | persistconnection 
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "6" }, { "$numberInt" : "4" } ] }  | 1200148 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "1" }, { "$numberInt" : "8" } ] }  | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "7" }, { "$numberInt" : "2" } ] }  | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "3" }, { "$numberInt" : "10" } ] } | 1200147 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "9" }, { "$numberInt" : "5" } ] }           | 1200147 |                                                                                                                                                                                                                    | f
+                                                                                                                                                                                                                                             |         |                                                                                                                                                                                                                    | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 6, pageSize => 2, pipeline => '{ "": [{ "$unwind": "$c" }, { "$limit": 10 }] }', collection_name => 'get_aggregation_cursor_smalldoc_test');
                                                                                                                      filtereddoc                                                                                                                     | docsize |                                                                                                continuationfiltered                                                                                                | persistconnection 
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-------------------
@@ -895,34 +947,34 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 6, pa
 
 ROLLBACK;
 -- test for errors when returnKey is set to true
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "db" }');
 ERROR:  The key returnKey is currently not supported
 -- test for no errors when returnKey is set to false
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : false, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : false, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "db" }');
                                                            cursorpage                                                           
 --------------------------------------------------------------------------------------------------------------------------------
  { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.movies", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
 (1 row)
 
 -- test for errors when returnKey and showRecordId are set to true
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "showRecordId": true, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "showRecordId": true, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "db" }');
 ERROR:  The key showRecordId is currently not supported
 -- test for ntoreturn in find command with unset documentdb.version
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies",  "limit" : 1,  "batchSize" : 1, "ntoreturn":1 ,"$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies",  "limit" : 1,  "batchSize" : 1, "ntoreturn":1 ,"$db" : "db" }');
 ERROR:  'limit' or 'batchSize' fields can not be set with 'ntoreturn' field
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 ,"$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 ,"$db" : "db" }');
                                                            cursorpage                                                           
 --------------------------------------------------------------------------------------------------------------------------------
  { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.movies", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
 (1 row)
 
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "batchSize":1, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "batchSize":1, "$db" : "db" }');
                                                            cursorpage                                                           
 --------------------------------------------------------------------------------------------------------------------------------
  { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.movies", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
 (1 row)
 
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "limit":1, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "limit":1, "$db" : "db" }');
                                                            cursorpage                                                           
 --------------------------------------------------------------------------------------------------------------------------------
  { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.movies", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
@@ -1140,3 +1192,50 @@ SELECT cursorPage FROM cursor_get_more(database => 'db',
 (1 row)
 
 ROLLBACK;
+-- Regression test for GitHub issue documentdb#484: crash in pg_get_querydef
+-- when called after pg_plan_query mutates the query tree.
+-- Exercise different cursor types with enableDebugQueryText on non-existent collection.
+SET documentdb.enableDebugQueryText TO on;
+SELECT document FROM documentdb_api.count_query('db', '{ "count": "nonexistent_coll_484" }');
+                               document                               
+----------------------------------------------------------------------
+ { "n" : { "$numberInt" : "0" }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- Streamable cursor (simple find, no sort/skip/limit)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {} }');
+                                                                  cursorpage                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.nonexistent_coll_484", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- SingleBatch cursor (find with limit 1)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {}, "limit": 1 }');
+                                                                  cursorpage                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.nonexistent_coll_484", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- Persistent cursor (find with sort)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {}, "sort": {"a": 1} }');
+NOTICE:  There are open held portals. Closing them
+                                                                  cursorpage                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.nonexistent_coll_484", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- PointRead cursor (find by _id on non-existent collection, falls back to Streamable)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {"_id": 1} }');
+                                                                  cursorpage                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.nonexistent_coll_484", "firstBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+-- PointRead cursor (find by _id on existing collection with _id index)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "get_aggregation_cursor_smalldoc_test", "filter": {"_id": 1} }');
+                                                                                                                                                                        cursorpage                                                                                                                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_smalldoc_test", "firstBatch" : [ { "_id" : { "$numberInt" : "1" }, "a" : "SampleSampleSampleSampleSampleSampleSampleSampleSampleSample", "c" : [ "aaaaaaaaaa", "aaaaaaaaaa", "aaaaaaaaaa", "aaaaaaaaaa", "aaaaaaaaaa", "d" ] } ] }, "ok" : { "$numberDouble" : "1.0" } }
+(1 row)
+
+SET documentdb.enableDebugQueryText TO off;

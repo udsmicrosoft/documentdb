@@ -35,7 +35,6 @@ SELECT documentdb_api.insert_one('db','queryuniquecomposite','{"_id":"8", "a": {
 BEGIN;
 set local documentdb.forceUseIndexIfAvailable to on;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'queryuniquecomposite') WHERE document @@ '{ "a.b": { "$gt": 5 } }';
 ROLLBACK;
 

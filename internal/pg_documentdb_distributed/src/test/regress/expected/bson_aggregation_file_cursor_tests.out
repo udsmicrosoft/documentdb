@@ -407,6 +407,20 @@ SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 
                                                                                                                                                                                                                                                  |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
 (6 rows)
 
+-- $max with file cursor - test with new aggregate implementation
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+                                                                                                                   filtereddoc                                                                                                                   | docsize |                                                                                                                                                                                  continuationfiltered                                                                                                                                                                                  | persistconnection 
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "1" }, { "$numberInt" : "2" } ] } | 1200153 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "3" }, { "$numberInt" : "4" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAC8TxIA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "5" }, { "$numberInt" : "6" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAB4nyQA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "7" }, { "$numberInt" : "8" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAA07zYA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "9" }, { "$numberInt" : "10" } ] }         | 1200152 |                                                                                                                                                                                                                                                                                                                                                                                        | f
+                                                                                                                                                                                                                                                 |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 1, pageSize => 100000, pipeline => '{ "": [{ "$match": { "_id": { "$gt": 2 }} }, { "$limit": 1 }]}');
                                                                                                   filtereddoc                                                                                                   | docsize | continuationfiltered | persistconnection 
 ---------------------------------------------------------------------
@@ -557,6 +571,20 @@ SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 
                                                                                                                                                                                                                                                  |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
 (6 rows)
 
+-- $max with local execution off - test with new aggregate implementation
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+                                                                                                                   filtereddoc                                                                                                                   | docsize |                                                                                                                                                                                  continuationfiltered                                                                                                                                                                                  | persistconnection 
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "1" }, { "$numberInt" : "2" } ] } | 1200153 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "3" }, { "$numberInt" : "4" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAC8TxIA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "5" }, { "$numberInt" : "6" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAB4nyQA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "7" }, { "$numberInt" : "8" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAA07zYA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "9" }, { "$numberInt" : "10" } ] }         | 1200152 |                                                                                                                                                                                                                                                                                                                                                                                        | f
+                                                                                                                                                                                                                                                 |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 RESET citus.enable_local_execution;
 -- with sharded
 SELECT documentdb_api.shard_collection('db', 'get_aggregation_cursor_test_file', '{ "_id": "hashed" }', false);
@@ -716,6 +744,20 @@ SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 
                                                                                                                                                                                                                                                  |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
 (6 rows)
 
+-- $max with sharded file cursor - test with new aggregate implementation
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+                                                                                                                   filtereddoc                                                                                                                   | docsize |                                                                                                                                                                                  continuationfiltered                                                                                                                                                                                  | persistconnection 
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "6" }, { "$numberInt" : "8" } ] } | 1200153 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "5" }, { "$numberInt" : "7" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAC8TxIA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "9" }, { "$numberInt" : "3" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAB4nyQA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "2" }, { "$numberInt" : "4" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAA07zYA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "$numberInt" : "10" }, { "$numberInt" : "1" } ] }         | 1200152 |                                                                                                                                                                                                                                                                                                                                                                                        | f
+                                                                                                                                                                                                                                                 |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 -- With local execution off.
 set citus.enable_local_execution to off;
 SELECT * FROM aggregation_cursor_test_file.drain_find_query(loopCount => 5, pageSize => 100000, skipVal => 2, obfuscate_id => true);
@@ -843,6 +885,20 @@ SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 
                                                                                                                                                                                                                                |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
 (6 rows)
 
+-- $max with file cursor sharded - test with new aggregate implementation
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test_file.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }', obfuscate_id => true);
+                                                                                                          filtereddoc                                                                                                          | docsize |                                                                                                                                                                                  continuationfiltered                                                                                                                                                                                  | persistconnection 
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "a" : "1" }, { "a" : "1" } ] } | 1200153 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "a" : "1" }, { "a" : "1" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAC8TxIA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "a" : "1" }, { "a" : "1" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAB4nyQA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "4294967294" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "a" : "1" }, { "a" : "1" } ] } | 1200152 | { "qi" : { "$numberLong" : "4294967294" }, "qp" : true, "qk" : { "$numberInt" : "2" }, "qn" : "cursor_4294967294", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3Mjk0AAAAAAAAAAAAAAAAAAAAAAAAAAA07zYA8D5JAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+ { "cursor" : { "id" : { "$numberLong" : "0" }, "ns" : "db.get_aggregation_cursor_test_file" }, "ok" : { "$numberDouble" : "1.0" }, "batchCount" : { "$numberInt" : "2" }, "ids" : [ { "a" : "1" }, { "a" : "1" } ] }          | 1200152 |                                                                                                                                                                                                                                                                                                                                                                                        | f
+                                                                                                                                                                                                                               |         |                                                                                                                                                                                                                                                                                                                                                                                        | f
+(6 rows)
+
+SET documentdb.enableNewMinMaxAccumulators TO off;
 RESET citus.enable_local_execution;
 -- start draining first page first (should not persist connection and have a query file)
 SELECT cursorPage, continuation, persistConnection FROM
@@ -949,3 +1005,111 @@ SELECT cursorPage, continuation, persistConnection FROM
 SELECT cursorPage, continuation, persistConnection FROM
     documentdb_api.find_cursor_first_page(database => 'db', commandSpec => '{ "find": "get_aggregation_cursor_test_file", "skip": 1, "batchSize": 2, "projection": { "_id": 1 } }', cursorId => 4294967298);
 ERROR:  Could not reserve a cursor - all cursors are in use and not expired
+set documentdb.maxCursorFileCount to 100;
+-- create a cursor but don't drain it.
+SELECT cursorPage, continuation, persistConnection FROM
+    documentdb_api.find_cursor_first_page(database => 'db', commandSpec => '{ "find": "get_aggregation_cursor_test_file", "skip": 1, "batchSize": 2, "projection": { "_id": 1 } }', cursorId => 4294967280);
+                                                                                                               cursorpage                                                                                                                |                                                                                                                                                                                      continuation                                                                                                                                                                                      | persistconnection 
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967280" }, "ns" : "db.get_aggregation_cursor_test_file", "firstBatch" : [ { "_id" : { "$numberInt" : "6" } }, { "_id" : { "$numberInt" : "2" } } ] }, "ok" : { "$numberDouble" : "1.0" } } | { "qi" : { "$numberLong" : "4294967280" }, "qp" : true, "qk" : { "$numberInt" : "1" }, "qn" : "cursor_4294967280", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3MjgwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzRgAAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE } | f
+(1 row)
+
+-- query the cursor file (it should be there)
+SELECT * FROM pg_ls_dir('pg_documentdb_cursor_files') f WHERE f LIKE '%4294967280%' ORDER BY 1;
+         f         
+---------------------------------------------------------------------
+ cursor_4294967280
+(1 row)
+
+-- sleep 4 seconds
+SELECT pg_sleep(4);
+ pg_sleep 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+-- now prune based on a 1s timeout - should prune the file.
+SELECT documentdb_api_internal.cursor_directory_cleanup(2);
+ cursor_directory_cleanup 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+-- now the cursor file doesn't exist.
+SELECT * FROM pg_ls_dir('pg_documentdb_cursor_files') f WHERE f LIKE '%4294967280%' ORDER BY 1;
+ f 
+---------------------------------------------------------------------
+(0 rows)
+
+-- now repeat this but sleep for the scenario for idleness with getmore.
+-- now start a new query
+SELECT continuation AS continuation_drain1 FROM
+    documentdb_api.find_cursor_first_page(database => 'db', commandSpec => '{ "find": "get_aggregation_cursor_test_file", "skip": 1, "batchSize": 2, "projection": { "_id": 1 } }', cursorId => 4294967280) \gset
+SELECT * FROM pg_ls_dir('pg_documentdb_cursor_files') f WHERE f LIKE '%4294967280%' ORDER BY 1;
+         f         
+---------------------------------------------------------------------
+ cursor_4294967280
+(1 row)
+
+-- sleep 1 and access it 4 times
+SELECT pg_sleep(1);
+ pg_sleep 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT cursorPage, continuation FROM documentdb_api.cursor_get_more(database => 'db', getMoreSpec => '{ "getMore": { "$numberLong": "4294967280" }, "collection": "get_aggregation_cursor_test_file",  "batchSize": 0 }', continuationSpec => :'continuation_drain1');
+                                                                            cursorpage                                                                            |                                                                                                                                                                                      continuation                                                                                                                                                                                      
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967280" }, "ns" : "db.get_aggregation_cursor_test_file", "nextBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } } | { "qi" : { "$numberLong" : "4294967280" }, "qp" : true, "qk" : { "$numberInt" : "1" }, "qn" : "cursor_4294967280", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3MjgwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzRgAAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE }
+(1 row)
+
+SELECT pg_sleep(1);
+ pg_sleep 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT cursorPage, continuation FROM documentdb_api.cursor_get_more(database => 'db', getMoreSpec => '{ "getMore": { "$numberLong": "4294967280" }, "collection": "get_aggregation_cursor_test_file",  "batchSize": 0 }', continuationSpec => :'continuation_drain1');
+                                                                            cursorpage                                                                            |                                                                                                                                                                                      continuation                                                                                                                                                                                      
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967280" }, "ns" : "db.get_aggregation_cursor_test_file", "nextBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } } | { "qi" : { "$numberLong" : "4294967280" }, "qp" : true, "qk" : { "$numberInt" : "1" }, "qn" : "cursor_4294967280", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3MjgwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzRgAAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE }
+(1 row)
+
+SELECT pg_sleep(1);
+ pg_sleep 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT cursorPage, continuation FROM documentdb_api.cursor_get_more(database => 'db', getMoreSpec => '{ "getMore": { "$numberLong": "4294967280" }, "collection": "get_aggregation_cursor_test_file", "batchSize": 0 }', continuationSpec => :'continuation_drain1');
+                                                                            cursorpage                                                                            |                                                                                                                                                                                      continuation                                                                                                                                                                                      
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967280" }, "ns" : "db.get_aggregation_cursor_test_file", "nextBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } } | { "qi" : { "$numberLong" : "4294967280" }, "qp" : true, "qk" : { "$numberInt" : "1" }, "qn" : "cursor_4294967280", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3MjgwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzRgAAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE }
+(1 row)
+
+SELECT pg_sleep(1);
+ pg_sleep 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT cursorPage, continuation FROM documentdb_api.cursor_get_more(database => 'db', getMoreSpec => '{ "getMore": { "$numberLong": "4294967280" }, "collection": "get_aggregation_cursor_test_file", "batchSize": 0 }', continuationSpec => :'continuation_drain1');
+                                                                            cursorpage                                                                            |                                                                                                                                                                                      continuation                                                                                                                                                                                      
+---------------------------------------------------------------------
+ { "cursor" : { "id" : { "$numberLong" : "4294967280" }, "ns" : "db.get_aggregation_cursor_test_file", "nextBatch" : [  ] }, "ok" : { "$numberDouble" : "1.0" } } | { "qi" : { "$numberLong" : "4294967280" }, "qp" : true, "qk" : { "$numberInt" : "1" }, "qn" : "cursor_4294967280", "qf" : { "$binary" : { "base64" : "MAEAAHBnX2RvY3VtZW50ZGJfY3Vyc29yX2ZpbGVzL2N1cnNvcl80Mjk0OTY3MjgwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzRgAAA==", "subType" : "00" } }, "numIters" : { "$numberInt" : "0" }, "sn" : NOW_SYS_VARIABLE }
+(1 row)
+
+-- now it's been at least 3 seconds, if we prune with a 2 second timeout, it should still not be pruned since getMore updated modified time.
+SELECT documentdb_api_internal.cursor_directory_cleanup(2);
+ cursor_directory_cleanup 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+SELECT * FROM pg_ls_dir('pg_documentdb_cursor_files') f WHERE f LIKE '%4294967280%' ORDER BY 1;
+         f         
+---------------------------------------------------------------------
+ cursor_4294967280
+(1 row)
+

@@ -208,6 +208,7 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_AGGREGATE_GROUP_BOTTOM_N] = "group_bottom_n",
 	[FEATURE_AGGREGATE_GROUP_CONCAT_ARRAYS] = "group_concat_arrays",
 	[FEATURE_AGGREGATE_GROUP_COUNT] = "group_count",
+	[FEATURE_AGGREGATE_GROUP_COUNT_WITH_ARG] = "group_count_with_arg",
 	[FEATURE_AGGREGATE_GROUP_FIRST] = "group_first",
 	[FEATURE_AGGREGATE_GROUP_FIRST_N] = "group_first_n",
 	[FEATURE_AGGREGATE_GROUP_LAST] = "group_last",
@@ -418,6 +419,7 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_STAGE_GROUP] = "group",
 	[FEATURE_STAGE_GROUP_ACC_FIRSTN_GT10] = "firstN_acc_GT10",
 	[FEATURE_STAGE_GROUP_ACC_LASTN_GT10] = "lastN_acc_GT10",
+	[FEATURE_STAGE_GROUP_DUPLICATE_ID] = "group_duplicate_id",
 	[FEATURE_STAGE_INDEXSTATS] = "indexStats",
 	[FEATURE_STAGE_INTERNAL_INHIBIT_OPTIMIZATION] = "_internalInhibitOptimization",
 	[FEATURE_STAGE_INVERSEMATCH] = "inverseMatch",
@@ -475,11 +477,6 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_UPDATE_OPERATOR_SET_ON_INSERT] = "update_operator_set_on_insert",
 	[FEATURE_UPDATE_OPERATOR_UNSET] = "update_operator_unset",
 
-	/* Feature usage stats */
-	[FEATURE_USAGE_TTL_PURGER_CALLS] = "ttl_purger_calls",
-	[FEATURE_USAGE_TTL_SATURATED_BATCHES] = "ttl_saturated_batches",
-	[FEATURE_USAGE_TTL_SLOW_BATCHES] = "ttl_slow_batches",
-
 	/* Feature mapping region - User CRUD*/
 	[FEATURE_USER_CREATE] = "user_create",
 	[FEATURE_USER_DROP] = "user_drop",
@@ -521,8 +518,11 @@ SharedFeatureCounterShmemSize(void)
 void
 SharedFeatureCounterShmemInit(void)
 {
+	/* Split into two asserts so the error message tells which direction to fix. */
 	StaticAssertExpr(MAX_FEATURE_INDEX < MAX_FEATURE_COUNT,
 					 "feature enums should be less than size - bump up MAX_FEATURE_COUNT");
+	StaticAssertExpr(MAX_FEATURE_INDEX + 1 <= MAX_FEATURE_COUNT,
+					 "MAX_FEATURE_COUNT is too large - reduce it to MAX_FEATURE_INDEX + 1");
 
 	/* Validate that we have names for the feature counters as well */
 	for (int i = 0; i < MAX_FEATURE_INDEX; i++)

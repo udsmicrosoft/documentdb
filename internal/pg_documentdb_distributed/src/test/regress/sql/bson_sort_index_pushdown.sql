@@ -7,8 +7,6 @@ SET citus.next_shard_id TO 9640000;
 SET documentdb.next_collection_id TO 964000;
 SET documentdb.next_collection_index_id TO 964000;
 
-SET documentdb.enableIndexOrderbyPushdown = 'on';
-
 DO $$
 DECLARE i int;
 DECLARE a int;
@@ -73,7 +71,6 @@ reset documentdb.enableOrderByIdOnCostFunction;
 
 SELECT documentdb_distributed_test_helpers.get_feature_counter_pretty(true);
 BEGIN;
-SET LOCAL documentdb.enableIndexOrderbyPushdown = 'false';
 ---- should not use  Index Scan using _id_ 
 EXPLAIN (COSTS OFF, TIMING OFF, ANALYZE ON, SUMMARY OFF) SELECT document FROM bson_aggregation_find('sort_pushdown', '{ "find": "coll", "filter": {"a": {"$eq": 14}}, "sort": {"_id": 1}, "limit": 20 }');
 
@@ -108,7 +105,6 @@ CALL documentdb_api.drop_indexes('sort_pushdown', '{ "dropIndexes": "coll", "ind
 ANALYZE documentdb_data.documents_964001;
 
 BEGIN;
-SET LOCAL documentdb.enableIndexOrderbyPushdown = 'true';
 EXPLAIN (COSTS OFF, TIMING OFF, ANALYZE ON, SUMMARY OFF) SELECT document FROM bson_aggregation_find('sort_pushdown', '{ "find": "coll", "filter": {"a": {"$eq": 14}}, "sort": {"_id": 1}, "limit": 20 }');
 
 -- or should push down to the shards and use object_id

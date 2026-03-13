@@ -5,7 +5,6 @@ SET documentdb.next_collection_id TO 68700;
 SET documentdb.next_collection_index_id TO 68700;
 
 set documentdb.enableExtendedExplainPlans to on;
-set documentdb.enableIndexOrderbyPushdown to on;
 
 -- if documentdb_extended_rum exists, set alternate index handler
 SELECT pg_catalog.set_config('documentdb.alternate_index_handler_name', 'extended_rum', false), extname FROM pg_extension WHERE extname = 'documentdb_extended_rum';
@@ -66,14 +65,12 @@ EXPLAIN (COSTS OFF, ANALYZE ON, TIMING OFF, SUMMARY OFF) SELECT document FROM bs
 BEGIN;
 set local enable_bitmapscan to off;
 set local enable_seqscan to off;
-set local documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN (COSTS OFF, ANALYZE ON, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_find('comp_pfe', '{ "find": "query_orderby_pfe", "filter": { "e": 10 }, "sort": { "e": 1 } }');
 ROLLBACK;
 
 BEGIN;
 set local enable_bitmapscan to off;
 set local enable_seqscan to off;
-set local documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN (COSTS OFF, ANALYZE ON, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_find('comp_pfe', '{ "find": "query_orderby_pfe", "filter": { "f": { "$gt": 10 } }, "sort": { "f": 1 } }');
 ROLLBACK;
 

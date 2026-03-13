@@ -93,7 +93,6 @@ SELECT documentdb_api.insert_one('db','queryuniqueindex','{"_id":"8", "a": { "b"
 BEGIN;
 set local documentdb.forceUseIndexIfAvailable to on;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'queryuniqueindex') WHERE document @@ '{ "a.b": { "$gt": 5 } }';
                                                              QUERY PLAN                                                              
 ---------------------------------------------------------------------

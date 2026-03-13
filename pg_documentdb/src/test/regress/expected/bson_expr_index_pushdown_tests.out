@@ -237,6 +237,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                                                                                                                     run_explain_and_trim                                                                                                                    
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=997 loops=1)
+   namespaceName: exprdb.exprcoll
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -247,7 +248,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
          Heap Blocks: exact=11
          ->  Bitmap Index Scan on a_1 (actual rows=998 loops=1)
                Index Cond: (document @>= '{ "a" : { "$numberInt" : "3" } }'::bson)
-(11 rows)
+(12 rows)
 
 -- now try with $lookup
 SELECT COUNT(documentdb_api.insert_one('exprdb', 'exprcollright', bson_build_document('_id'::text, i, 'a'::text, i, 'b'::text, i))) FROM generate_series(1, 1000) i;
@@ -271,6 +272,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Nested Loop (actual rows=991 loops=1)
    ->  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=991 loops=1)
+         namespaceName: exprdb.exprcoll
          indexName: a_1
          indexKey: {"a": 1}
          isMultiKey: false
@@ -282,6 +284,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                      Index Cond: (document @>= '{ "a" : { "$numberInt" : "10" } }'::bson)
    ->  Aggregate (actual rows=1 loops=991)
          ->  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=1 loops=991)
+               namespaceName: exprdb.exprcollright
                indexName: a_1
                indexKey: {"a": 1}
                isMultiKey: false
@@ -291,7 +294,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                      Heap Blocks: exact=991
                      ->  Bitmap Index Scan on a_1 (actual rows=1 loops=991)
                            Index Cond: (document @*= documentdb_api_internal.bson_dollar_lookup_extract_filter_expression(collection.document, '{ "a" : "a" }'::bson))
-(22 rows)
+(24 rows)
 
 -- lookup with let
 SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
@@ -301,6 +304,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Nested Loop (actual rows=991 loops=1)
    ->  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=991 loops=1)
+         namespaceName: exprdb.exprcoll
          indexName: a_1
          indexKey: {"a": 1}
          isMultiKey: false
@@ -312,6 +316,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                      Index Cond: (document @>= '{ "a" : { "$numberInt" : "10" } }'::bson)
    ->  Aggregate (actual rows=1 loops=991)
          ->  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=1 loops=991)
+               namespaceName: exprdb.exprcollright
                indexName: a_1
                indexKey: {"a": 1}
                isMultiKey: false
@@ -321,7 +326,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                      Heap Blocks: exact=991
                      ->  Bitmap Index Scan on a_1 (actual rows=1 loops=991)
                            Index Cond: (document @= documentdb_api_internal.bson_expression_get('{ }'::bson, '{ "a" : "$$myvar" }'::bson, true, documentdb_api_internal.bson_dollar_lookup_expression_eval_merge(collection.document, '{ "myvar" : "$a" }'::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson)))
-(22 rows)
+(24 rows)
 
 -- composite with partial $expr to the index
 SELECT documentdb_api_internal.create_indexes_non_concurrently('exprdb', '{ "createIndexes": "exprcoll", "indexes": [ { "key": { "a": 1, "b": 1, "c": 1, "d": 1 }, "name": "abcd_1", "enableOrderedIndex": true }] }', TRUE);
@@ -335,6 +340,7 @@ EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('exprdb',
                                                                                                                           QUERY PLAN                                                                                                                           
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan)
+   namespaceName: exprdb.exprcoll
    indexName: abcd_1
    indexKey: {"a": 1,"b": 1,"c": 1,"d": 1}
    isMultiKey: false
@@ -342,7 +348,7 @@ EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('exprdb',
    ->  Index Scan using abcd_1 on documents_201 collection
          Index Cond: ((document @= '{ "a" : { "$numberInt" : "5" } }'::bson) AND (document @= '{ "b" : { "$numberInt" : "5" } }'::bson) AND (document @= '{ "c" : { "$numberInt" : "5" } }'::bson) AND (document @> '{ "d" : { "$numberInt" : "5" } }'::bson))
          Filter: documentdb_api_internal.bson_dollar_expr(document, '{ "" : { "$and" : [ { "$eq" : [ "$f", "$g" ] }, { "$gt" : [ "$d", { "$numberInt" : "5" } ] } ] } }'::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson)
-(8 rows)
+(9 rows)
 
 -- after adding a row with arrays, can no longer push down (multikey expr not supported)
 SELECT documentdb_api.insert_one('exprdb', 'exprcoll', '{ "_id": "array", "a": [ 1, 2, 3 ] }');

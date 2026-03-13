@@ -160,16 +160,11 @@ GenerateListCollectionsQuery(text *databaseDatum, pgbson *listCollectionsSpec,
 		}
 		else if (StringViewEqualsCString(&keyView, "$db"))
 		{
-			if (context.databaseNameDatum == NULL)
+			text *prevDb = context.databaseNameDatum;
+			ValidateOrExtractDatabaseNameTextFromSpec(&listCollectionsIter,
+													  &context.databaseNameDatum);
+			if (prevDb == NULL)
 			{
-				/* Extract the database out of $db */
-				EnsureTopLevelFieldType("$db", &listCollectionsIter, BSON_TYPE_UTF8);
-
-				uint32_t databaseLength = 0;
-				const char *databaseName = bson_iter_utf8(&listCollectionsIter,
-														  &databaseLength);
-				context.databaseNameDatum = cstring_to_text_with_len(databaseName,
-																	 databaseLength);
 				databaseDatum = context.databaseNameDatum;
 			}
 		}
@@ -247,16 +242,11 @@ GenerateListIndexesQuery(text *databaseDatum, pgbson *listIndexesSpec,
 		}
 		else if (StringViewEqualsCString(&keyView, "$db"))
 		{
-			if (context.databaseNameDatum == NULL)
+			text *prevDb = context.databaseNameDatum;
+			ValidateOrExtractDatabaseNameTextFromSpec(&listIndexesIter,
+													  &context.databaseNameDatum);
+			if (prevDb == NULL)
 			{
-				/* Extract the database out of $db */
-				EnsureTopLevelFieldType("$db", &listIndexesIter, BSON_TYPE_UTF8);
-
-				uint32_t databaseLength = 0;
-				const char *databaseName = bson_iter_utf8(&listIndexesIter,
-														  &databaseLength);
-				context.databaseNameDatum = cstring_to_text_with_len(databaseName,
-																	 databaseLength);
 				databaseDatum = context.databaseNameDatum;
 			}
 		}

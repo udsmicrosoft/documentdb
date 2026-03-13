@@ -1,0 +1,38 @@
+[config]
+default_to_workspace = false
+
+[tasks.format-check]
+command = "cargo"
+args = ["fmt", "--all", "--check"]
+
+[tasks.clippy]
+command = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--frozen", "--", "-D", "warnings"]
+
+[tasks.deny]
+command = "cargo"
+args = ["deny", "check", "bans"]
+
+[tasks.lint]
+dependencies = ["format-check", "clippy", "deny"]
+
+[tasks.build]
+command = "cargo"
+args = ["build", "--workspace"]
+
+[tasks.release-build]
+command = "cargo"
+args = ["build", "--frozen", "--profile=release-with-symbols"]
+
+[tasks.test]
+clear = true
+script_runner = "@shell"
+script = '''
+bash ../scripts/run_rust_tests_with_junit.sh "$CARGO_MAKE_WORKING_DIRECTORY"
+'''
+
+[tasks.dev]
+dependencies = ["build", "lint"]
+
+[tasks.release]
+dependencies = ["release-build", "lint"]

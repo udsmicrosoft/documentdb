@@ -49,7 +49,7 @@ ANALYZE documentdb_data.documents_4160;
 BEGIN;
 set local seq_page_cost to 5;
 set local rum.enable_semifast_gettuple to on;
-set local documentdb.enableNewSelectivityMode to on;
+set local documentdb.enableCompositeIndexPlanner to on;
 EXPLAIN (COSTS OFF, BUFFERS OFF, ANALYZE ON, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_find('db', '{ "find": "agg_pipeline_index_pushdown", "filter": { "accid": 1 }, "skip": 100, "limit": 100 }');
 ROLLBACK;
 
@@ -57,6 +57,6 @@ ROLLBACK;
 BEGIN;
 set local seq_page_cost to 5;
 set local rum.enable_semifast_gettuple to on;
-set local documentdb.enableNewSelectivityMode to on;
+set local documentdb.enableCompositeIndexPlanner to on;
 EXPLAIN (COSTS OFF, BUFFERS OFF, ANALYZE ON, TIMING OFF, SUMMARY OFF) SELECT document FROM bson_aggregation_find('db', '{ "find": "agg_pipeline_index_pushdown", "filter": { "accid": 1 }, "skip": 100, "limit": 100 }');
 ROLLBACK;

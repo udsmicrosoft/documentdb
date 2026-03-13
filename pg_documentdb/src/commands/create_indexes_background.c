@@ -681,24 +681,21 @@ ReindexOrCreateCommandCore(PG_FUNCTION_ARGS, char *internalQuery)
 Datum
 command_reindex_index_background(PG_FUNCTION_ARGS)
 {
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("dbName cannot be NULL")));
-	}
-
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("Argument value must not be NULL")));
 	}
 
-	text *databaseDatum = PG_GETARG_TEXT_P(0);
 	pgbson *indexSpec = PG_GETARG_PGBSON(1);
+
+	const char *databaseString = PG_ARGISNULL(0) ? "NULL" :
+								 quote_literal_cstr(text_to_cstring(PG_GETARG_TEXT_P(0)));
 
 	StringInfo submitIndexBuildRequestQuery = makeStringInfo();
 	appendStringInfo(submitIndexBuildRequestQuery,
 					 "SELECT %s.reindex_indexes_background_internal(%s,%s)",
 					 ApiInternalSchemaName,
-					 quote_literal_cstr(text_to_cstring(databaseDatum)),
+					 databaseString,
 					 quote_literal_cstr(PgbsonToHexadecimalString(indexSpec)));
 
 	PG_RETURN_DATUM(ReindexOrCreateCommandCore(fcinfo,
@@ -713,24 +710,19 @@ command_reindex_index_background(PG_FUNCTION_ARGS)
 Datum
 command_create_indexes_background(PG_FUNCTION_ARGS)
 {
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("dbName cannot be NULL")));
-	}
-
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("Argument value must not be NULL")));
 	}
 
-	text *databaseDatum = PG_GETARG_TEXT_P(0);
 	pgbson *indexSpec = PG_GETARG_PGBSON(1);
-
+	const char *databaseString = PG_ARGISNULL(0) ? "NULL" :
+								 quote_literal_cstr(text_to_cstring(PG_GETARG_TEXT_P(0)));
 	StringInfo submitIndexBuildRequestQuery = makeStringInfo();
 	appendStringInfo(submitIndexBuildRequestQuery,
 					 "SELECT %s.create_indexes_background_internal(%s,%s)",
 					 ApiInternalSchemaName,
-					 quote_literal_cstr(text_to_cstring(databaseDatum)),
+					 databaseString,
 					 quote_literal_cstr(PgbsonToHexadecimalString(indexSpec)));
 
 	PG_RETURN_DATUM(ReindexOrCreateCommandCore(fcinfo,
@@ -1154,7 +1146,7 @@ SubmitCreateIndexesRequest(Datum dbNameDatum,
 						   pgbson *createIndexesMessage, bool *volatile snapshotSet)
 {
 	bool buildAsUniqueForPrepareUnique = false;
-	CreateIndexesArg createIndexesArg = ParseCreateIndexesArg(dbNameDatum,
+	CreateIndexesArg createIndexesArg = ParseCreateIndexesArg(&dbNameDatum,
 															  createIndexesMessage,
 															  buildAsUniqueForPrepareUnique);
 

@@ -210,17 +210,19 @@ DrainSingleResultQuery(Query *query)
 	queryPortal->visible = false;
 	queryPortal->cursorOptions = cursorOptions;
 
-	ParamListInfo paramListInfo = NULL;
-	PlannedStmt *queryPlan = pg_plan_query(query, NULL, cursorOptions,
-										   paramListInfo);
-
-	/* Set the plan in the cursor for this iteration */
+	/* Deparse query text before planning since the planner may modify the query tree */
 	char *sourceText = "";
 	if (EnableDebugQueryText)
 	{
 		bool pretty = false;
 		sourceText = pg_get_querydef(query, pretty);
 	}
+
+	ParamListInfo paramListInfo = NULL;
+	PlannedStmt *queryPlan = pg_plan_query(query, NULL, cursorOptions,
+										   paramListInfo);
+
+	/* Set the plan in the cursor for this iteration */
 	PortalDefineQuery(queryPortal, NULL, sourceText,
 					  CMDTAG_SELECT,
 					  list_make1(queryPlan),
@@ -398,6 +400,14 @@ CreateAndDrainSingleBatchQuery(const char *cursorName, Query *query,
 	/* Save the context before doing SPI */
 	MemoryContext currentContext = CurrentMemoryContext;
 
+	/* Deparse query text before planning since the planner may modify the query tree */
+	char *sourceText = "";
+	if (EnableDebugQueryText)
+	{
+		bool pretty = false;
+		sourceText = pg_get_querydef(query, pretty);
+	}
+
 	/* Plan the query */
 	ParamListInfo paramList = NULL;
 	PlannedStmt *queryPlan = pg_plan_query(query, NULL, cursorOptions, paramList);
@@ -408,12 +418,6 @@ CreateAndDrainSingleBatchQuery(const char *cursorName, Query *query,
 		cursorName,
 		accumulatedSize,
 		closeCursor);
-	char *sourceText = "";
-	if (EnableDebugQueryText)
-	{
-		bool pretty = false;
-		sourceText = pg_get_querydef(query, pretty);
-	}
 	DrainStatementViaExecutor(queryPlan, paramList, sourceText, (DestReceiver *) receiver,
 							  currentContext);
 }
@@ -468,6 +472,14 @@ CreateAndDrainPersistedQuery(const char *cursorName, Query *query,
 	/* Save the context before doing SPI */
 	MemoryContext currentContext = CurrentMemoryContext;
 
+	/* Deparse query text before planning since the planner may modify the query tree */
+	char *sourceText = "";
+	if (EnableDebugQueryText)
+	{
+		bool pretty = false;
+		sourceText = pg_get_querydef(query, pretty);
+	}
+
 	/* Plan the query */
 	ParamListInfo paramList = NULL;
 	PlannedStmt *queryPlan = pg_plan_query(query, NULL, cursorOptions, paramList);
@@ -508,12 +520,6 @@ CreateAndDrainPersistedQuery(const char *cursorName, Query *query,
 	}
 
 	/* Set the plan into the portal  */
-	char *sourceText = "";
-	if (EnableDebugQueryText)
-	{
-		bool pretty = false;
-		sourceText = pg_get_querydef(query, pretty);
-	}
 	PortalDefineQuery(queryPortal, NULL, sourceText,
 					  CMDTAG_SELECT,
 					  list_make1(queryPlan),
@@ -586,6 +592,14 @@ CreateAndDrainPersistedQueryWithFiles(const char *cursorName, Query *query,
 	/* Save the context before doing SPI */
 	MemoryContext currentContext = CurrentMemoryContext;
 
+	/* Deparse query text before planning since the planner may modify the query tree */
+	char *sourceText = "";
+	if (EnableDebugQueryText)
+	{
+		bool pretty = false;
+		sourceText = pg_get_querydef(query, pretty);
+	}
+
 	/* Plan the query */
 	ParamListInfo paramList = NULL;
 	PlannedStmt *queryPlan = pg_plan_query(query, NULL, cursorOptions, paramList);
@@ -596,12 +610,6 @@ CreateAndDrainPersistedQueryWithFiles(const char *cursorName, Query *query,
 																			cursorName,
 																			accumulatedSize,
 																			closeCursor);
-	char *sourceText = "";
-	if (EnableDebugQueryText)
-	{
-		bool pretty = false;
-		sourceText = pg_get_querydef(query, pretty);
-	}
 	DrainStatementViaExecutor(queryPlan, paramList, sourceText, (DestReceiver *) receiver,
 							  currentContext);
 
@@ -628,6 +636,14 @@ CreateAndDrainPointReadQuery(const char *cursorName, Query *query,
 	/* Save the context before doing SPI */
 	MemoryContext currentContext = CurrentMemoryContext;
 
+	/* Deparse query text before planning since the planner may modify the query tree */
+	char *sourceText = "";
+	if (EnableDebugQueryText)
+	{
+		bool pretty = false;
+		sourceText = pg_get_querydef(query, pretty);
+	}
+
 	/* Plan the query */
 	ParamListInfo paramList = NULL;
 	PlannedStmt *queryPlan = TryCreatePointReadPlan(query);
@@ -645,12 +661,6 @@ CreateAndDrainPointReadQuery(const char *cursorName, Query *query,
 		batchSize, cursorName,
 		accumulatedSize,
 		closeCursor);
-	char *sourceText = "";
-	if (EnableDebugQueryText)
-	{
-		bool pretty = false;
-		sourceText = pg_get_querydef(query, pretty);
-	}
 	DrainStatementViaExecutor(queryPlan, paramList, sourceText,
 							  (DestReceiver *) receiver, currentContext);
 }
@@ -1243,13 +1253,15 @@ FetchTailableCursorAndWriteUntilPageOrSize(Portal portal, int32_t batchSize,
 
 			/*
 			 * For tailable cursors, if the cursor is terminated due to batch/size limit, just
-			 * return the continuation token, sicne the cursor is never fully drained for tailable
+			 * return the continuation token, since the cursor is never fully drained for tailable
 			 * cursors. we just stop here and return the last continuation token to the user
 			 * to resume the cursor at this point later.
 			 */
 			if (isCursorTerminated)
 			{
-				return continuationToken;
+				/* Return the last continuation token in the writer context. */
+				return CopyPgbsonIntoMemoryContext(continuationToken,
+												   writerContext);
 			}
 
 			/*

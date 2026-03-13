@@ -175,7 +175,6 @@ ROLLBACK;
 -- Adding a $sort that can be pushed down in the pipeline
 BEGIN;
 SET LOCAL enable_seqscan TO off;
-set local documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN(costs off) SELECT document from bson_aggregation_pipeline('compdb', 
   '{ "aggregate": "menu", "pipeline": [ { "$lookup": { "from": "establishments", "pipeline": [ { "$match": { "order_quantity": { "$gt": 110 } }}, { "$sort": { "establishment_name": 1 }}], "as": "matched_docs", "localField": "establishment_name", "foreignField": "establishment_name" }} ], "cursor": {} }');
 ROLLBACK;

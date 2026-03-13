@@ -6,7 +6,7 @@ SET search_path TO documentdb_core,documentdb_api,documentdb_api_catalog;
 SELECT documentdb_api_internal.create_indexes_non_concurrently('db', NULL, true);
 ERROR:  arg cannot be NULL
 SELECT documentdb_api_internal.create_indexes_non_concurrently(NULL, '{}', true);
-ERROR:  dbName cannot be NULL
+ERROR:  $db must be specified.
 SELECT documentdb_api_internal.create_indexes_non_concurrently('db', '{"createIndexes": "collection_1", "unknown_field": []}', true);
 ERROR:  BSON field 'createIndexes.unknown_field' is an unknown field
 SELECT documentdb_api_internal.create_indexes_non_concurrently('db', '{"createIndexes": null, "indexes": [{"key": {"a": 1, "": -1}, "name": "my_idx"}]}', true);
@@ -497,7 +497,7 @@ SELECT documentdb_api.insert_one('db','dropdups_ignore','{"_id": "2", "a": "dup"
 
 SELECT documentdb_api_internal.create_indexes_non_concurrently(p_arg=>'{"createIndexes": "dropdups_ignore", "indexes": [{"key": {"a": 1}, "name": "dropdups_ignore_idx_1", "dropDups": true, "unique": true }]}', p_database_name=>'db', p_skip_check_collection_create=>true);
 ERROR:  could not create exclusion constraint "documents_rum_index_11032_110068"
-DETAIL:  Key (document, (ROW(shard_key_value, document)::shard_key_and_document))=({ "_id" : "1", "a" : "dup" }, (11004,"{ ""_id"" : ""1"", ""a"" : ""dup"" }")) conflicts with key (document, (ROW(shard_key_value, document)::shard_key_and_document))=({ "_id" : "2", "a" : "dup" }, (11004,"{ ""_id"" : ""2"", ""a"" : ""dup"" }")).
+DETAIL:  Key (document, (ROW(shard_key_value, document)::documentdb_api_catalog.shard_key_and_document))=({ "_id" : "1", "a" : "dup" }, (11004,"{ ""_id"" : ""1"", ""a"" : ""dup"" }")) conflicts with key (document, (ROW(shard_key_value, document)::documentdb_api_catalog.shard_key_and_document))=({ "_id" : "2", "a" : "dup" }, (11004,"{ ""_id"" : ""2"", ""a"" : ""dup"" }")).
 CONTEXT:  SQL statement "ALTER TABLE documentdb_data.documents_11004 ADD CONSTRAINT documents_rum_index_11032 EXCLUDE USING documentdb_rum ( document documentdb_api_catalog.bson_rum_single_path_ops(path='a',generateNotFoundTerm=true) WITH OPERATOR(documentdb_api_catalog.=?=), ((shard_key_value, document)::documentdb_api_catalog.shard_key_and_document) documentdb_api_catalog.bson_rum_exclusion_ops(path='a') WITH OPERATOR(documentdb_api_catalog.=)) "
 select documentdb_api.delete('db', '{"delete":"dropdups_ignore", "deletes":[{"q":{"_id": "2"}, "limit": 0 } ] }');
                                          delete                                         

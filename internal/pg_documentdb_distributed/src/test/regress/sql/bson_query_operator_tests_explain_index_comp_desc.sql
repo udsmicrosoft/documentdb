@@ -39,7 +39,6 @@ set local documentdb.useLocalExecutionShardQueries to off;
 set local enable_seqscan TO off;
 set local documentdb.forceUseIndexIfAvailable to on;
 set local documentdb.enableExtendedExplainPlans to on;
-set local documentdb.forceRumIndexScanToBitmapHeapScan to off;
 
 \i sql/bson_query_operator_tests_explain_core.sql
 COMMIT;

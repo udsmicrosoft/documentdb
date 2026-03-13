@@ -18,7 +18,6 @@
 #include "query/bson_dollar_selectivity.h"
 #include "aggregation/bson_query_common.h"
 
-extern bool EnableNewOperatorSelectivityMode;
 extern bool EnableCompositeIndexPlanner;
 extern bool LowSelectivityForLookup;
 
@@ -94,7 +93,7 @@ GetDollarOperatorSelectivity(PlannerInfo *planner, Oid selectivityOpExpr,
 		}
 	}
 
-	if (!EnableNewOperatorSelectivityMode && !EnableCompositeIndexPlanner)
+	if (!EnableCompositeIndexPlanner)
 	{
 		return GetDisableStatisticSelectivity(args, defaultExprSelectivity);
 	}
@@ -179,7 +178,8 @@ GetStatisticsNoStatsData(List *args, Oid selectivityOpExpr, double defaultExprSe
 	{
 		case BSON_INDEX_STRATEGY_DOLLAR_EQUAL:
 		{
-			if (dollarElement.bsonValue.value_type == BSON_TYPE_NULL)
+			if (dollarElement.bsonValue.value_type == BSON_TYPE_NULL ||
+				dollarElement.bsonValue.value_type == BSON_TYPE_BOOL)
 			{
 				/* $eq: null matches paths that don't exist: presume normal selectivity */
 				return defaultExprSelectivity;
@@ -189,6 +189,7 @@ GetStatisticsNoStatsData(List *args, Oid selectivityOpExpr, double defaultExprSe
 			return LowSelectivity;
 		}
 
+		case BSON_INDEX_STRATEGY_DOLLAR_NOT_IN:
 		case BSON_INDEX_STRATEGY_DOLLAR_NOT_EQUAL:
 		{
 			return HighSelectivity;
@@ -227,6 +228,19 @@ GetStatisticsNoStatsData(List *args, Oid selectivityOpExpr, double defaultExprSe
 			if (rangeParams.isFullScan)
 			{
 				return 1.0;
+			}
+
+			if (rangeParams.isElemMatch)
+			{
+				int32_t elemMatchStrategy = BSON_INDEX_STRATEGY_INVALID;
+				bool hasEqualityPrefix = false;
+				bool hasNonEqualityPrefix = false;
+				ElemMatchIndexOpStrategyClassify(&rangeParams, &elemMatchStrategy,
+												 &hasEqualityPrefix,
+												 &hasNonEqualityPrefix);
+
+				/* If the elemMatch has an equality prefix, then we can assume the selectivity is similar to an equality match */
+				return hasEqualityPrefix ? LowSelectivity : defaultExprSelectivity;
 			}
 
 			return defaultExprSelectivity / 2;

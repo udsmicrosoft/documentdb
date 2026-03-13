@@ -54,7 +54,7 @@ static void DistributeCrudFunctions(void);
 static void CreateIndexBuildsTable(bool includeOptions, bool includeDropCommandType);
 static void CreateValidateDbNameTrigger(void);
 static void AlterDefaultDatabaseObjects(void);
-static char * UpdateClusterMetadata(bool isInitialize);
+static char * UpdateClusterMetadata(void);
 static void CreateReferenceTable(const char *tableName);
 static void CreateDistributedFunction(const char *functionName, const
 									  char *distributionArgName,
@@ -73,6 +73,8 @@ static void SetPermissionsForReadOnlyRole(void);
 static void SetPermissionsForReadWriteRole(void);
 static void CheckAndReplicateReferenceTable(const char *schema, const char *tableName);
 static void UpdateChangesTableOwnerToAdminRole(void);
+static bool RunUpgradeActions(ExtensionVersion installedVersion, ExtensionVersion
+							  lastUpgradeVersion);
 
 
 PG_FUNCTION_INFO_V1(command_initialize_cluster);
@@ -158,7 +160,7 @@ SetupCluster(bool isInitialize)
 	 */
 	EnsureMetadataTableReplicated("collections");
 
-	char *lastUpgradeVersionString = UpdateClusterMetadata(isInitialize);
+	char *lastUpgradeVersionString = UpdateClusterMetadata();
 	ParseVersionString(&lastUpgradeVersion, lastUpgradeVersionString);
 
 	GetInstalledVersion(&installedVersion);
@@ -181,15 +183,27 @@ SetupCluster(bool isInitialize)
 					installedVersion.Patch));
 	}
 
+	return RunUpgradeActions(installedVersion, lastUpgradeVersion);
+}
+
+
+/* Upgrade distributed state to the target upgrade version.
+ * NOTE: This method should not take a dependency on isInitialize.
+ */
+static bool
+RunUpgradeActions(ExtensionVersion installedVersion, ExtensionVersion lastUpgradeVersion)
+{
 	ClusterOperationVersions versions =
 	{
 		.InstalledVersion = installedVersion,
 		.LastUpgradeVersion = lastUpgradeVersion
 	};
 
-	/* If the version is < 0.0-5 or if it's an initialize ensure metadata collections are created */
-	if (isInitialize ||
-		ShouldRunSetupForVersion(&versions, DocDB_V0, 0, 5))
+	/* If the version is < 0.0-5 or if it's an initialize ensure metadata collections are created
+	 * Note that the create scripts will seed this table with a value that is < 5 so that would count
+	 * towards the initialize path.
+	 */
+	if (ShouldRunSetupForVersion(&versions, DocDB_V0, 0, 5))
 	{
 		/*
 		 * We should only create and modify schema objects here for versions that are no longer covered by the upgrade path.
@@ -278,20 +292,18 @@ SetupCluster(bool isInitialize)
 		SetPermissionsForReadOnlyRole();
 	}
 
-	if (ShouldRunSetupForVersion(&versions, DocDB_V0, 21, 0))
+	if (ShouldRunSetupForVersion(&versions, DocDB_V0, 21, 0) &&
+		ClusterAdminRole && ClusterAdminRole[0] != '\0')
 	{
-		if (!isInitialize && ClusterAdminRole[0] != '\0')
-		{
-			StringInfo cmdStr = makeStringInfo();
-			bool isNull = false;
-			appendStringInfo(cmdStr,
-							 "GRANT %s, %s TO %s WITH ADMIN OPTION;",
-							 ApiAdminRoleV2,
-							 ApiReadOnlyRole,
-							 quote_identifier(ClusterAdminRole));
-			ExtensionExecuteQueryViaSPI(cmdStr->data, false, SPI_OK_UTILITY,
-										&isNull);
-		}
+		StringInfo cmdStr = makeStringInfo();
+		bool isNull = false;
+		appendStringInfo(cmdStr,
+						 "GRANT %s, %s TO %s WITH ADMIN OPTION;",
+						 ApiAdminRoleV2,
+						 ApiReadOnlyRole,
+						 quote_identifier(ClusterAdminRole));
+		ExtensionExecuteQueryViaSPI(cmdStr->data, false, SPI_OK_UTILITY,
+									&isNull);
 	}
 
 	if (ShouldRunSetupForVersion(&versions, DocDB_V0, 23, 0))
@@ -339,10 +351,15 @@ SetupCluster(bool isInitialize)
 	if (ShouldRunSetupForVersion(&versions, DocDB_V0, 110, 0))
 	{
 		SetPermissionsForReadWriteRole();
+
+		/* Make roles a reference table so it's replicated to all nodes */
+		StringInfo tableName = makeStringInfo();
+		appendStringInfo(tableName, "%s.roles", ApiCatalogSchemaName);
+		CreateReferenceTable(tableName->data);
 	}
 
 	/* we call the post setup cluster hook to allow the extension to do any additional setup */
-	PostSetupClusterHook(isInitialize, &ShouldRunSetupForVersionForHook, &versions);
+	PostSetupClusterHook(&ShouldRunSetupForVersionForHook, &versions);
 
 	TriggerInvalidateClusterMetadata();
 	return true;
@@ -959,7 +976,7 @@ CheckAndReplicateReferenceTable(const char *schema, const char *tableName)
 
 
 static char *
-UpdateClusterMetadata(bool isInitialize)
+UpdateClusterMetadata(void)
 {
 	bool isNull = false;
 
@@ -968,7 +985,12 @@ UpdateClusterMetadata(bool isInitialize)
 	Datum catalogExtVersion = ExtensionExecuteQueryWithArgsViaSPI(
 		"SELECT extversion FROM pg_extension WHERE extname = $1", 1, argTypes, args, NULL,
 		true, SPI_OK_SELECT, &isNull);
-	Assert(!isNull);
+
+	if (isNull)
+	{
+		ereport(ERROR, (errmsg("Extension %s is not installed in the cluster",
+							   DistributedExtensionName)));
+	}
 
 	Datum clusterVersionDatum = ExtensionExecuteQueryViaSPI(
 		FormatSqlQuery(
@@ -977,7 +999,14 @@ UpdateClusterMetadata(bool isInitialize)
 		true,
 		SPI_OK_SELECT,
 		&isNull);
-	Assert(!isNull);
+
+	if (isNull)
+	{
+		ereport(ERROR, (errmsg(
+							"Cluster metadata is not initialized. The extension %s might"
+							" not be installed correctly.",
+							DistributedExtensionName)));
+	}
 
 	char *catalogVersion = TextDatumGetCString(catalogExtVersion);
 	char *clusterVersion = TextDatumGetCString(clusterVersionDatum);
@@ -992,7 +1021,11 @@ UpdateClusterMetadata(bool isInitialize)
 	Datum citusVersion = ExtensionExecuteQueryViaSPI(
 		"SELECT coalesce(metadata->>'last_upgrade_version', '11.0-1') FROM pg_dist_node_metadata",
 		true, SPI_OK_SELECT, &isNull);
-	Assert(!isNull);
+
+	if (isNull)
+	{
+		ereport(ERROR, (errmsg("Citus version is not found in the cluster metadata.")));
+	}
 
 	pgbson_writer writer;
 	PgbsonWriterInit(&writer);
@@ -1000,11 +1033,18 @@ UpdateClusterMetadata(bool isInitialize)
 	PgbsonWriterAppendUtf8(&writer, "last_citus_version", -1, TextDatumGetCString(
 							   citusVersion));
 
-	/* Seed the first version */
-	if (isInitialize)
-	{
-		PgbsonWriterAppendUtf8(&writer, "initialized_version", -1, catalogVersion);
-	}
+	/* Seed the initialized version if and only if it's not set first version
+	 * This becomes "initialized_version": { "$ifNull": [ "$initializedVersion", "catalog_version" ] }
+	 */
+	pgbson_writer childWriter;
+	PgbsonWriterStartDocument(&writer, "initialized_version", 19, &childWriter);
+
+	pgbson_array_writer arrayWriter;
+	PgbsonWriterStartArray(&childWriter, "$ifNull", -1, &arrayWriter);
+	PgbsonArrayWriterWriteUtf8(&arrayWriter, "$initialized_version");
+	PgbsonArrayWriterWriteUtf8(&arrayWriter, catalogVersion);
+	PgbsonWriterEndArray(&childWriter, &arrayWriter);
+	PgbsonWriterEndDocument(&writer, &childWriter);
 
 	Datum updateArgs[1] = { PointerGetDatum(PgbsonWriterGetPgbson(&writer)) };
 	Oid updateTypes[1] = { BsonTypeId() };

@@ -178,6 +178,10 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 1, pa
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 100000, pipeline => '{ "": [{ "$sort": { "_id": -1 } }]}');
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
 
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+SET documentdb.enableNewMinMaxAccumulators TO off;
+
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 1, pageSize => 100000, pipeline => '{ "": [{ "$match": { "_id": { "$gt": 2 }} }, { "$limit": 1 }]}');
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 1, pageSize => 100000, pipeline => '{ "": [{ "$match": { "_id": { "$gt": 2 }} }, { "$limit": 1 }, { "$addFields": { "c": "$a" }}]}');
 
@@ -200,6 +204,9 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 2, pa
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 1, pageSize => 0, pipeline => '{ "": [{ "$limit": 1 }]}');
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 100000, pipeline => '{ "": [{ "$sort": { "_id": -1 } }]}');
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+SET documentdb.enableNewMinMaxAccumulators TO off;
 ROLLBACK;
 
 -- with sharded
@@ -224,6 +231,10 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 1, pa
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 100000, pipeline => '{ "": [{ "$sort": { "_id": -1 } }]}');
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
 
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+SET documentdb.enableNewMinMaxAccumulators TO off;
+
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 6, pageSize => 2, pipeline => '{ "": [{ "$unwind": "$c" }, { "$limit": 10 }] }', collection_name => 'get_aggregation_cursor_smalldoc_test');
 
 
@@ -242,23 +253,26 @@ SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 2, pa
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 1, pageSize => 0, pipeline => '{ "": [{ "$limit": 1 }]}');
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 100000, pipeline => '{ "": [{ "$sort": { "_id": -1 } }]}');
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+SET documentdb.enableNewMinMaxAccumulators TO on;
+SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 5, pageSize => 2, pipeline => '{ "": [{ "$group": { "_id": "$_id", "c": { "$max": "$a" } } }] }');
+SET documentdb.enableNewMinMaxAccumulators TO off;
 SELECT * FROM aggregation_cursor_test.drain_aggregation_query(loopCount => 6, pageSize => 2, pipeline => '{ "": [{ "$unwind": "$c" }, { "$limit": 10 }] }', collection_name => 'get_aggregation_cursor_smalldoc_test');
 ROLLBACK;
 
 -- test for errors when returnKey is set to true
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "db" }');
 
 -- test for no errors when returnKey is set to false
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : false, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "returnKey" : false, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "db" }');
 
 -- test for errors when returnKey and showRecordId are set to true
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "showRecordId": true, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "filter" : { "title" : "a" }, "limit" : 1, "singleBatch" : true, "batchSize" : 1, "showRecordId": true, "returnKey" : true, "lsid" : { "id" : { "$binary" : { "base64": "apfUje6LTzKH9YfO3smIGA==", "subType" : "04" } } }, "$db" : "db" }');
 
 -- test for ntoreturn in find command with unset documentdb.version
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies",  "limit" : 1,  "batchSize" : 1, "ntoreturn":1 ,"$db" : "test" }');
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 ,"$db" : "test" }');
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "batchSize":1, "$db" : "test" }');
-SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "limit":1, "$db" : "test" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies",  "limit" : 1,  "batchSize" : 1, "ntoreturn":1 ,"$db" : "db" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 ,"$db" : "db" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "batchSize":1, "$db" : "db" }');
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find" : "movies", "ntoreturn":1 , "limit":1, "$db" : "db" }');
 
 -- GUC to change default batch size should be honored but should follow the 16MB limit
 BEGIN;
@@ -385,3 +399,20 @@ SELECT cursorPage FROM cursor_get_more(database => 'db',
     continuationSpec => :'r1_continuation');
 
 ROLLBACK;
+
+-- Regression test for GitHub issue documentdb#484: crash in pg_get_querydef
+-- when called after pg_plan_query mutates the query tree.
+-- Exercise different cursor types with enableDebugQueryText on non-existent collection.
+SET documentdb.enableDebugQueryText TO on;
+SELECT document FROM documentdb_api.count_query('db', '{ "count": "nonexistent_coll_484" }');
+-- Streamable cursor (simple find, no sort/skip/limit)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {} }');
+-- SingleBatch cursor (find with limit 1)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {}, "limit": 1 }');
+-- Persistent cursor (find with sort)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {}, "sort": {"a": 1} }');
+-- PointRead cursor (find by _id on non-existent collection, falls back to Streamable)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "nonexistent_coll_484", "filter": {"_id": 1} }');
+-- PointRead cursor (find by _id on existing collection with _id index)
+SELECT cursorPage FROM documentdb_api.find_cursor_first_page('db', '{ "find": "get_aggregation_cursor_smalldoc_test", "filter": {"_id": 1} }');
+SET documentdb.enableDebugQueryText TO off;

@@ -27,5 +27,11 @@ void ValidateUpdateDocument(const bson_value_t *updateSpec, const bson_value_t *
 pgbson * BsonUpdateDocument(pgbson *sourceDocument, const bson_value_t *updateSpec,
 							const bson_value_t *querySpec, const
 							bson_value_t *arrayFilters, const bson_value_t *variableSpec);
+pgbson * BsonUpdateDocumentWithSource(pgbson *sourceDocument, const
+									  bson_value_t *updateSpec,
+									  const bson_value_t *querySpec, const
+									  bson_value_t *arrayFilters, const
+									  bson_value_t *variableSpec,
+									  ItemPointer ctid, Oid tableOid);
 
 #endif

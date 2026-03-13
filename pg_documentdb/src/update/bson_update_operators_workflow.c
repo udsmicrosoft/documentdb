@@ -56,22 +56,6 @@ static const StringView PositionalFilterString = { .string = "$", .length = 1 };
  */
 
 
-/* The type of positional operator a node has */
-typedef enum PositionalType
-{
-	/* It is not a positional update */
-	PositionalType_None = 0,
-
-	/* Matches the $[] path */
-	PositionalType_All,
-
-	/* Matches the specified value $ path */
-	PositionalType_QueryFilter,
-
-	/* Corresponds to the $[identifier] path */
-	PositionalType_ArrayFilter
-} PositionalType;
-
 /* Metadata about positional nodes (if any) */
 typedef struct PositionalData
 {
@@ -243,6 +227,19 @@ typedef struct UpdateOperatorWriter
 	/* the underlying array writer if one is requested */
 	UpdateArrayWriter updateArrayWriter;
 } UpdateOperatorWriter;
+
+
+/* --------------------------------------------------------- */
+/* Global hooks */
+/* --------------------------------------------------------- */
+NotifyUpdatedField_HookType notify_updated_field_hook = NULL;
+NotifyRemovedField_HookType notify_remove_field_hook = NULL;
+StartPositionalUpdate_HookType start_positional_update_hook = NULL;
+NotifyPositionalMatchIndex_HookType notify_positional_match_index_hook = NULL;
+RemoveLastMatchedIndex_HookType remove_last_matched_index_hook = NULL;
+EndPositionalUpdate_HookType end_positional_update_hook = NULL;
+
+extern bool MultiplePositionalNotAllowed;
 
 
 /* --------------------------------------------------------- */
@@ -543,6 +540,44 @@ GetPositionalData(const BsonPathNode *node)
 	{
 		const BsonUpdateLeafNode *updateNode = CastAsUpdateLeafNode(node);
 		return &updateNode->positionalData;
+	}
+}
+
+
+/*
+ * Helper function to extract positional type, if multiple children with positional exist
+ * returns the max positional type.
+ */
+inline static PositionalType
+GetPositionalType(const BsonPathNode *node)
+{
+	PositionalType type = PositionalType_None;
+	if (IsIntermediateNode(node))
+	{
+		const BsonUpdateIntermediatePathNode *updateNode =
+			CastAsUpdateIntermediateNode(node);
+		if (updateNode->hasPositionalChildren)
+		{
+			/* if the parent has positional children, ensure all children
+			 * are positional - otherwise it fails
+			 */
+			const BsonPathNode *child;
+			foreach_child(child, (&updateNode->base))
+			{
+				const PositionalData *data = GetPositionalData(child);
+				type = Max(type, data->type);
+			}
+			return type;
+		}
+		else
+		{
+			return type;
+		}
+	}
+	else
+	{
+		const BsonUpdateLeafNode *updateNode = CastAsUpdateLeafNode(node);
+		return updateNode->positionalData.type;
 	}
 }
 
@@ -848,6 +883,10 @@ UpdateWriterWriteModifiedValue(UpdateOperatorWriter *writer, const bson_value_t 
 {
 	PgbsonElementWriterWriteValue(writer->writer, value);
 	writer->modifyType = MODIFY_TYPE_CHANGED;
+	if (notify_updated_field_hook != NULL)
+	{
+		notify_updated_field_hook(writer->updateTracker, writer->relativePath, value);
+	}
 }
 
 
@@ -859,6 +898,10 @@ void
 UpdateWriterSkipValue(UpdateOperatorWriter *writer)
 {
 	writer->modifyType = MODIFY_TYPE_CHANGED;
+	if (notify_remove_field_hook != NULL)
+	{
+		notify_remove_field_hook(writer->updateTracker, writer->relativePath);
+	}
 }
 
 
@@ -935,6 +978,18 @@ UpdateArrayWriterFinalize(UpdateOperatorWriter *writer, UpdateArrayWriter *array
 	PgbsonElementWriterEndArray(writer->writer, &arrayWriter->writer);
 	writer->updateArrayWriter.isValid = false;
 	writer->modifyType = Max(writer->modifyType, arrayWriter->modifyType);
+
+	/*
+	 * Track all array updates by the same operator as a single change
+	 *
+	 * TODO: Consider tracking single element changes with operators such as $each in special cases
+	 * to allow more granular change tracking.
+	 */
+	if (writer->modifyType == MODIFY_TYPE_CHANGED && notify_updated_field_hook != NULL)
+	{
+		bson_value_t value = PgbsonArrayWriterGetValue(&arrayWriter->writer);
+		notify_updated_field_hook(writer->updateTracker, writer->relativePath, &value);
+	}
 }
 
 
@@ -1316,6 +1371,11 @@ HandleUnsetUpdateTree(BsonIntermediatePathNode *tree,
 		{
 			HandleNodeExistsInTree(node, updatePathView.string, value, &updateTreeState);
 		}
+
+		bool markAsIncludeAncestor = false;
+
+		BsonPathNode *ignoreAsItIsNotDollarRename = NULL;
+		UpdateParentDataInTree(node, markAsIncludeAncestor, ignoreAsItIsNotDollarRename);
 	}
 }
 
@@ -1382,6 +1442,37 @@ ValidateSpecPathForUpdateTree(const StringView *updatePath)
 							errmsg(
 								"Positional element (i.e. '$') cannot appear at the beginning of the path '%s'.",
 								updatePath->string)));
+		}
+	}
+
+	if (MultiplePositionalNotAllowed)
+	{
+		/* Reject paths that contain multiple positional segments (".$"). */
+		int positionalDotDollarCount = 0;
+		for (uint32_t i = 0; i + 1 < updatePath->length; i++)
+		{
+			if (updatePath->string[i] == '.' && updatePath->string[i + 1] == '$')
+			{
+				if ((i + 1) == (updatePath->length - 1))
+				{
+					/* If we are at the end, this is positional */
+					positionalDotDollarCount++;
+				}
+				else if (updatePath->string[i + 2] == '.')
+				{
+					/* If not the next char needs to be a dot for this to be positional */
+					positionalDotDollarCount++;
+				}
+
+				if (positionalDotDollarCount > 1)
+				{
+					/* TODO: Check error code */
+					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+									errmsg(
+										"Too many positional (i.e. '$') elements found in path '%s'",
+										updatePath->string)));
+				}
+			}
 		}
 	}
 }
@@ -1731,13 +1822,16 @@ TraverseArrayAndApplyUpdate(bson_iter_t *sourceDocIterator,
 	PgbsonInitArrayElementWriter(writer, &arrayElementWriter);
 
 	/* Special case, if there's positional children, then the tracker only tracks
-	 * updates to the array as a whole
-	 * See use of trackArrayValue.
+	 * updates to the array as a whole for $[] and $[<identifier>] cases.
 	 */
-	BsonUpdateTracker *trackerInner = tracker;
-	if (tree->hasPositionalChildren)
+	if (tree->hasPositionalChildren && start_positional_update_hook != NULL)
 	{
-		trackerInner = NULL;
+		const BsonPathNode *baseNode = (const BsonPathNode *) tree;
+		StringView relativePathToNode = GetRelativePathUntilField(baseNode);
+		PositionalType type = GetPositionalType(baseNode);
+		bool isRootNode = relativePathToNode.string == baseNode->field.string;
+		start_positional_update_hook(tracker, type, isRootNode,
+									 &baseNode->field, &relativePathToNode);
 	}
 
 	int32_t index = 0;
@@ -1750,7 +1844,7 @@ TraverseArrayAndApplyUpdate(bson_iter_t *sourceDocIterator,
 		bool fieldModified = HandleCurrentIteratorPosition(sourceDocIterator, tree,
 														   &arrayElementWriter,
 														   &fieldHandledBitmapSet, state,
-														   trackerInner, isArray,
+														   tracker, isArray,
 														   hasArrayAncestors,
 														   &fieldPath);
 		index++;
@@ -1765,6 +1859,12 @@ TraverseArrayAndApplyUpdate(bson_iter_t *sourceDocIterator,
 	if (fieldHandledBitmapSet != NULL)
 	{
 		bms_free(fieldHandledBitmapSet);
+	}
+
+	if (modified && tree->hasPositionalChildren && end_positional_update_hook != NULL)
+	{
+		bson_value_t value = PgbsonArrayWriterGetValue(writer);
+		end_positional_update_hook(tracker, &value);
 	}
 
 	return modified;
@@ -1803,6 +1903,14 @@ HandleCurrentIteratorPosition(bson_iter_t *documentIterator,
 			continue;
 		}
 
+		/* This node is a match check if this is positional and notify match index */
+		if (notify_positional_match_index_hook != NULL)
+		{
+			notify_positional_match_index_hook(tracker, fieldPath);
+		}
+
+		bool modified = false;
+
 		/* field is a match. */
 		switch (child->nodeType)
 		{
@@ -1812,19 +1920,18 @@ HandleCurrentIteratorPosition(bson_iter_t *documentIterator,
 			{
 				/* It's an update node */
 				const BsonUpdateLeafNode *node = CastAsUpdateLeafNode(child);
-				bool modified = WriteCurrentNode(node, currentValue, writer, state,
-												 tracker, isArray, hasArrayAncestors,
-												 fieldPath);
+				modified = WriteCurrentNode(node, currentValue, writer, state,
+											tracker, isArray, hasArrayAncestors,
+											fieldPath);
 				*fieldHandledBitmapSet = bms_add_member(*fieldHandledBitmapSet,
 														index);
-				return modified;
+				break;
 			}
 
 			case NodeType_Intermediate:
 			{
 				const BsonUpdateIntermediatePathNode *intermediate =
 					CastAsUpdateIntermediateNode(child);
-				bool modified = false;
 
 				/* the update is an intermediate document, write the nested */
 				/* document. */
@@ -1905,7 +2012,7 @@ HandleCurrentIteratorPosition(bson_iter_t *documentIterator,
 
 				*fieldHandledBitmapSet = bms_add_member(*fieldHandledBitmapSet,
 														index);
-				return modified;
+				break;
 			}
 
 			default:
@@ -1914,6 +2021,13 @@ HandleCurrentIteratorPosition(bson_iter_t *documentIterator,
 									   child->nodeType)));
 			}
 		}
+
+		if (remove_last_matched_index_hook != NULL)
+		{
+			remove_last_matched_index_hook(tracker);
+		}
+
+		return modified;
 	}
 
 	/* no updates for this field in the document - write it to the target. */

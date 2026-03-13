@@ -83,7 +83,7 @@ PG_FUNCTION_INFO_V1(command_drop_indexes);
 PG_FUNCTION_INFO_V1(command_drop_indexes_concurrently);
 PG_FUNCTION_INFO_V1(command_drop_indexes_concurrently_internal);
 
-static DropIndexesArg ParseDropIndexesArg(pgbson *options);
+static DropIndexesArg ParseDropIndexesArg(pgbson *options, Datum *databaseNameDatum);
 static void DropIndexesArgExpandIndexNameList(uint64 collectionId,
 											  DropIndexesArg *dropIndexesArg);
 static DropIndexesResult * DropIndexesConcurrentlyInternal(char *dbName, pgbson *arg);
@@ -109,20 +109,20 @@ static void CancelIndexBuildRequest(int indexId);
 Datum
 command_drop_indexes(PG_FUNCTION_ARGS)
 {
-	/* ApiSchema.drop_indexes already verified NULL args but .. */
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("dbName cannot be NULL")));
-	}
-	char *dbName = text_to_cstring(PG_GETARG_TEXT_P(0));
-
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("Argument value must not be NULL")));
 	}
 	pgbson *arg = PG_GETARG_PGBSON(1);
 
-	DropIndexesArg dropIndexesArg = ParseDropIndexesArg(arg);
+	Datum dbNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
+	DropIndexesArg dropIndexesArg = ParseDropIndexesArg(arg, &dbNameDatum);
+
+	if (dbNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errmsg("dbName cannot be NULL")));
+	}
+	char *dbName = TextDatumGetCString(dbNameDatum);
 
 	bool dropIndexConcurrently = false;
 	DropIndexesResult dropIndexResult = ProcessDropIndexesRequest(dbName, dropIndexesArg,
@@ -366,16 +366,22 @@ ProcessDropIndexesRequest(char *dbName, DropIndexesArg dropIndexesArg, bool
 Datum
 command_drop_indexes_concurrently(PG_FUNCTION_ARGS)
 {
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("dbName cannot be NULL")));
-	}
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("Argument value must not be NULL")));
 	}
-	text *databaseDatum = PG_GETARG_TEXT_P(0);
 	pgbson *spec = PG_GETARG_PGBSON(1);
+
+	Datum dbNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
+
+	/* Parse to extract $db if needed (result is unused but side-effects dbNameDatum) */
+	ParseDropIndexesArg(spec, &dbNameDatum);
+
+	if (dbNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errmsg("dbName cannot be NULL")));
+	}
+	text *databaseDatum = DatumGetTextP(dbNameDatum);
 	bool ok = false;
 	pgbson *respose;
 
@@ -452,17 +458,22 @@ command_drop_indexes_concurrently(PG_FUNCTION_ARGS)
 Datum
 command_drop_indexes_concurrently_internal(PG_FUNCTION_ARGS)
 {
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("dbName cannot be NULL")));
-	}
-	char *dbName = text_to_cstring(PG_GETARG_TEXT_P(0));
-
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("Argument value must not be NULL")));
 	}
 	pgbson *arg = PG_GETARG_PGBSON(1);
+
+	Datum dbNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
+
+	/* Parse to extract $db if needed */
+	ParseDropIndexesArg(arg, &dbNameDatum);
+
+	if (dbNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errmsg("dbName cannot be NULL")));
+	}
+	char *dbName = TextDatumGetCString(dbNameDatum);
 
 	DropIndexesResult *dropIndexResult = DropIndexesConcurrentlyInternal(dbName, arg);
 
@@ -489,7 +500,8 @@ DropIndexesConcurrentlyInternal(char *dbName, pgbson *arg)
 	MemoryContext savedMemoryContext = CurrentMemoryContext;
 	PG_TRY();
 	{
-		DropIndexesArg dropIndexesArg = ParseDropIndexesArg(arg);
+		Datum databaseNameDatum = CStringGetTextDatum(dbName);
+		DropIndexesArg dropIndexesArg = ParseDropIndexesArg(arg, &databaseNameDatum);
 		bool dropIndexConcurrently = true;
 		*dropIndexResult = ProcessDropIndexesRequest(dbName, dropIndexesArg,
 													 dropIndexConcurrently);
@@ -536,7 +548,7 @@ DropIndexesConcurrentlyInternal(char *dbName, pgbson *arg)
  * dbCommand/dropIndexes.
  */
 static DropIndexesArg
-ParseDropIndexesArg(pgbson *arg)
+ParseDropIndexesArg(pgbson *arg, Datum *databaseNameDatum)
 {
 	DropIndexesArg dropIndexesArg = { 0 };
 
@@ -617,6 +629,10 @@ ParseDropIndexesArg(pgbson *arg)
 											   "[string, object]");
 			}
 		}
+		else if (strcmp(argKey, "$db") == 0)
+		{
+			ValidateOrExtractDatabaseNameFromSpec(&argIter, databaseNameDatum);
+		}
 		else if (IsCommonSpecIgnoredField(argKey))
 		{
 			elog(DEBUG1, "Command field not recognized: dropIndexes.%s", argKey);
@@ -638,6 +654,12 @@ ParseDropIndexesArg(pgbson *arg)
 	}
 
 	/* verify that all non-optional fields are given */
+
+	if (*databaseNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("$db cannot be NULL")));
+	}
 
 	if (dropIndexesArg.collectionName == NULL)
 	{

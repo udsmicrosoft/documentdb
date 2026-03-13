@@ -22,7 +22,6 @@ BEGIN;
 set local enable_seqscan to off;
 set local documentdb.forceUseIndexIfAvailable to on;
 set local enable_bitmapscan to off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 
 \i sql/bson_dollar_ops_basic_compare_tests_explain_core.sql
 ROLLBACK;

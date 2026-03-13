@@ -5,7 +5,7 @@ SET documentdb.next_collection_index_id TO 6000;
 SELECT documentdb_api_internal.create_indexes_non_concurrently('db', NULL);
 ERROR:  arg cannot be NULL
 SELECT documentdb_api_internal.create_indexes_non_concurrently(NULL, '{}');
-ERROR:  dbName cannot be NULL
+ERROR:  $db must be specified.
 SELECT documentdb_api_internal.create_indexes_non_concurrently('db', '{"createIndexes": "collection_1", "unknown_field": []}');
 ERROR:  BSON field 'createIndexes.unknown_field' is an unknown field
 SELECT documentdb_api_internal.create_indexes_non_concurrently('db', '{"createIndexes": null, "indexes": [{"key": {"a": 1, "": -1}, "name": "my_idx"}]}');

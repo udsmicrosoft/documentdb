@@ -40,46 +40,35 @@ SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
 EXPLAIN (COSTS OFF) WITH t1 as (SELECT document FROM documentdb_api.collection('db', 'bson_index_rum_index_scan_to_bitmap_heap_scan') WHERE document OPERATOR(documentdb_api_catalog.@@) '{"order_id": "ORD2" , "$and": [{"timestamp" : { "$lte":2000000}}]}'::bson  ) SELECT bson_repath_and_build('rxCount'::text, BSONAVERAGE(document -> 'month')) from t1 group by bson_expression_get(document, '{ "": "$product_name" }');
 ROLLBACK;
 
--- IndexScan is overritten by BitmapHeapScan when documentdb_api.forceRumIndexScantoBitmapHeapScan is toggled to off and then to on
 BEGIN;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO true;
 SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM documentdb_api.collection('db', 'bson_index_rum_index_scan_to_bitmap_heap_scan') WHERE document OPERATOR(documentdb_api_catalog.@@) '{"order_id": "ORD1" }'::bson LIMIT 10;
 END;
 
--- IndexScan is preferred when is turned off via setting documentdb_api.forceRumIndexScantoBitmapHeapScan TO off
 BEGIN;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO off;
 set local enable_bitmapscan TO OFF;
 SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM documentdb_api.collection('db', 'bson_index_rum_index_scan_to_bitmap_heap_scan') WHERE document OPERATOR(documentdb_api_catalog.@@) '{"order_id": "ORD1" }'::bson LIMIT 10;
 END;
 
--- IndexScan is preferred when is turned off via setting documentdb_api.forceRumIndexScantoBitmapHeapScan TO "off"
 BEGIN;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO off;
 set local enable_bitmapscan TO OFF;
 SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM documentdb_api.collection('db', 'bson_index_rum_index_scan_to_bitmap_heap_scan') WHERE document OPERATOR(documentdb_api_catalog.@@) '{"order_id": "ORD1" }'::bson LIMIT 10;
 END;
 
--- IndexScan is preferred when is turned off via setting documentdb_api.forceRumIndexScantoBitmapHeapScan TO false
 BEGIN;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO false;
 set local enable_bitmapscan TO OFF;
 SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM documentdb_api.collection('db', 'bson_index_rum_index_scan_to_bitmap_heap_scan') WHERE document OPERATOR(documentdb_api_catalog.@@) '{"order_id": "ORD1" }'::bson LIMIT 10;
 END;
 
--- IndexScan is preferred when is turned off via setting documentdb_api.forceRumIndexScantoBitmapHeapScan TO "false"
 BEGIN;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO "false";
 set local enable_bitmapscan TO OFF;
 SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM documentdb_api.collection('db', 'bson_index_rum_index_scan_to_bitmap_heap_scan') WHERE document OPERATOR(documentdb_api_catalog.@@) '{"order_id": "ORD1" }'::bson LIMIT 10;

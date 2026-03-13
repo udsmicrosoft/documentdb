@@ -77,10 +77,11 @@ extern bool EnableCursorsOnAggregationQueryRewrite;
 extern bool EnableCollation;
 extern bool DefaultInlineWriteOperations;
 extern int MaxAggregationStagesAllowed;
-extern bool EnableIndexOrderbyPushdown;
 extern bool EnableConversionStreamableToSingleBatch;
 extern bool EnableFindProjectionAfterOffset;
 extern bool EnableNewCountAggregates;
+extern bool FailOnNonEmptyGroupCountArg;
+extern bool FailOnGroupIdDuplicate;
 extern bool EnableUseLookupNewProjectInlineMethod;
 extern bool InlineChangeStreamMatchStage;
 extern bool RemoveMatchNamespaceFilters;
@@ -1319,17 +1320,11 @@ GenerateAggregationQuery(text *database, pgbson *aggregationSpec, QueryData *que
 		}
 		else if (StringViewEqualsCString(&keyView, "$db"))
 		{
-			/* BackCompat: Ignore if provided top level */
-			if (context.databaseNameDatum == NULL)
+			text *prevDb = context.databaseNameDatum;
+			ValidateOrExtractDatabaseNameTextFromSpec(&aggregationIterator,
+													  &context.databaseNameDatum);
+			if (prevDb == NULL)
 			{
-				/* Extract the database out of $db */
-				EnsureTopLevelFieldType("$db", &aggregationIterator, BSON_TYPE_UTF8);
-
-				uint32_t databaseLength = 0;
-				const char *databaseName = bson_iter_utf8(&aggregationIterator,
-														  &databaseLength);
-				context.databaseNameDatum = cstring_to_text_with_len(databaseName,
-																	 databaseLength);
 				database = context.databaseNameDatum;
 			}
 		}
@@ -1518,17 +1513,11 @@ GenerateFindQuery(text *databaseDatum, pgbson *findSpec, QueryData *queryData, b
 			{
 				if (StringViewEqualsCString(&keyView, "$db"))
 				{
-					/* BackCompat: Ignore if provided top level */
-					if (context.databaseNameDatum == NULL)
+					text *prevDb = context.databaseNameDatum;
+					ValidateOrExtractDatabaseNameTextFromSpec(&findIterator,
+															  &context.databaseNameDatum);
+					if (prevDb == NULL)
 					{
-						/* Extract the database out of $db */
-						EnsureTopLevelFieldType("$db", &findIterator, BSON_TYPE_UTF8);
-
-						uint32_t databaseLength = 0;
-						const char *databaseName = bson_iter_utf8(&findIterator,
-																  &databaseLength);
-						context.databaseNameDatum = cstring_to_text_with_len(databaseName,
-																			 databaseLength);
 						databaseDatum = context.databaseNameDatum;
 					}
 
@@ -2122,12 +2111,28 @@ GenerateCountQuery(text *databaseDatum, pgbson *countSpec, bool setStatementTime
 			EnsureTopLevelFieldIsNumberLike("distinct.maxTimeMS", value);
 			SetExplicitStatementTimeout(BsonValueAsInt32(value));
 		}
+		else if (StringViewEqualsCString(&keyView, "$db"))
+		{
+			text *prevDb = context.databaseNameDatum;
+			ValidateOrExtractDatabaseNameTextFromSpec(&countIterator,
+													  &context.databaseNameDatum);
+			if (prevDb == NULL)
+			{
+				databaseDatum = context.databaseNameDatum;
+			}
+		}
 		else if (!IsCommonSpecIgnoredField(keyView.string))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 							errmsg("%.*s is an unknown field",
 								   keyView.length, keyView.string)));
 		}
+	}
+
+	if (context.databaseNameDatum == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
+						errmsg("Required element \"$db\" missing.")));
 	}
 
 	if (collectionName.length == 0)
@@ -2310,12 +2315,28 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 			EnsureTopLevelFieldIsNumberLike("distinct.maxTimeMS", value);
 			SetExplicitStatementTimeout(BsonValueAsInt32(value));
 		}
+		else if (StringViewEqualsCString(&keyView, "$db"))
+		{
+			text *prevDb = context.databaseNameDatum;
+			ValidateOrExtractDatabaseNameTextFromSpec(&distinctIter,
+													  &context.databaseNameDatum);
+			if (prevDb == NULL)
+			{
+				databaseDatum = context.databaseNameDatum;
+			}
+		}
 		else if (!IsCommonSpecIgnoredField(keyView.string))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 							errmsg("%.*s is an unknown field",
 								   keyView.length, keyView.string)));
 		}
+	}
+
+	if (context.databaseNameDatum == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
+						errmsg("Required element \"$db\" missing.")));
 	}
 
 	if (!hasDistinct)
@@ -2402,18 +2423,7 @@ ParseGetMore(text **databaseName, pgbson *getMoreSpec, QueryData *queryData, boo
 		}
 		else if (strcmp(pathKey, "$db") == 0)
 		{
-			/* BackCompat: Ignore if provided top level */
-			if (*databaseName == NULL)
-			{
-				/* Extract the database out of $db */
-				EnsureTopLevelFieldType("$db", &cursorSpecIter, BSON_TYPE_UTF8);
-
-				uint32_t databaseLength = 0;
-				const char *databaseStr = bson_iter_utf8(&cursorSpecIter,
-														 &databaseLength);
-				*databaseName = cstring_to_text_with_len(databaseStr,
-														 databaseLength);
-			}
+			ValidateOrExtractDatabaseNameTextFromSpec(&cursorSpecIter, databaseName);
 		}
 		else if (!IsCommonSpecIgnoredField(pathKey))
 		{
@@ -5002,7 +5012,7 @@ HandleSort(const bson_value_t *existingValue, Query *query,
 										 InvalidOid, InvalidOid,
 										 COERCE_EXPLICIT_CALL);
 
-			if (EnableIndexOrderbyPushdown && !isSortByMeta)
+			if (!isSortByMeta)
 			{
 				/*
 				 * If there's an orderby pushdown to the index, add a full scan clause iff
@@ -5284,6 +5294,44 @@ AddSimpleGroupAccumulator(Query *query, const bson_value_t *accumulatorValue,
 
 	Aggref *aggref = CreateSingleArgAggregate(aggregateFunctionOid,
 											  (Expr *) accumFunc, parseState);
+	repathArgs = lappend(repathArgs, AddGroupExpression((Expr *) accumulatorText,
+														parseState, identifiers,
+														query, TEXTOID, NULL));
+	repathArgs = lappend(repathArgs, AddGroupExpression((Expr *) aggref,
+														parseState, identifiers,
+														query, BsonTypeId(),
+														NULL));
+	return repathArgs;
+}
+
+
+inline static List *
+AddSimpleGroupAccumulatorWithExpr(Query *query, const bson_value_t *accumulatorValue,
+								  List *repathArgs, Const *accumulatorText,
+								  ParseState *parseState, char *identifiers,
+								  Expr *documentExpr, Oid aggregateFunctionOid,
+								  Expr *variableSpec, const char *collationString)
+{
+	Expr *exprConst = (Expr *) MakeBsonConst(BsonValueToDocumentPgbson(accumulatorValue));
+
+	documentExpr = GetDocumentExprForGroupAccumulatorValue(accumulatorValue,
+														   documentExpr);
+
+	Const *collationConst = IsCollationApplicable(collationString) ?
+							MakeTextConst(collationString,
+										  strlen(collationString)) :
+							makeNullConst(TEXTOID, -1, InvalidOid);
+
+	List *aggregateArgs = list_make4(documentExpr, exprConst, variableSpec,
+									 collationConst);
+	List *argTypesList = list_make4_oid(BsonTypeId(), BsonTypeId(), BsonTypeId(),
+										TEXTOID);
+
+	Aggref *aggref = CreateMultiArgAggregate(aggregateFunctionOid,
+											 aggregateArgs,
+											 argTypesList,
+											 parseState);
+
 	repathArgs = lappend(repathArgs, AddGroupExpression((Expr *) accumulatorText,
 														parseState, identifiers,
 														query, TEXTOID, NULL));
@@ -5851,8 +5899,7 @@ HandleGroup(const bson_value_t *existingValue, Query *query,
 
 	/* Push prior stuff to a subquery first since we're gonna aggregate our way */
 	if (list_length(query->targetList) > 1 || query->hasAggs ||
-		list_length(query->groupClause) > 0 || list_length(query->sortClause) > 0 ||
-		!EnableIndexOrderbyPushdown)
+		list_length(query->groupClause) > 0 || list_length(query->sortClause) > 0)
 	{
 		query = MigrateQueryToSubQuery(query, context);
 	}
@@ -5868,13 +5915,27 @@ HandleGroup(const bson_value_t *existingValue, Query *query,
 
 	/* First get the _id */
 	bson_value_t idValue = { 0 };
+	bool idAlreadyFound = false;
 	while (bson_iter_next(&groupIter))
 	{
 		StringView keyView = bson_iter_key_string_view(&groupIter);
 		if (StringViewEquals(&keyView, &IdFieldStringView))
 		{
+			if (idAlreadyFound)
+			{
+				ReportFeatureUsage(FEATURE_STAGE_GROUP_DUPLICATE_ID);
+
+				if (FailOnGroupIdDuplicate)
+				{
+					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION15948),
+									errmsg("a group's _id may only be specified once")));
+				}
+
+				break;
+			}
+
 			idValue = *bson_iter_value(&groupIter);
-			break;
+			idAlreadyFound = true;
 		}
 	}
 
@@ -6003,28 +6064,73 @@ HandleGroup(const bson_value_t *existingValue, Query *query,
 		else if (StringViewEqualsCString(&accumulatorName, "$max"))
 		{
 			ReportFeatureUsage(FEATURE_AGGREGATE_GROUP_MAX);
-			repathArgs = AddSimpleGroupAccumulator(query, &accumulatorElement.bsonValue,
-												   repathArgs,
-												   accumulatorText, parseState,
-												   identifiers,
-												   origEntry->expr,
-												   BsonMaxAggregateFunctionOid(),
-												   context->variableSpec);
+
+			if (CanUseWithExprAggregates())
+			{
+				repathArgs = AddSimpleGroupAccumulatorWithExpr(
+					query, &accumulatorElement.bsonValue,
+					repathArgs,
+					accumulatorText, parseState,
+					identifiers, origEntry->expr,
+					BsonMaxWithExprAggregateFunctionOid(),
+					context->variableSpec,
+					context->collationString);
+			}
+			else
+			{
+				repathArgs = AddSimpleGroupAccumulator(query,
+													   &accumulatorElement.bsonValue,
+													   repathArgs,
+													   accumulatorText, parseState,
+													   identifiers,
+													   origEntry->expr,
+													   BsonMaxAggregateFunctionOid(),
+													   context->variableSpec);
+			}
 		}
 		else if (StringViewEqualsCString(&accumulatorName, "$min"))
 		{
 			ReportFeatureUsage(FEATURE_AGGREGATE_GROUP_MIN);
-			repathArgs = AddSimpleGroupAccumulator(query, &accumulatorElement.bsonValue,
-												   repathArgs,
-												   accumulatorText, parseState,
-												   identifiers,
-												   origEntry->expr,
-												   BsonMinAggregateFunctionOid(),
-												   context->variableSpec);
+
+			if (CanUseWithExprAggregates())
+			{
+				repathArgs = AddSimpleGroupAccumulatorWithExpr(
+					query, &accumulatorElement.bsonValue,
+					repathArgs,
+					accumulatorText, parseState,
+					identifiers, origEntry->expr,
+					BsonMinWithExprAggregateFunctionOid(),
+					context->variableSpec,
+					context->collationString);
+			}
+			else
+			{
+				repathArgs = AddSimpleGroupAccumulator(query,
+													   &accumulatorElement.bsonValue,
+													   repathArgs,
+													   accumulatorText, parseState,
+													   identifiers,
+													   origEntry->expr,
+													   BsonMinAggregateFunctionOid(),
+													   context->variableSpec);
+			}
 		}
 		else if (StringViewEqualsCString(&accumulatorName, "$count"))
 		{
 			ReportFeatureUsage(FEATURE_AGGREGATE_GROUP_COUNT);
+
+			if (!IsBsonValueEmptyDocument(&accumulatorElement.bsonValue))
+			{
+				ReportFeatureUsage(FEATURE_AGGREGATE_GROUP_COUNT_WITH_ARG);
+
+				if (FailOnNonEmptyGroupCountArg)
+				{
+					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_TYPEMISMATCH),
+									errmsg(
+										"$count:{} accumulator requires 0 arguments")));
+				}
+			}
+
 			if (CanUseNewCountAggregates())
 			{
 				/* Use the new BSONCOUNT aggregate. */
@@ -6442,39 +6548,36 @@ HandleGroup(const bson_value_t *existingValue, Query *query,
 	grpcl->hashable = true;
 	query->groupClause = list_make1(grpcl);
 
-	if (EnableIndexOrderbyPushdown)
-	{
-		/* Group by is valid for pushdown iff it's a string expression of a path that's not a variable */
-		bool isGroupByValidForIndexPushdown =
-			idValue.value_type == BSON_TYPE_UTF8 &&
-			idValue.value.v_utf8.len > 1 &&
-			idValue.value.v_utf8.str[0] == '$' &&
-			idValue.value.v_utf8.str[1] != '$';
+	/* Group by is valid for pushdown iff it's a string expression of a path that's not a variable */
+	bool isGroupByValidForIndexPushdown =
+		idValue.value_type == BSON_TYPE_UTF8 &&
+		idValue.value.v_utf8.len > 1 &&
+		idValue.value.v_utf8.str[0] == '$' &&
+		idValue.value.v_utf8.str[1] != '$';
 
-		/*
-		 * If there's an orderby pushdown to the index, add a full scan clause iff
-		 * the query has no filters yet.
-		 */
-		if (isGroupByValidForIndexPushdown &&
-			CanPushSortFilterToIndex(query, context))
-		{
-			pgbsonelement sortElement = { 0 };
-			sortElement.path = idValue.value.v_utf8.str + 1;
-			sortElement.pathLength = idValue.value.v_utf8.len - 1;
-			sortElement.bsonValue.value_type = BSON_TYPE_INT32;
-			sortElement.bsonValue.value.v_int32 = 1;
-			pgbson *sortSpec = PgbsonElementToPgbson(&sortElement);
-			Const *sortConst = MakeBsonConst(sortSpec);
-			List *rangeArgs = list_make2(origEntry->expr, sortConst);
-			Expr *fullScanExpr = (Expr *) makeFuncExpr(
-				BsonFullScanFunctionOid(), BOOLOID, rangeArgs,
-				InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
-			List *currentQuals = make_ands_implicit(
-				(Expr *) query->jointree->quals);
-			currentQuals = lappend(currentQuals, fullScanExpr);
-			query->jointree->quals = (Node *) make_ands_explicit(
-				currentQuals);
-		}
+	/*
+	 * If there's an orderby pushdown to the index, add a full scan clause iff
+	 * the query has no filters yet.
+	 */
+	if (isGroupByValidForIndexPushdown &&
+		CanPushSortFilterToIndex(query, context))
+	{
+		pgbsonelement sortElement = { 0 };
+		sortElement.path = idValue.value.v_utf8.str + 1;
+		sortElement.pathLength = idValue.value.v_utf8.len - 1;
+		sortElement.bsonValue.value_type = BSON_TYPE_INT32;
+		sortElement.bsonValue.value.v_int32 = 1;
+		pgbson *sortSpec = PgbsonElementToPgbson(&sortElement);
+		Const *sortConst = MakeBsonConst(sortSpec);
+		List *rangeArgs = list_make2(origEntry->expr, sortConst);
+		Expr *fullScanExpr = (Expr *) makeFuncExpr(
+			BsonFullScanFunctionOid(), BOOLOID, rangeArgs,
+			InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+		List *currentQuals = make_ands_implicit(
+			(Expr *) query->jointree->quals);
+		currentQuals = lappend(currentQuals, fullScanExpr);
+		query->jointree->quals = (Node *) make_ands_explicit(
+			currentQuals);
 	}
 
 	/* Now that the group + accumulators are done, push to a subquery

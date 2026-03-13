@@ -35,7 +35,6 @@ set enable_seqscan to off;
 EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('comp_db', '{ "find": "query_orderby", "filter": { "a": { "$exists": true }}, "sort": { "a": 1 } }');
 
 -- now the order by succeeds with an index scan
-SET documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('comp_db', '{ "find": "query_orderby", "filter": { "a": { "$exists": true }}, "sort": { "a": 1 } }');
 
 -- point read on _id with order by was broken initially and was fixed in 108 
@@ -170,14 +169,14 @@ EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bs
 
 
 -- groupby pushdown works for non-multi-key indexes
-EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf", "pipeline": [ { "$match": { "a": { "$exists": true } } }, { "$group": { "_id": "$a", "c": { "$count": 1 } } } ] }');
+EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf", "pipeline": [ { "$match": { "a": { "$exists": true } } }, { "$group": { "_id": "$a", "c": { "$count": {} } } } ] }');
 
 set enable_bitmapscan to off;
-EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": 1 } } } ] }');
+EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": {} } } } ] }');
 
 -- the same does not work on multi-key indexes
-EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf_arr", "pipeline": [ { "$match": { "a": { "$exists": true } } }, { "$group": { "_id": "$a", "c": { "$count": 1 } } } ] }');
-EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf_arr", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": 1 } } } ] }');
+EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf_arr", "pipeline": [ { "$match": { "a": { "$exists": true } } }, { "$group": { "_id": "$a", "c": { "$count": {} } } } ] }');
+EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf_arr", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": {} } } } ] }');
 
 set enable_bitmapscan to off;
 -- for non-multi-key requires, prefix equality until the min order by key only.
@@ -233,7 +232,6 @@ SELECT COUNT(documentdb_api.insert_one('comp_db', 'query_orderby_perf2', FORMAT(
 
 ANALYZE documentdb_data.documents_68004;
 
-SET documentdb.enableIndexOrderbyPushdown to on;
 set documentdb.forceUseIndexIfAvailable to on;
 set enable_bitmapscan to off;
 EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "query_orderby_perf2", "pipeline": [ { "$match": { "b": { "$exists": true } } }, { "$sort": { "b": 1 } } ] }');
@@ -294,7 +292,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('comp_db', '{ "cr
 
 BEGIN;
 set local documentdb.forceDisableSeqScan to on;
-set local documentdb.enableIndexOrderbyPushdown to on;
 set local documentdb.enableExtendedExplainPlans to on;
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "sortcoll", "pipeline": [ { "$sort": { "a.b": 1 } } ] }');
 ROLLBACK;
@@ -302,13 +299,11 @@ ROLLBACK;
 
 BEGIN;
 set local documentdb.forceDisableSeqScan to on;
-set local documentdb.enableIndexOrderbyPushdown to on;
 SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "sortcoll", "pipeline": [ { "$sort": { "a.b": 1 } } ] }');
 SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "sortcoll", "pipeline": [ { "$sort": { "a.b": -1 } } ] }');
 ROLLBACK;
 
 set documentdb.forceDisableSeqScan to on;
-set documentdb.enableIndexOrderbyPushdown to on;
 set documentdb.enableExtendedExplainPlans to on;
 
 -- can't push this down (no equality prefix)
@@ -431,9 +426,8 @@ select COUNT(documentdb_api.insert_one('comp_db', 'ordering_groups', FORMAT('{ "
 ANALYZE documentdb_data.documents_68009;
 
 set documentdb.forceDisableSeqScan to on;
-set documentdb.enableIndexOrderbyPushdown to on;
-EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "ordering_groups", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": 1 } } } ] }');
-SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "ordering_groups", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": 1 } } } ] }');
+EXPLAIN (ANALYZE ON, COSTS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "ordering_groups", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": {} } } } ] }');
+SELECT document FROM bson_aggregation_pipeline('comp_db', '{ "aggregate": "ordering_groups", "pipeline": [ { "$group": { "_id": "$a", "c": { "$count": {} } } } ] }');
 
 
 -- sorting on prefix with missing path is not allowed unless it's equality.
@@ -500,7 +494,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('comp_db', '{ "cr
 SELECT COUNT(*) FROM ( SELECT documentdb_api.insert_one('comp_db', 'index_orderby_selection',
     FORMAT('{ "_id": %s, "filter1": "filter1-%s", "filter2": "filter2-%s", "filter3": %s, "orderKey": %s, "otherPath": "somePath-%s" }', i, i % 10, i, i % 100, i, i)::bson) FROM generate_series(1, 10000) i) j;
 
-set documentdb.enableIndexOrderbyPushdown to on;
 reset enable_sort;
 
 -- this has all the paths matching.
@@ -516,3 +509,25 @@ SELECT documentdb_api.coll_mod('comp_db', 'index_orderby_selection', '{ "collMod
 -- now it picks the sort index
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF)
     SELECT * FROM bson_aggregation_find('comp_db', '{ "find": "index_orderby_selection", "filter": { "filter1": "filter1-5", "filter2": { "$gte": "filter2-55" }, "filter3": { "$gt": 50 } }, "sort": { "orderKey": 1 }, "limit": 10 }');
+
+
+-- test filter pushdown with order by scan
+SELECT COUNT(documentdb_api.insert_one('comp_db', 'testbitmaponorder', FORMAT('{ "_id": %s, "a": "%s%s", "b": "%s%s" }', i, repeat('a', 10000), i, repeat('a', 10000), i)::bson)) FROM generate_series(1, 10000) i;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('comp_db', '{ "createIndexes": "testbitmaponorder", "indexes": [ { "key": { "b": 1, "c": 1, "a": 1 }, "name": "b_c_a_1", "enableOrderedIndex": true } ] }', TRUE);
+
+SELECT documentdb_distributed_test_helpers.drop_primary_key('comp_db', 'testbitmaponorder');
+
+\d documentdb_data.documents_68013
+
+ANALYZE documentdb_data.documents_68013;
+
+set documentdb.forceDisableSeqScan to off;
+set documentdb.enableExtendedExplainPlans to off;
+set enable_indexscan to off;
+set enable_bitmapscan to on;
+set seq_page_cost to 1000;
+EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('comp_db', '{ "find": "testbitmaponorder", "filter": { "a": { "$gt": "" }  }, "sort": { "b": 1 } }');
+
+set work_mem to '64';
+WITH r1 AS (SELECT document FROM bson_aggregation_find('comp_db', '{ "find": "testbitmaponorder", "filter": { "a": { "$gt": "" }  }, "sort": { "b": 1 } }'))
+SELECT COUNT(*) FROM r1;

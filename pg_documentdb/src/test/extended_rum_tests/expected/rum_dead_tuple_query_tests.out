@@ -75,6 +75,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                              run_explain_and_trim                              
 -------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=1000 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -87,7 +88,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
          Heap Blocks: exact=10
          ->  Bitmap Index Scan on a_1 (actual rows=1000 loops=1)
                Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(13 rows)
+(14 rows)
 
 reset documentdb.forceDisableSeqScan;
 SELECT documentdb_api.delete('pvacuum_db_2', '{ "delete": "p_dead_tup", "deletes": [ { "q": { "_id": { "$gte": 10 } }, "limit": 0 } ]}');
@@ -103,6 +104,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                              run_explain_and_trim                             
 ------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -115,7 +117,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
          Heap Blocks: exact=10
          ->  Bitmap Index Scan on a_1 (actual rows=1000 loops=1)
                Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(13 rows)
+(14 rows)
 
 -- vacuum the main table with FREEZE - but skip the index prune (to generate LP_DEAD scenario deterministically)
 SELECT FORMAT('VACUUM (FREEZE ON, INDEX_CLEANUP OFF) documentdb_data.documents_%s', :vacuum_col) \gexec
@@ -127,6 +129,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -136,13 +139,14 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 1000)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(10 rows)
+(11 rows)
 
 SELECT documentdb_test_helpers.run_explain_and_trim(
     $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('pvacuum_db_2', '{ "find": "p_dead_tup", "filter": { "a": { "$exists": true } } }') $cmd$);
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -153,7 +157,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 9)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(11 rows)
+(12 rows)
 
 -- recovers the dead tuple values as is.
 set documentdb_rum.enable_support_dead_index_items to off;
@@ -162,6 +166,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -171,7 +176,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 1000)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(10 rows)
+(11 rows)
 
 -- now insert a document - should resurrect the tuple.
 -- first read the tuples & metadata.
@@ -248,6 +253,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                               
 ---------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=10 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -258,7 +264,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 11)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=10 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(11 rows)
+(12 rows)
 
 -- repeat with multi-key scenarios with posting lists
 SELECT FORMAT('TRUNCATE documentdb_data.documents_%s', :vacuum_col) \gexec
@@ -276,6 +282,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=10000 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: true
@@ -288,7 +295,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
          Heap Blocks: exact=114
          ->  Bitmap Index Scan on a_1 (actual rows=30000 loops=1)
                Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(13 rows)
+(14 rows)
 
 -- here we leave behind index tuples 1 to 10, even numbers and multiples of 3 until 30.
 reset documentdb.forceDisableSeqScan;
@@ -309,6 +316,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: true
@@ -319,7 +327,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 30000)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(11 rows)
+(12 rows)
 
 -- this will only clean up even more occurrences (since duplicate TID bitmap won't track kill_prior_tuple).
 SELECT documentdb_test_helpers.run_explain_and_trim(
@@ -327,6 +335,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: true
@@ -338,7 +347,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 26474)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(12 rows)
+(13 rows)
 
 -- this will only clean up even more occurrences (since duplicate TID bitmap won't track kill_prior_tuple).
 SELECT documentdb_test_helpers.run_explain_and_trim(
@@ -346,6 +355,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: true
@@ -357,7 +367,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 21280)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(12 rows)
+(13 rows)
 
 -- this will only clean up even more occurrences (since duplicate TID bitmap won't track kill_prior_tuple).
 SELECT documentdb_test_helpers.run_explain_and_trim(
@@ -365,6 +375,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: true
@@ -376,7 +387,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 14275)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(12 rows)
+(13 rows)
 
 -- recovers the dead tuple values as is.
 set documentdb_rum.enable_support_dead_index_items to off;
@@ -385,6 +396,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: true
@@ -395,7 +407,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 30000)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(11 rows)
+(12 rows)
 
 -- now resurrect multiple terms (should resurrect even when flag is off)
 set documentdb_rum.enable_support_dead_index_items to off;
@@ -497,6 +509,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=10000 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -509,7 +522,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
          Heap Blocks: exact=94
          ->  Bitmap Index Scan on a_1 (actual rows=10000 loops=1)
                Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(13 rows)
+(14 rows)
 
 reset documentdb.forceDisableSeqScan;
 SELECT documentdb_api.delete('pvacuum_db_2', '{ "delete": "p_dead_tup", "deletes": [ { "q": { "_id": { "$gte": 10 } }, "limit": 0 } ]}');
@@ -565,6 +578,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -574,7 +588,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 9198)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(10 rows)
+(11 rows)
 
 -- now set the GUC and query twice
 set documentdb_rum.enable_support_dead_index_items to on;
@@ -583,6 +597,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -592,7 +607,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 9198)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(10 rows)
+(11 rows)
 
 -- now set the GUC and query twice
 SELECT documentdb_test_helpers.run_explain_and_trim(
@@ -600,6 +615,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=9 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -610,7 +626,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 9198)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=9 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(11 rows)
+(12 rows)
 
 -- check page metadata
 WITH r1 AS (SELECT i, rum_dead_tuple_test.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_602', i)) as entry FROM generate_series(3, 8) i)
@@ -656,6 +672,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=0 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -666,7 +683,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 9198)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=0 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(11 rows)
+(12 rows)
 
 -- check page metadata
 WITH r1 AS (SELECT i, rum_dead_tuple_test.documentdb_rum_page_get_stats(public.get_raw_page('documentdb_data.documents_rum_index_602', i)) as entry FROM generate_series(3, 8) i)
@@ -720,6 +737,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
                                run_explain_and_trim                               
 ----------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=100 loops=1)
+   namespaceName: pvacuum_db_2.p_dead_tup
    indexName: a_1
    indexKey: {"a": 1}
    isMultiKey: false
@@ -730,7 +748,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
    scanKeyDetails: key 1: [(isInequality: true, estimatedEntryCount: 9798)]
    ->  Index Scan using a_1 on documents_601 collection (actual rows=100 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(11 rows)
+(12 rows)
 
 -- revive and print
 SELECT rum_dead_tuple_test.documentdb_rum_revive_index_tuples('documentdb_data.documents_rum_index_602'::regclass::oid, false);

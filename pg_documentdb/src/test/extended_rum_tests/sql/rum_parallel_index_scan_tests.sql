@@ -21,7 +21,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently(
     '{ "createIndexes": "parallel_scan", "indexes": [ { "key": { "b": 1 }, "name": "b_1", "enableCompositeTerm": false } ] }', TRUE);
 
 set documentdb.enableExtendedExplainPlans to on;
-set documentdb.enableIndexOrderbyPushdown to on;
 set enable_bitmapscan to off;
 SELECT documentdb_test_helpers.run_explain_and_trim(
     $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
@@ -30,7 +29,6 @@ SELECT documentdb_test_helpers.run_explain_and_trim(
 set parallel_tuple_cost to 0;
 set parallel_setup_cost to 0;
 set documentdb.enableCompositeParallelIndexScan to on;
-set documentdb.enableIndexOrderbyPushdown to on;
 set parallel_leader_participation to off;
 set enable_seqscan to off;
 set documentdb.forceParallelScanIfAvailable to on;

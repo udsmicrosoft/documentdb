@@ -116,7 +116,8 @@ PG_FUNCTION_INFO_V1(command_insert_txn_proc);
 
 
 static BatchInsertionSpec * BuildBatchInsertionSpec(bson_iter_t *insertCommandIter,
-													pgbsonsequence *insertDocs);
+													pgbsonsequence *insertDocs,
+													Datum *databaseNameDatum);
 static List * BuildInsertionList(bson_iter_t *insertArrayIter, bool *hasSkippedDocuments);
 static List * BuildInsertionListFromPgbsonSequence(pgbsonsequence *docSequence,
 												   bool *hasSkippedDocuments);
@@ -289,7 +290,8 @@ CreateCollectionForInsert(Datum databaseNameDatum, Datum collectionNameDatum)
  * a BatchInsertionSpec.
  */
 static BatchInsertionSpec *
-BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDocs)
+BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDocs,
+						Datum *databaseNameDatum)
 {
 	const char *collectionName = NULL;
 	List *documents = NIL;
@@ -358,6 +360,10 @@ BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDo
 			SetExplicitStatementTimeout(BsonValueAsInt32(bson_iter_value(
 															 insertCommandIter)));
 		}
+		else if (strcmp(field, "$db") == 0)
+		{
+			ValidateOrExtractDatabaseNameFromSpec(insertCommandIter, databaseNameDatum);
+		}
 		else if (IsCommonSpecIgnoredField(field))
 		{
 			elog(DEBUG1, "Command field not recognized: insert.%s", field);
@@ -376,6 +382,11 @@ BuildBatchInsertionSpec(bson_iter_t *insertCommandIter, pgbsonsequence *insertDo
 								"The BSON field 'insert.%s' is not recognized as a valid field.",
 								field)));
 		}
+	}
+
+	if (*databaseNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errmsg("Database name must not be NULL value")));
 	}
 
 	if (collectionName == NULL)
@@ -1037,11 +1048,6 @@ ProcessInsertion(MongoCollection *collection,
 static Datum
 CommandInsertCore(PG_FUNCTION_ARGS, InsertMode insertMode, MemoryContext allocContext)
 {
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("Database name must not be NULL value")));
-	}
-
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("insert document cannot be NULL")));
@@ -1049,8 +1055,8 @@ CommandInsertCore(PG_FUNCTION_ARGS, InsertMode insertMode, MemoryContext allocCo
 
 	ThrowIfServerOrTransactionReadOnly();
 
-	Datum databaseNameDatum = PG_GETARG_DATUM(0);
 	pgbson *insertSpec = PG_GETARG_PGBSON(1);
+	Datum databaseNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
 
 	pgbsonsequence *insertDocs = PG_GETARG_MAYBE_NULL_PGBSON_SEQUENCE(2);
 
@@ -1077,7 +1083,9 @@ CommandInsertCore(PG_FUNCTION_ARGS, InsertMode insertMode, MemoryContext allocCo
 
 	/* we first validate insert command BSON and build a specification */
 	BatchInsertionSpec *batchSpec = BuildBatchInsertionSpec(&insertCommandIter,
-															insertDocs);
+															insertDocs,
+															&databaseNameDatum);
+
 	ReportInsertFeatureUsage(list_length(batchSpec->documents));
 	BatchInsertionResult batchResult;
 	batchResult.resultMemoryContext = allocContext;
@@ -1363,6 +1371,12 @@ InsertOrReplaceDocument(uint64 collectionId, const char *shardTableName, int64
 	{
 		planId = QUERY_ID_INSERT_OR_REPLACE_NEW;
 
+		char *additionalArgs = "";
+		if (IsClusterVersionAtleast(DocDB_V0, 111, 0))
+		{
+			additionalArgs = ", ctid, tableoid";
+		}
+
 		if (shardTableName != NULL && shardTableName[0] != '\0')
 		{
 			/* Direct shard - we need to extract tableId_shardId as a suffix */
@@ -1372,12 +1386,12 @@ InsertOrReplaceDocument(uint64 collectionId, const char *shardTableName, int64
 			appendStringInfo(&query, " ON CONFLICT ON CONSTRAINT collection_pk_%s"
 									 " DO UPDATE SET document ="
 									 " COALESCE(%s.update_bson_document("
-									 " %s.documents_%s.document, %s.bson_from_bytea($4), '{}'::%s.bson, NULL::%s.bson, NULL::%s.bson, NULL::TEXT),"
+									 " %s.documents_%s.document, %s.bson_from_bytea($4), '{}'::%s.bson, NULL::%s.bson, NULL::%s.bson, NULL::TEXT%s),"
 									 " %s.documents_%s.document)",
 							 shardSuffix, ApiInternalSchemaNameV2, ApiDataSchemaName,
 							 shardSuffix, CoreSchemaName, CoreSchemaName, CoreSchemaName,
-							 CoreSchemaName, ApiDataSchemaName,
-							 shardSuffix);
+							 CoreSchemaName, additionalArgs,
+							 ApiDataSchemaName, shardSuffix);
 		}
 		else
 		{
@@ -1385,12 +1399,13 @@ InsertOrReplaceDocument(uint64 collectionId, const char *shardTableName, int64
 							 " ON CONFLICT ON CONSTRAINT collection_pk_" UINT64_FORMAT
 							 " DO UPDATE SET document ="
 							 " COALESCE(%s.update_bson_document(%s.documents_"UINT64_FORMAT
-							 ".document, %s.bson_from_bytea($4), '{}'::%s.bson, NULL::%s.bson, NULL::%s.bson, NULL::TEXT),"
+							 ".document, %s.bson_from_bytea($4), '{}'::%s.bson, NULL::%s.bson, NULL::%s.bson, NULL::TEXT%s),"
 							 " %s.documents_"UINT64_FORMAT ".document)",
 							 collectionId, ApiInternalSchemaNameV2, ApiDataSchemaName,
 							 collectionId,
 							 CoreSchemaName, CoreSchemaName, CoreSchemaName,
-							 CoreSchemaName, ApiDataSchemaName, collectionId);
+							 CoreSchemaName, additionalArgs,
+							 ApiDataSchemaName, collectionId);
 		}
 	}
 	else

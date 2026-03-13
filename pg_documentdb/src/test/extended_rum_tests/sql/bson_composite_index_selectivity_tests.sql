@@ -5,6 +5,44 @@ SET documentdb.next_collection_index_id TO 200;
 
 set documentdb.defaultUseCompositeOpClass to on;
 
+CREATE SCHEMA index_selectivity_tests;
+CREATE FUNCTION index_selectivity_tests.validate_explain_has_minimal_bounds(query text) RETURNS void
+ LANGUAGE plpgsql AS $$
+DECLARE
+    v_explain_row text;
+    v_has_index_bounds boolean := false;
+BEGIN
+    FOR v_explain_row IN EXECUTE p_query
+    LOOP
+        IF v_explain_row LIKE '%indexBounds:%' THEN
+            v_has_index_bounds := true;
+            IF LOWER(v_explain_row) LIKE '%minkey%' OR LOWER(v_explain_row) LIKE '%maxkey%' THEN
+                RAISE EXCEPTION 'Pushed to an index which has a path that is not fully constrained %', v_explain_row;
+            END IF;
+        END IF;
+    END LOOP;
+    IF NOT v_has_index_bounds THEN
+        RAISE EXCEPTION 'Expected index bounds not found in EXPLAIN output for query: %', p_query;
+    END IF;
+END;
+$$;
+
+CREATE FUNCTION index_selectivity_tests.transform_explain_index_bounds(p_query text) RETURNS SETOF TEXT
+ LANGUAGE plpgsql AS $$
+DECLARE
+    v_explain_row text;
+BEGIN
+    FOR v_explain_row IN EXECUTE p_query
+    LOOP
+        IF regexp_like(v_explain_row, '.+startup cost=[0-9\.]+, total cost=[0-9\.]+, selectivity=[0-9\.e-]+, correlation=[0-9\.]+, estimated index pages loaded=[0-9\.]+%, estimated total index entries=5000, boundary selectivity=[0-9\.e-]+, num boundaries=[0-9]+, estimated data pages loaded=[0-9\.]+%') THEN
+            RETURN NEXT regexp_replace(v_explain_row, '=[0-9\.e-]+', '=xx.xx', 'g');
+        ELSE
+            RETURN NEXT v_explain_row;
+        END IF;
+    END LOOP;
+END;
+$$;
+
 -- create 2 single path indexes
 SELECT documentdb_api_internal.create_indexes_non_concurrently(
     'comp_idb', '{ "createIndexes": "comp_index_selectivity", "indexes": [ { "name": "comp_index1", "key": { "path1": 1 } } ] }', TRUE);
@@ -24,6 +62,14 @@ EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb', '{ "f
 set documentdb.enableCompositeIndexPlanner to on;
 EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb', '{ "find": "comp_index_selectivity", "filter": { "path1": 5, "path2": { "$gt": 500 } }}');
 
+set documentdb.enableExplainScanIndexCosts to on;
+set documentdb.enableExtendedExplainPlans to on;
+SELECT index_selectivity_tests.transform_explain_index_bounds($cmd$ 
+    EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb', '{ "find": "comp_index_selectivity", "filter": { "path1": 5, "path2": { "$gt": 500 } }}');
+$cmd$);
+reset documentdb.enableExplainScanIndexCosts;
+reset documentdb.enableExtendedExplainPlans;
+
 -- repeat this setup but with documents > 1 KB
 TRUNCATE documentdb_data.documents_201;
 
@@ -36,3 +82,112 @@ EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb', '{ "f
 
 set documentdb.enableCompositeIndexPlanner to on;
 EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb', '{ "find": "comp_index_selectivity", "filter": { "path1": 5, "path2": { "$gt": 500 } }}');
+
+set documentdb.enableExtendedExplainPlans to on;
+set documentdb.enableCompositeIndexPlanner to off;
+
+-- Create indexes on the two $or branch fields and a compound sort index
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "name": "idx_refs_val", "key": { "refs.val": 1 } } ] }', TRUE);
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "name": "idx_code_id", "key": { "code": 1, "_id": 1 } } ] }', TRUE);
+
+-- Insert docs > 1KB with padding. Many docs match the $in filter to make BitmapOr + Sort expensive.
+SELECT COUNT(documentdb_api.insert_one('comp_idb', 'generic_selectiviity_coll',
+    bson_build_document(
+        '_id'::text, i,
+        'code'::text, CASE WHEN i % 5 = 0 THEN 'xK9mTargetValue' ELSE 'otherVal' || i END,
+        'refs'::text, ('[ { "val": "' || CASE WHEN i % 7 = 0 THEN 'xK9mTargetValue' ELSE 'otherRef' || i END || '" } ]')::bson,
+        'removed'::text, CASE WHEN i % 100 = 0 THEN true ELSE false END,
+        'padding'::text, repeat('z', 2000)
+    ))) FROM generate_series(1, 10000) i;
+
+ANALYZE documentdb_data.documents_202;
+
+-- Test: $or with $in on separate indexes should not bitmap OR with composite planner
+-- This reproduces a scenario where a query with $or, $ne, sort and limit picks a
+-- bitmap OR plan unless enableCompositeIndexPlanner is set, where the composite planner
+-- adjusts cost estimates on large documents to prefer the ordered index scan.
+-- Without composite planner: uses Bitmap OR (suboptimal for large docs with sort + limit)
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb',
+    '{ "find": "generic_selectiviity_coll", "filter": { "$or": [ { "code": { "$in": [ "xK9mTargetValue" ] } }, { "refs.val": { "$in": [ "xK9mTargetValue" ] } } ], "removed": { "$ne": true } }, "sort": { "code": 1 }, "limit": 50 }');
+
+-- With composite planner: should use Bitmap OR
+set documentdb.enableCompositeIndexPlanner to on;
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb',
+    '{ "find": "generic_selectiviity_coll", "filter": { "$or": [ { "code": { "$in": [ "xK9mTargetValue" ] } }, { "refs.val": { "$in": [ "xK9mTargetValue" ] } } ], "removed": { "$ne": true } }, "sort": { "code": 1 }, "limit": 50 }');
+
+-- Test: composite planner picks optimal compound index for multi-field filter with sort + limit
+-- Without composite planner, the planner picks a suboptimal index whose leading key is more
+-- selective but does not align with the sort. With composite planner, it picks the compound
+-- index whose key order aligns with the sort, avoiding an expensive sort step on large docs.
+set documentdb.enableCompositeIndexPlanner to off;
+
+-- Drop indexes from previous test and truncate
+CALL documentdb_api.drop_indexes('comp_idb', '{ "dropIndexes": "generic_selectiviity_coll", "index": ["idx_refs_val", "idx_code_id"] }');
+TRUNCATE documentdb_data.documents_202;
+
+-- Create three compound indexes
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "name": "idx_flag_groupId_ownerId", "key": { "flag": 1, "groupId": 1, "_id.ownerId": 1 } } ] }', TRUE);
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "name": "idx_flag_ownerGroupId_ownerId", "key": { "flag": 1, "_id.ownerGroupId": 1, "_id.ownerId": 1 } } ] }', TRUE);
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "name": "idx_ownerId_groupId_state_flag_id", "key": { "_id.ownerId": 1, "groupId": 1, "state": 1, "flag": 1, "_id": 1 } } ] }', TRUE);
+
+-- Insert 5000 docs > 1KB with compound _id
+SELECT COUNT(documentdb_api.insert_one('comp_idb', 'generic_selectiviity_coll',
+    ('{ "_id": { "ownerId": "owner-' || (i % 10)::text || '", "ownerGroupId": "ownerGroup-' || (i % 50)::text || '", "seq": ' || i::text ||
+     ' }, "flag": ' || CASE WHEN i % 50 = 0 THEN 'true' ELSE 'false' END ||
+     ', "groupId": "group-' || (i % 200)::text ||
+     '", "state": "active", "padding": "' || repeat('z', 1100) || '" }')::bson
+    )) FROM generate_series(1, 5000) i;
+
+ANALYZE documentdb_data.documents_202;
+
+-- Without composite planner: picks suboptimal idx_ownerId_groupId_state_flag_id
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb',
+    '{ "find": "generic_selectiviity_coll", "filter": { "flag": false, "_id.ownerId": { "$in": ["owner-3"] }, "groupId": { "$in": ["group-0", "group-1", "group-2", "group-3", "group-4", "group-5", "group-6", "group-7", "group-8", "group-9", "group-10" ] } }, "sort": { "groupId": 1, "_id": 1 }, "limit": 500 }');
+
+-- With composite planner: picks optimal idx_flag_groupId_ownerId
+set documentdb.enableCompositeIndexPlanner to on;
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb',
+    '{ "find": "generic_selectiviity_coll", "filter": { "flag": false, "_id.ownerId": { "$in": ["owner-3"] }, "groupId": { "$in": ["group-0", "group-1", "group-2", "group-3", "group-4", "group-5", "group-6", "group-7", "group-8", "group-9", "group-10" ] } }, "sort": { "groupId": 1, "_id": 1 }, "limit": 500 }');
+
+-- Test: composite planner picks correct index with $elemMatch on nested arrays
+-- Reproduces https://github.com/documentdb/documentdb/issues/405
+-- Without composite planner, a shorter prefix-matching index is picked instead of the
+-- longer compound index that covers the $elemMatch fields.
+set documentdb.enableCompositeIndexPlanner to off;
+set enable_seqscan to on;
+set enable_bitmapscan to on;
+
+-- Drop indexes from previous test and truncate
+CALL documentdb_api.drop_indexes('comp_idb', '{ "dropIndexes": "generic_selectiviity_coll", "index": ["idx_flag_groupId_ownerId", "idx_flag_ownerGroupId_ownerId", "idx_ownerId_groupId_state_flag_id"] }');
+TRUNCATE documentdb_data.documents_202;
+
+-- Create three compound indexes with enableOrderedIndex
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "key": { "tenantId": 1, "active": 1, "status": 1, "steps.assignees.userId": 1, "steps.assignees.status": 1, "steps.assignees.active": 1, "label": 1 }, "name": "idx_tenant_active_status_userId_assigneeStatus_assigneeActive_label", "enableOrderedIndex": true } ] }', TRUE);
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "key": { "tenantId": 1, "steps.assignees.userId": 1, "steps.assignees.status": 1, "steps.assignees.active": 1, "steps.assignees.updatedAt": -1 }, "name": "idx_tenant_userId_assigneeStatus_assigneeActive_updatedAt", "enableOrderedIndex": true } ] }', TRUE);
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'comp_idb', '{ "createIndexes": "generic_selectiviity_coll", "indexes": [ { "key": { "tenantId": 1, "active": 1, "status": 1, "createdAt": -1 }, "name": "idx_tenant_active_status_createdAt", "enableOrderedIndex": true } ] }', TRUE);
+
+-- Insert 1000 docs with nested array structure
+SELECT COUNT(documentdb_api.insert_one('comp_idb', 'generic_selectiviity_coll',
+    FORMAT('{ "_id": %s, "tenantId": "tenant-abc-001", "active": 1, "status": 1, "steps": [ { "assignees": [ { "status": 4, "active": 1, "userId": "user-xyz-001", "updatedAt": "20260101120000" } ] } ], "label": "entry-name" }', i)::bson
+    )) FROM generate_series(1, 1000) i;
+
+ANALYZE documentdb_data.documents_202;
+
+-- Without composite planner: picks idx_tenant_active_status_createdAt (suboptimal, only matches 3-field prefix)
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb',
+    '{ "find": "generic_selectiviity_coll", "filter": { "tenantId": { "$in": ["tenant-abc-001", "tenant-abc-002"] }, "active": 1, "status": { "$in": [1, 2, 3] }, "steps.assignees": { "$elemMatch": { "userId": "user-xyz-001", "status": 4, "active": 1 } } } }');
+
+-- With composite planner: picks a better index that covers more query fields
+set documentdb.enableCompositeIndexPlanner to on;
+set enable_seqscan to off;
+set enable_bitmapscan to off;
+EXPLAIN (COSTS OFF) SELECT document FROM bson_aggregation_find('comp_idb',
+    '{ "find": "generic_selectiviity_coll", "filter": { "tenantId": { "$in": ["tenant-abc-001", "tenant-abc-002"] }, "active": 1, "status": { "$in": [1, 2, 3] }, "steps.assignees": { "$elemMatch": { "userId": "user-xyz-001", "status": 4, "active": 1 } } } }');

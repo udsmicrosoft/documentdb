@@ -102,7 +102,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('db', documentdb_
 
 BEGIN;
 set local enable_seqscan TO off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 -- EXPLAIN QUERIES
 EXPLAIN (COSTS OFF) SELECT object_id, document FROM documentdb_api.collection('db', 'decimal128') WHERE document @< '{ "a": {"$numberDecimal": "Infinity"} }';
 EXPLAIN (COSTS OFF) SELECT object_id, document FROM documentdb_api.collection('db', 'decimal128') WHERE document @<= '{ "a": {"$numberDecimal": "Infinity"} }';

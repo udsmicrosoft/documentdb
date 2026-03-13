@@ -117,7 +117,7 @@ BEGIN
   END LOOP;
   RETURN;
 END; $$ language plpgsql;
-CREATE OR REPLACE FUNCTION documentdb_distributed_test_helpers.run_explain_and_trim(p_query text)
+CREATE OR REPLACE FUNCTION documentdb_distributed_test_helpers.run_explain_and_trim(p_query text, p_ignore_heap_fetches boolean DEFAULT false)
 RETURNS SETOF text
 AS $$
 DECLARE
@@ -129,6 +129,8 @@ BEGIN
       CONTINUE;
     ELSIF v_explain_row ~ '^\s+Index Searches: [0-9]+\s*$' THEN
       CONTINUE;
+    ELSIF p_ignore_heap_fetches AND v_explain_row ~ '^\s+Heap Fetches: [0-9]+\s*$' THEN
+      SELECT regexp_replace(v_explain_row, 'Heap Fetches: [0-9]+', 'Heap Fetches: xxx') INTO v_explain_row;
     ELSIF v_explain_row ~ 'Parallel Index Scan using .+ on documents_[0-9]+ collection \(actual rows=[0-9\.]+ loops=[0-9]+\)' THEN
       SELECT regexp_replace(v_explain_row, 'Parallel Index Scan using (.+) on documents_([0-9]+) collection \(actual rows=[0-9\.]+ loops=([0-9]+)\)',
                                            'Parallel Index Scan using \1 on documents_\2 collection (actual rows=xyz loops=\3)') INTO v_explain_row;
@@ -221,6 +223,7 @@ DECLARE
   completed boolean := false;
   indexRequest text;
   index_cmd_stored text;
+  attempt_count int := 0;
 BEGIN
   SET search_path TO documentdb_core,documentdb_api;
   SELECT * INTO create_index_response FROM documentdb_api.create_indexes_background(p_database_name, p_index_spec);
@@ -249,7 +252,13 @@ BEGIN
           END IF;
           
           COMMIT; -- COMMIT so that CREATE INDEX CONCURRENTLY does not wait for documentdb_distributed_test_helpers.create_indexes_background
+
+          -- don't wait longer than 10 seconds for the index build to complete. This avoids timeouts due to infinite waits.
+          IF attempt_count > 100 THEN
+            RAISE EXCEPTION 'Waited too long for index build to complete. Last response from check_build_index_status: %', check_build_index_status;
+          END IF;
           PERFORM pg_sleep_for('100 ms');
+          attempt_count := attempt_count + 1;
       END LOOP;
     ELSE
       ok := create_index_response.ok;

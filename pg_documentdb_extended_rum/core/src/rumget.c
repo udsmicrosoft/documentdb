@@ -841,10 +841,6 @@ restartScanEntry:
 			entry->isFinished = false;
 		}
 	}
-	else if (entry->curKeyCategory == RUM_CAT_ORDER_ITEM)
-	{
-		ereport(ERROR, (errmsg("Unsupported call startScanEntry on order item key")));
-	}
 	else if (btreeEntry.findItem(&btreeEntry, stackEntry) ||
 			 (entry->queryCategory == RUM_CAT_EMPTY_QUERY &&
 			  entry->scanWithAddInfo))
@@ -1881,7 +1877,7 @@ startScan(IndexScanDesc scan)
 		scanType = RumOrderedScan;
 		startOrderedScanEntries(scan, rumstate, so);
 	}
-	else if (so->norderbys > 0 &&
+	else if ((so->norderbys > 0 || RumEnableOrderedOperatorScans) &&
 			 so->willSort && !rumstate->useAlternativeOrder)
 	{
 		scanType = RumOrderedScan;
@@ -4154,7 +4150,7 @@ MoveScanForward(RumScanOpaque so, Snapshot snapshot, ParallelIndexScanDesc paral
 			}
 			else if (RumEnableSkipIntermediateEntry && canSkipCheck &&
 					 ScanDirectionIsForward(so->orderScanDirection) &&
-					 so->totalentries == 1 &&
+					 so->totalsearchentries == 1 &&
 					 so->rumstate.canOuterOrdering[so->orderByScanData->orderByEntry->
 												   attnum - 1] &&
 					 so->rumstate.outerOrderingFn[so->orderByScanData->orderByEntry->
@@ -4162,7 +4158,7 @@ MoveScanForward(RumScanOpaque so, Snapshot snapshot, ParallelIndexScanDesc paral
 			{
 				/* In this path, the orderbyEntry marked itself to push the scan forward due to the tail entry being done
 				 * but the prefix of it being unbounded.
-				 * TODO: Lift the restriction for so->totalentries == 1 by tracking multiple orderby entries here.
+				 * TODO: Lift the restriction for so->totalsearchentries == 1 by tracking multiple orderby entries here.
 				 * That's because the new value for the sortEntry *could* skip over ranges that are valid for other entries.
 				 */
 				bool resetScan = false;
@@ -4628,17 +4624,17 @@ rumgettuple(IndexScanDesc scan, ScanDirection direction)
 
 	if (so->firstCall)
 	{
+		if (!ScanDirectionIsNoMovement(direction))
+		{
+			so->orderScanDirection = direction;
+		}
+
 		/*
 		 * Set up the scan keys, and check for unsatisfiable query.
 		 */
 		if (RumIsNewKey(scan))
 		{
 			rumNewScanKey(scan);
-		}
-
-		if (!ScanDirectionIsNoMovement(direction))
-		{
-			so->orderScanDirection = direction;
 		}
 
 		so->firstCall = false;

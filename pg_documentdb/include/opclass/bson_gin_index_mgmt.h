@@ -243,7 +243,9 @@ void GetCollationFromIndexOptions(void *indexOptions, StringView *collationStrin
 
 struct PlannerInfo;
 bool TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct
-										PlannerInfo *root);
+										PlannerInfo *root, bool *canSupportIndexOnlyScan);
+List * ExtractBoundaryQualsForOrderedIndexPath(struct IndexPath *indexPath,
+											   int *num_sa_scans);
 
 /* Helper macro to retrieve a length prefixed value in the index options */
 #define Get_Index_Path_Option(options, field, result, resultFieldLength) \

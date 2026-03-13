@@ -1214,7 +1214,15 @@ ShardCollectionCore(ShardCollectionArgs *args)
 		collection = GetMongoCollectionByNameDatum(
 			databaseDatum, collectionDatum, AccessShareLock);
 
-		Assert(collection != NULL);
+		if (collection == NULL)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("Failed to create collection %s.%s for sharding",
+								   args->databaseName, args->collectionName),
+							errdetail_log(
+								"Collection was not found after implicit create for sharding for %s.%s",
+								args->databaseName, args->collectionName)));
+		}
 	}
 
 	if (collection->shardKey == NULL &&
@@ -1512,7 +1520,7 @@ ShardCollectionCore(ShardCollectionArgs *args)
 		SetGUCLocally(psprintf("%s.defaultUseCompositeOpClass", ApiGucPrefixV2), "false");
 
 		bool buildAsUniqueForPrepareUnique = isPrepareUniqueSupported;
-		CreateIndexesArg createIndexesArg = ParseCreateIndexesArg(databaseDatum,
+		CreateIndexesArg createIndexesArg = ParseCreateIndexesArg(&databaseDatum,
 																  createIndexesMsg,
 																  buildAsUniqueForPrepareUnique);
 		bool skipCheckCollectionCreate = createIndexesArg.blocking;

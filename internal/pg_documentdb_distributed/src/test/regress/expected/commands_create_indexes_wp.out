@@ -560,7 +560,6 @@ SELECT documentdb_distributed_test_helpers.drop_primary_key('wp_test', 'ok_test_
 SET citus.propagate_set_commands TO 'local';
 BEGIN;
   set local enable_seqscan TO OFF;
-  set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
   -- can use idx_1
   EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('wp_test', 'ok_test_5') WHERE document OPERATOR(documentdb_api_catalog.@@) '{"d.e.f": 1, "_id": 0}';
                                                                                                                       QUERY PLAN                                                                                                                       

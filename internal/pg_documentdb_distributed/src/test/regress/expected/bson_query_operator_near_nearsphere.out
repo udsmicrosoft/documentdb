@@ -1698,10 +1698,10 @@ SELECT document FROM bson_aggregation_distinct('db', '{ "distinct": "near_sphere
 -- With sort on findAndModify with near, sort takes precedence
 SELECT documentdb_api.find_and_modify('db', '{"findAndModify": "near_sphere_distinct", "query": { "loc.coordinates": { "$near": [0, 0], "$maxDistance": 1} }, "sort": {"_id": -1}, "update": {"a": 10}, "fields": {"_id": 1}}');
 ERROR:  Operators $geoNear, $near, and $nearSphere cannot be used in this particular context
-CONTEXT:  SQL statement "SELECT ctid, object_id, document FROM documentdb_data.documents_5231_523025 WHERE  documentdb_api_internal.bson_query_match(document, $1::documentdb_core.bson, $2::documentdb_core.bson, $3::text) ORDER BY documentdb_api_catalog.bson_orderby(document, $4::documentdb_core.bson) DESC LIMIT 1 FOR UPDATE"
+CONTEXT:  SQL statement "SELECT ctid, object_id, document, tableoid FROM documentdb_data.documents_5231_523025 WHERE  documentdb_api_internal.bson_query_match(document, $1::documentdb_core.bson, $2::documentdb_core.bson, $3::text) ORDER BY documentdb_api_catalog.bson_orderby(document, $4::documentdb_core.bson) DESC LIMIT 1 FOR UPDATE"
 SQL statement " SELECT documentdb_api_internal.update_worker($1, $2, $3, $4::documentdb_core.bson, $5::documentdb_core.bsonsequence, $6) FROM documentdb_data.documents_5231 WHERE shard_key_value = 5231"
 -- If no sort clause then near decides the ordering
 SELECT documentdb_api.find_and_modify('db', '{"findAndModify": "near_sphere_distinct", "query": { "loc.coordinates": { "$near": [30, 30]} }, "update": {"a": 10}, "fields": {"_id": 1}}');
 ERROR:  Operators $geoNear, $near, and $nearSphere cannot be used in this particular context
-CONTEXT:  SQL statement "SELECT ctid, object_id, document FROM documentdb_data.documents_5231_523025 WHERE  documentdb_api_internal.bson_query_match(document, $1::documentdb_core.bson, $2::documentdb_core.bson, $3::text) LIMIT 1 FOR UPDATE"
+CONTEXT:  SQL statement "SELECT ctid, object_id, document, tableoid FROM documentdb_data.documents_5231_523025 WHERE  documentdb_api_internal.bson_query_match(document, $1::documentdb_core.bson, $2::documentdb_core.bson, $3::text) LIMIT 1 FOR UPDATE"
 SQL statement " SELECT documentdb_api_internal.update_worker($1, $2, $3, $4::documentdb_core.bson, $5::documentdb_core.bsonsequence, $6) FROM documentdb_data.documents_5231 WHERE shard_key_value = 5231"

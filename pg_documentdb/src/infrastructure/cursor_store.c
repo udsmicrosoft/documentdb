@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
+#include <utime.h>
 
 #include "metadata/metadata_cache.h"
 #include "utils/documentdb_errors.h"
@@ -471,6 +472,12 @@ DeserializeFileState(bytea *cursorFileState)
 				 errmsg("Failed to open file \"%s\": %m",
 						fileState->cursorState.cursorFileName)));
 	}
+
+	/*
+	 * Update the file's modification time so the TTL-based cleanup in
+	 * cursor_directory_cleanup does not expire an actively-used cursor.
+	 */
+	utime(fileState->cursorState.cursorFileName, NULL);
 
 	/* Register the cursor file for transaction abort */
 	strncpy(PendingCursorFile, fileState->cursorState.cursorFileName, NAMEDATALEN);

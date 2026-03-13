@@ -22,6 +22,7 @@
 #include <nodes/nodeFuncs.h>
 #include <catalog/pg_am.h>
 #include <optimizer/paths.h>
+#include <parser/parsetree.h>
 #include <optimizer/pathnode.h>
 #include "nodes/pg_list.h"
 #include <pg_config_manual.h>
@@ -30,14 +31,18 @@
 #include <optimizer/cost.h>
 #include <access/genam.h>
 #include <utils/index_selfuncs.h>
+#include <access/gin.h>
+#include <catalog/pg_collation.h>
 
 #include "metadata/index.h"
 #include "query/query_operator.h"
+#include "collation/collation.h"
 #include "opclass/bson_gin_index_types_core.h"
 #include "geospatial/bson_geospatial_geonear.h"
 #include "planner/mongo_query_operator.h"
 #include "opclass/bson_index_support.h"
 #include "opclass/bson_gin_index_mgmt.h"
+#include "opclass/bson_gin_composite_scan.h"
 #include "opclass/bson_text_gin.h"
 #include "metadata/metadata_cache.h"
 #include "utils/documentdb_errors.h"
@@ -49,6 +54,7 @@
 #include "query/bson_dollar_selectivity.h"
 #include "planner/documentdb_planner.h"
 #include "aggregation/bson_query_common.h"
+#include "index_am/documentdb_rum.h"
 
 typedef struct
 {
@@ -194,6 +200,8 @@ typedef struct IndexElemmatchState
 	List *pathStates;
 } IndexElemmatchState;
 
+extern bool EnableExtendedExplainPlans;
+extern bool EnableExplainScanIndexCosts;
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
@@ -225,12 +233,13 @@ static bool IsMatchingPathForQueryOperator(RelOptInfo *rel, Path *path,
 static Expr * ProcessFullScanForOrderBy(SupportRequestIndexCondition *req, List *args);
 static OpExpr * CreateFullScanOpExpr(Expr *documentExpr, const char *sourcePath, uint32_t
 									 sourcePathLength, int32_t orderByScanDirection);
+static Expr * CreateKnownFullScanExpr(Datum queryValue, Expr *documentExpr, int
+									  sortDirection);
 static OpExpr * CreateExistsTrueOpExpr(Expr *documentExpr, const char *sourcePath,
 									   uint32_t sourcePathLength);
 static List * GetSortDetails(PlannerInfo *root, Index rti,
 							 bool *hasOrderBy, bool *hasGroupby, bool *isOrderById);
 static bool IsValidIndexPathForIdOrderBy(IndexPath *indexPath, List *sortDetails);
-static bool IsValidForIndexOnlyScans(PlannerInfo *root);
 
 /*-------------------------------*/
 /* Force index support functions */
@@ -281,6 +290,8 @@ static bool TryUseAlternateIndexForPrimaryKeyLookup(PlannerInfo *root, RelOptInf
 													context,
 													MatchIndexPath matchIndexPath);
 static void PrimaryKeyLookupUnableToFindIndex(void);
+static bool IndexClauseIsValidForIndexOnlyScan(const IndexClause *clause,
+											   bytea *indexOptions);
 
 static const ForceIndexSupportFuncs ForceIndexOperatorSupport[] =
 {
@@ -335,16 +346,15 @@ static const ForceIndexSupportFuncs ForceIndexOperatorSupport[] =
 
 extern bool EnableVectorForceIndexPushdown;
 extern bool EnableGeonearForceIndexPushdown;
-extern bool EnableNewOperatorSelectivityMode;
 extern bool EnableCompositeIndexPlanner;
 extern bool LowSelectivityForLookup;
-extern bool EnableIndexOrderbyPushdown;
 extern bool EnableExprLookupIndexPushdown;
 extern bool EnableUnifyPfeOnIndexInfo;
 extern bool EnableIdIndexPushdown;
 extern bool ForceIndexOnlyScanIfAvailable;
 extern bool EnableIdIndexCustomCostFunction;
 extern bool EnableIndexOnlyScan;
+extern bool EnableIndexOnlyScanOnCostFunction;
 extern bool EnableOrderByIdOnCostFunction;
 extern bool EnablePrimaryKeyCursorScan;
 
@@ -400,7 +410,7 @@ dollar_support(PG_FUNCTION_ARGS)
 	else if (IsA(supportRequest, SupportRequestSelectivity))
 	{
 		SupportRequestSelectivity *req = (SupportRequestSelectivity *) supportRequest;
-		if ((EnableNewOperatorSelectivityMode || EnableCompositeIndexPlanner))
+		if (EnableCompositeIndexPlanner)
 		{
 			const MongoIndexOperatorInfo *indexOperator =
 				GetMongoIndexOperatorInfoByPostgresFuncId(req->funcid);
@@ -644,13 +654,9 @@ OpExprForAggregationStageSupportFunction(Node *supportRequest)
 }
 
 
-/*
- * Checks if an Expr is the expression
- * WHERE shard_key_value = 'collectionId'
- * and is an unsharded equality operator.
- */
-bool
-IsOpExprShardKeyForUnshardedCollections(Expr *expr, uint64 collectionId)
+/* Checks if the expr is a shard key equality expr and if so returns true and populates the shardKeyValue */
+static bool
+IsOpExprShardKey(Expr *expr, int64 *shardKeyValue)
 {
 	if (!IsA(expr, OpExpr))
 	{
@@ -673,8 +679,31 @@ IsOpExprShardKeyForUnshardedCollections(Expr *expr, uint64 collectionId)
 
 	Var *firstArgVar = (Var *) firstArg;
 	Const *secondArgConst = (Const *) secondArg;
-	return firstArgVar->varattno == DOCUMENT_DATA_TABLE_SHARD_KEY_VALUE_VAR_ATTR_NUMBER &&
-		   DatumGetInt64(secondArgConst->constvalue) == (int64) collectionId;
+	if (firstArgVar->varattno == DOCUMENT_DATA_TABLE_SHARD_KEY_VALUE_VAR_ATTR_NUMBER)
+	{
+		if (shardKeyValue != NULL && !secondArgConst->constisnull)
+		{
+			*shardKeyValue = DatumGetInt64(secondArgConst->constvalue);
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * Checks if an Expr is the expression
+ * WHERE shard_key_value = 'collectionId'
+ * and is an unsharded equality operator.
+ */
+bool
+IsOpExprShardKeyForUnshardedCollections(Expr *expr, uint64 collectionId)
+{
+	int64 extractedShardKeyValue = 0;
+	return IsOpExprShardKey(expr, &extractedShardKeyValue) &&
+		   extractedShardKeyValue == (int64) collectionId;
 }
 
 
@@ -1427,36 +1456,250 @@ static inline bool
 IndexStrategySupportsIndexOnlyScan(BsonIndexStrategy indexStrategy)
 {
 	return !IsNegationStrategy(indexStrategy) &&
+		   indexStrategy != BSON_INDEX_STRATEGY_INVALID &&
+		   indexStrategy != BSON_INDEX_STRATEGY_DOLLAR_GEOINTERSECTS &&
+		   indexStrategy != BSON_INDEX_STRATEGY_DOLLAR_GEOWITHIN &&
+		   indexStrategy != BSON_INDEX_STRATEGY_DOLLAR_TEXT &&
 		   indexStrategy != BSON_INDEX_STRATEGY_DOLLAR_ELEMMATCH &&
 		   indexStrategy != BSON_INDEX_STRATEGY_DOLLAR_TYPE &&
-		   indexStrategy != BSON_INDEX_STRATEGY_DOLLAR_SIZE &&
-		   indexStrategy != BSON_INDEX_STRATEGY_INVALID;
+		   indexStrategy != BSON_INDEX_STRATEGY_DOLLAR_SIZE;
 }
 
 
 static inline bool
-IsShardKeyFilterBoolExpr(BoolExpr *boolExpr, RestrictInfo *shardKeyExpr)
+IsScalarArrayOpExprTrimmable(const ScalarArrayOpExpr *scalarArrayOpExpr)
 {
-	bool isShardKeyFilter = false;
-	ListCell *boolArgs;
-	foreach(boolArgs, boolExpr->args)
-	{
-		RestrictInfo *boolRinfo = lfirst_node(RestrictInfo, boolArgs);
-		if (boolRinfo == shardKeyExpr)
-		{
-			isShardKeyFilter = true;
-			break;
-		}
-	}
+	return scalarArrayOpExpr->opno == BsonIndexBoundsEqualOperatorId();
+}
 
-	return isShardKeyFilter;
+
+static inline bool
+IsFuncExprTrimmable(const FuncExpr *funcExpr)
+{
+	return funcExpr->funcid == BsonIndexHintFunctionOid() ||
+		   funcExpr->funcid == BsonFullScanFunctionOid();
 }
 
 
 static bool
-IndexClausesValidForIndexOnlyScan(IndexPath *indexPath,
-								  RelOptInfo *rel,
-								  ReplaceExtensionFunctionContext *replaceContext)
+IsExprTrimmable(Expr *expr)
+{
+	if (IsA(expr, FuncExpr))
+	{
+		return IsFuncExprTrimmable((FuncExpr *) expr);
+	}
+	if (IsA(expr, ScalarArrayOpExpr))
+	{
+		return IsScalarArrayOpExprTrimmable((ScalarArrayOpExpr *) expr);
+	}
+
+	return false;
+}
+
+
+static bool
+IsBsonValueArgumentValidForIndexOnlyScan(const bson_value_t *bsonValue)
+{
+	/* These are special and need runtime recheck. */
+	if (IsBsonValueEmptyArray(bsonValue) || bsonValue->value_type == BSON_TYPE_NULL)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+static bool
+CheckOpArgIsValidForIndexOnlyScan(Const *arg, bytea *indexOptions, BsonIndexStrategy
+								  indexStrategy)
+{
+	if (indexOptions == NULL)
+	{
+		return false;
+	}
+
+	Datum queryValue = arg->constvalue;
+	pgbsonelement queryElement;
+	const char *collation = PgbsonToSinglePgbsonElementWithCollation(DatumGetPgBson(
+																		 queryValue),
+																	 &queryElement);
+
+	if (IsCollationValid(collation))
+	{
+		/* index with collation is not yet supported. */
+		return false;
+	}
+
+	if (indexStrategy == BSON_INDEX_STRATEGY_DOLLAR_IN)
+	{
+		bson_iter_t iter;
+		BsonValueInitIterator(&queryElement.bsonValue, &iter);
+		while (bson_iter_next(&iter))
+		{
+			const bson_value_t *arrayValue = bson_iter_value(&iter);
+			if (!IsBsonValueArgumentValidForIndexOnlyScan(arrayValue))
+			{
+				return false;
+			}
+		}
+	}
+	else if (!IsBsonValueArgumentValidForIndexOnlyScan(&queryElement.bsonValue))
+	{
+		return false;
+	}
+
+	return ValidateIndexForQualifierElement(indexOptions, &queryElement,
+											indexStrategy);
+}
+
+
+static bool
+ExprIsValidForIndexOnlyScan(Expr *expr, bytea *indexOptions, bool *isShardKeyExpr,
+							int64 *shardKeyValue)
+{
+	check_stack_depth();
+	CHECK_FOR_INTERRUPTS();
+
+	if (IsExprTrimmable(expr))
+	{
+		/* If the clause is something that we can trim off for index only scan, then it's valid for index only scan. */
+		return true;
+	}
+
+	if (IsA(expr, OpExpr) || IsA(expr, FuncExpr))
+	{
+		List *args = NIL;
+		const MongoIndexOperatorInfo *operator = NULL;
+
+		/* Can't use the function that gets the mongo index operator info from node
+		 *  because that one gets the funcId from the opExpr and there are some cases at the planner
+		 *  layer where the opExpr funcId isn't populated when we transform the funcExpr into opExpr
+		 *  so we get an invalid operator strategy, because of that we call each API depending on the expr kind.*/
+		if (IsA(expr, OpExpr))
+		{
+			OpExpr *opExpr = (OpExpr *) expr;
+			args = opExpr->args;
+			operator = GetMongoIndexOperatorByPostgresOperatorId(opExpr->opno);
+		}
+		else
+		{
+			FuncExpr *funcExpr = (FuncExpr *) expr;
+			args = funcExpr->args;
+			operator = GetMongoIndexOperatorInfoByPostgresFuncId(funcExpr->funcid);
+		}
+
+		if (operator == NULL || list_length(args) != 2)
+		{
+			/* We only support binary operators for index only scan. */
+			return false;
+		}
+
+		if (operator->indexStrategy == BSON_INDEX_STRATEGY_INVALID)
+		{
+			bool isOpExprShardKeyResult = IsOpExprShardKey(expr, shardKeyValue);
+			if (isShardKeyExpr != NULL)
+			{
+				*isShardKeyExpr = isOpExprShardKeyResult;
+			}
+
+			return isOpExprShardKeyResult;
+		}
+
+		if (!IndexStrategySupportsIndexOnlyScan(operator->indexStrategy))
+		{
+			return false;
+		}
+
+		Expr *secondArg = lsecond(args);
+		if (!IsA(secondArg, Const))
+		{
+			return false;
+		}
+
+		return CheckOpArgIsValidForIndexOnlyScan((Const *) secondArg, indexOptions,
+												 operator->indexStrategy);
+	}
+	else if (IsA(expr, BoolExpr))
+	{
+		/* For BoolExpr, we recursively check if all the arguments are valid for index only scan. */
+		BoolExpr *boolExpr = (BoolExpr *) expr;
+		ListCell *boolArgs;
+		foreach(boolArgs, boolExpr->args)
+		{
+			Expr *boolArg = (Expr *) lfirst(boolArgs);
+			bool isShardKeyExprInner = false;
+			if (!ExprIsValidForIndexOnlyScan(boolArg, indexOptions, &isShardKeyExprInner,
+											 shardKeyValue))
+			{
+				return false;
+			}
+
+			if (isShardKeyExpr != NULL)
+			{
+				*isShardKeyExpr = *isShardKeyExpr || isShardKeyExprInner;
+			}
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+
+static bool
+IndexClauseIsValidForIndexOnlyScan(const IndexClause *clause, bytea *indexOptions)
+{
+	if (clause->lossy)
+	{
+		return false;
+	}
+
+	if (clause->indexcol != 0 ||
+		list_length(clause->indexquals) != 1)
+	{
+		/* Only support indexonlyscan if the index clause is on the first column */
+		return false;
+	}
+
+	RestrictInfo *rinfo = clause->rinfo;
+
+	/* We ignore if it is a shard key expression or not as for rum indexes a shard key value opExpr will never be valid to be pushed down. */
+	bool isShardKeyExpr = false;
+	return ExprIsValidForIndexOnlyScan(rinfo->clause, indexOptions, &isShardKeyExpr,
+									   NULL);
+}
+
+
+static bool
+IndexRestrictInfoSupportIndexOnlyScan(const RestrictInfo *rinfo,
+									  bytea *indexOptions,
+									  const RestrictInfo **shardKeyRestrictInfo,
+									  int64 *shardKeyValue)
+{
+	if (indexOptions == NULL)
+	{
+		return false;
+	}
+
+	bool isShardKeyExpr = false;
+	bool supportsIndexOnlyScan = ExprIsValidForIndexOnlyScan(rinfo->clause, indexOptions,
+															 &isShardKeyExpr,
+															 shardKeyValue);
+	if (isShardKeyExpr && shardKeyRestrictInfo != NULL)
+	{
+		*shardKeyRestrictInfo = rinfo;
+	}
+
+	return supportsIndexOnlyScan;
+}
+
+
+static bool
+IndexClausesSupportIndexOnlyScan(IndexPath *indexPath,
+								 RelOptInfo *rel,
+								 ReplaceExtensionFunctionContext *replaceContext)
 {
 	bytea *indexOptions = indexPath->indexinfo->opclassoptions != NULL ?
 						  indexPath->indexinfo->opclassoptions[0] : NULL;
@@ -1469,36 +1712,8 @@ IndexClausesValidForIndexOnlyScan(IndexPath *indexPath,
 	foreach(clauseCell, indexPath->indexclauses)
 	{
 		IndexClause *clause = (IndexClause *) lfirst(clauseCell);
-		if (clause->lossy)
-		{
-			return false;
-		}
 
-		if (clause->indexcol != 0 ||
-			list_length(clause->indexquals) != 1)
-		{
-			/* Only support indexonlyscan if the index clause is on the first column */
-			return false;
-		}
-
-		RestrictInfo *rinfo = clause->rinfo;
-		if (!IsA(rinfo->clause, OpExpr))
-		{
-			return false;
-		}
-
-		OpExpr *opExpr = (OpExpr *) rinfo->clause;
-		const MongoIndexOperatorInfo *indexOperator =
-			GetMongoIndexOperatorByPostgresOperatorId(opExpr->opno);
-
-		if (!IndexStrategySupportsIndexOnlyScan(indexOperator->indexStrategy))
-		{
-			return false;
-		}
-
-		/* TODO (IndexOnlyScan): can we support null equality? */
-		Expr *secondArg = lsecond(opExpr->args);
-		if (!IsA(secondArg, Const))
+		if (!IndexClauseIsValidForIndexOnlyScan(clause, indexOptions))
 		{
 			return false;
 		}
@@ -1508,51 +1723,23 @@ IndexClausesValidForIndexOnlyScan(IndexPath *indexPath,
 	foreach(rinfoCell, indexPath->indexinfo->indrestrictinfo)
 	{
 		RestrictInfo *baseRestrictInfo = (RestrictInfo *) lfirst(rinfoCell);
-		Expr *clause = baseRestrictInfo->clause;
 
-		if (!IsA(clause, OpExpr))
-		{
-			if (IsA(clause, BoolExpr) &&
-				replaceContext->plannerOrderByData.isShardKeyEqualityOnUnsharded &&
-				IsShardKeyFilterBoolExpr((BoolExpr *) clause,
-										 replaceContext->plannerOrderByData.
-										 shardKeyEqualityExpr))
-			{
-				/* If it is a shard key filter, we can safely do an index only scan. */
-				continue;
-			}
+		const RestrictInfo *shardKeyRestrictInfo = NULL;
 
-			return false;
-		}
-
-		OpExpr *opExpr = (OpExpr *) clause;
-
-		Expr *secondArg = lsecond(opExpr->args);
-		if (!IsA(secondArg, Const))
+		/* at the planner layer these are trimmed out so we shouldn't see them for index only scan here. */
+		if (!IndexRestrictInfoSupportIndexOnlyScan(baseRestrictInfo, indexOptions,
+												   &shardKeyRestrictInfo, NULL))
 		{
 			return false;
 		}
 
-		const MongoIndexOperatorInfo *indexOperator =
-			GetMongoIndexOperatorByPostgresOperatorId(opExpr->opno);
-		BsonIndexStrategy indexStrategy = indexOperator->indexStrategy;
-
-		if (indexStrategy == BSON_INDEX_STRATEGY_INVALID)
-		{
-			/* if it is a shard key filter, we can safely do an index only scan. */
-			if (replaceContext->plannerOrderByData.isShardKeyEqualityOnUnsharded &&
-				baseRestrictInfo ==
-				replaceContext->plannerOrderByData.shardKeyEqualityExpr)
-			{
-				continue;
-			}
-
-			return false;
-		}
-
-		Datum queryValue = ((Const *) secondArg)->constvalue;
-		if (!ValidateIndexForQualifierValue(indexOptions, queryValue,
-											indexStrategy))
+		/* if we have a shard key value filter we can only do index only scan for unsharded for RUM indexes because if it is sharded the shard key value needs to be evaluated at runtime and that goes against
+		 * the index only scan semantics.
+		 */
+		if (shardKeyRestrictInfo != NULL &&
+			(!replaceContext->plannerOrderByData.isShardKeyEqualityOnUnsharded ||
+			 shardKeyRestrictInfo !=
+			 replaceContext->plannerOrderByData.shardKeyEqualityExpr))
 		{
 			return false;
 		}
@@ -1572,7 +1759,7 @@ PlanHasAggregates(PlannerInfo *root)
 
 
 static bool
-IsValidForIndexOnlyScans(PlannerInfo *root)
+IsQueryValidForIndexOnlyScan(PlannerInfo *root)
 {
 	if (!PlanHasAggregates(root) ||
 		root->hasJoinRTEs)
@@ -1621,7 +1808,7 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		return;
 	}
 
-	if (!IsValidForIndexOnlyScans(root))
+	if (!IsQueryValidForIndexOnlyScan(root))
 	{
 		return;
 	}
@@ -1636,6 +1823,7 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	ListCell *cell;
 	foreach(cell, rel->pathlist)
 	{
+		bool isBitmapPath = false;
 		Path *path = (Path *) lfirst(cell);
 		if (IsA(path, BitmapHeapPath))
 		{
@@ -1644,6 +1832,7 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (IsA(bitmapPath->bitmapqual, IndexPath))
 			{
 				path = (Path *) bitmapPath->bitmapqual;
+				isBitmapPath = true;
 			}
 		}
 
@@ -1657,7 +1846,16 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 		if (indexPath->path.pathtype == T_IndexOnlyScan)
 		{
-			/* Already an index only scan */
+			/* Already an index only scan if it is under a bitmap heap scan, we try to cost it and add it
+			 * to let the planner decide whether promoting the index only scan is better or not. */
+			if (isBitmapPath)
+			{
+				bool partialPath = false;
+				double loopCount = 1.0;
+				cost_index(indexPath, root, loopCount, partialPath);
+				addedPaths = lappend(addedPaths, indexPath);
+			}
+
 			continue;
 		}
 
@@ -1691,6 +1889,12 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		}
 		else
 		{
+			if (!ForceIndexOnlyScanIfAvailable && EnableIndexOnlyScanOnCostFunction)
+			{
+				/* Only convert on the planner if we want to force it or if the cost function is not enabled. */
+				continue;
+			}
+
 			if (indexPath->indexinfo->nkeycolumns < 1 ||
 				!IsOrderBySupportedOnOpClass(indexPath->indexinfo->relam,
 											 indexPath->indexinfo->opfamily[0]))
@@ -1703,7 +1907,7 @@ ConsiderIndexOnlyScan(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				continue;
 			}
 
-			if (!IndexClausesValidForIndexOnlyScan(indexPath, rel, context))
+			if (!IndexClausesSupportIndexOnlyScan(indexPath, rel, context))
 			{
 				continue;
 			}
@@ -1826,6 +2030,8 @@ documentdb_btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 						  Selectivity *indexSelectivity, double *indexCorrelation,
 						  double *indexPages)
 {
+	bool convertedToIndexOnlyScan = false;
+
 	if (EnableOrderByIdOnCostFunction && EnableIdIndexCustomCostFunction &&
 		list_length(root->query_pathkeys) == 1)
 	{
@@ -1833,7 +2039,7 @@ documentdb_btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	}
 
 	if (EnableIdIndexCustomCostFunction && EnableIndexOnlyScan &&
-		IsValidForIndexOnlyScans(root))
+		IsQueryValidForIndexOnlyScan(root))
 	{
 		bool hasOtherQuals = false;
 		IndexPath *modified = TrimIndexRestrictInfoForBtreePath(root, path,
@@ -1842,6 +2048,7 @@ documentdb_btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		{
 			*path = *modified;
 			path->path.pathtype = T_IndexOnlyScan;
+			convertedToIndexOnlyScan = true;
 		}
 
 		if (modified != path)
@@ -1853,6 +2060,29 @@ documentdb_btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	btcostestimate(root, path, loop_count, indexStartupCost, indexTotalCost,
 				   indexSelectivity, indexCorrelation, indexPages);
+
+	if (convertedToIndexOnlyScan)
+	{
+		/*
+		 * We convert this path to T_IndexOnlyScan inside the AM cost callback.
+		 * At that point, PostgreSQL's cost_index() has already taken the is-index-only
+		 * decision for this costing pass, so cost_index() does not apply its usual allvisfrac
+		 * adjustment here. We apply the same visibility-fraction adjustment in this
+		 * callback to approximate index-only scan costing for this pass.
+		 */
+		*indexSelectivity = *indexSelectivity * (1.0 - path->indexinfo->rel->allvisfrac);
+	}
+
+	if (EnableExtendedExplainPlans && EnableExplainScanIndexCosts)
+	{
+		RangeTblEntry *rte = planner_rt_fetch(path->indexinfo->rel->relid, root);
+		RecordCostEstimateForIndex(path->indexinfo->indexoid, rte->relid,
+								   *indexStartupCost,
+								   *indexTotalCost, *indexSelectivity,
+								   *indexCorrelation, *indexPages,
+								   path->indexinfo->pages, path->indexinfo->tuples,
+								   *indexSelectivity, 0, 0);
+	}
 }
 
 
@@ -2348,14 +2578,143 @@ PopulateQueryPathAndValueFromOpExpr(OpExpr *opExpr, const char **queryPathString
 }
 
 
+static void
+IndexStrategyClassify(int32_t indexStrategy, bool *equalityPrefixes,
+					  bool *nonEqualityPrefixes,
+					  Oid opNo, bool isPartialFilterExpr, const
+					  bson_value_t *optionalQueryValue,
+					  int8_t *orderScanDirection, int32_t *outputIndexStrategy)
+{
+	*outputIndexStrategy = indexStrategy;
+	switch (indexStrategy)
+	{
+		case BSON_INDEX_STRATEGY_DOLLAR_EQUAL:
+		{
+			*equalityPrefixes = true;
+			break;
+		}
+
+		case BSON_INDEX_STRATEGY_DOLLAR_GREATER_EQUAL:
+		{
+			/* this is not a full scan (only exists: true is allowed) */
+			if (optionalQueryValue->value_type != BSON_TYPE_MINKEY)
+			{
+				*nonEqualityPrefixes = true;
+			}
+
+			break;
+		}
+
+		case BSON_INDEX_STRATEGY_DOLLAR_LESS_EQUAL:
+		{
+			/* this is not a full scan (only <= MaxKey is allowed) */
+			if (optionalQueryValue->value_type != BSON_TYPE_MAXKEY)
+			{
+				*nonEqualityPrefixes = true;
+			}
+
+			break;
+		}
+
+		case BSON_INDEX_STRATEGY_INVALID:
+		{
+			if (opNo == BsonRangeMatchOperatorOid() &&
+				optionalQueryValue->value_type != BSON_TYPE_EOD)
+			{
+				*outputIndexStrategy = BSON_INDEX_STRATEGY_DOLLAR_RANGE;
+				DollarRangeParams rangeParams = { 0 };
+				InitializeQueryDollarRange(optionalQueryValue, &rangeParams);
+
+				if (rangeParams.isElemMatch)
+				{
+					ElemMatchIndexOpStrategyClassify(&rangeParams, outputIndexStrategy,
+													 equalityPrefixes,
+													 nonEqualityPrefixes);
+				}
+				else if (!rangeParams.isFullScan)
+				{
+					*nonEqualityPrefixes = true;
+				}
+
+				*orderScanDirection = rangeParams.orderScanDirection;
+			}
+			else if (isPartialFilterExpr && opNo == BsonEqualMatchRuntimeOperatorId())
+			{
+				*equalityPrefixes = true;
+			}
+			else
+			{
+				*nonEqualityPrefixes = true;
+			}
+
+			break;
+		}
+
+		default:
+		{
+			/* Track the filters as being a non-equality (range predicate) */
+			*nonEqualityPrefixes = true;
+			break;
+		}
+	}
+}
+
+
+void
+ElemMatchIndexOpStrategyClassify(DollarRangeParams *params,
+								 int32_t *queryStrategy,
+								 bool *equalityPrefixes,
+								 bool *nonEqualityPrefixes)
+{
+	bson_iter_t elemMatchIter;
+	bool hasStrategies = false;
+	BsonValueInitIterator(&params->elemMatchValue, &elemMatchIter);
+	while (bson_iter_next(&elemMatchIter))
+	{
+		bson_iter_t innerIter;
+		if (bson_iter_recurse(&elemMatchIter, &innerIter))
+		{
+			BsonIndexStrategy strat = BSON_INDEX_STRATEGY_INVALID;
+			bson_value_t queryValue = { 0 };
+			while (bson_iter_next(&innerIter))
+			{
+				const char *key = bson_iter_key(&innerIter);
+				const bson_value_t *value = bson_iter_value(&innerIter);
+				if (strcmp(key, "op") == 0)
+				{
+					strat = (BsonIndexStrategy) BsonValueAsInt32(value);
+				}
+				else if (strcmp(key, "value") == 0)
+				{
+					queryValue = *value;
+				}
+			}
+
+			bool isPartialFilterExpr = false;
+			int8_t indexSortDirection = 0;
+			hasStrategies = true;
+			IndexStrategyClassify(strat, equalityPrefixes, nonEqualityPrefixes,
+								  InvalidOid, isPartialFilterExpr, &queryValue,
+								  &indexSortDirection, queryStrategy);
+		}
+	}
+
+	if (!hasStrategies)
+	{
+		*nonEqualityPrefixes = true;
+	}
+}
+
+
 static int32_t
 UpdateEqualityPrefixesAndGetSortOrder(const char *queryPath, bytea *opClassOptions,
 									  OpExpr *expr, bool isPartialFilterExpr,
-									  bson_value_t *optionalQueryValue,
+									  const bson_value_t *optionalQueryValue,
 									  bool equalityPrefixes[INDEX_MAX_KEYS],
 									  bool nonEqualityPrefixes[INDEX_MAX_KEYS],
 									  int32_t *outputColumnNumber,
-									  int8_t *indexSortDirection)
+									  int8_t *indexSortDirection,
+									  int32_t *indexStrategy)
 {
 	int columnNumber = GetCompositeOpClassColumnNumber(queryPath,
 													   opClassOptions,
@@ -2369,75 +2728,53 @@ UpdateEqualityPrefixesAndGetSortOrder(const char *queryPath, bytea *opClassOptio
 		return 0;
 	}
 
-	int32_t orderScanDirection = 0;
+	int8_t orderScanDirection = 0;
 	const MongoIndexOperatorInfo *info =
 		GetMongoIndexOperatorByPostgresOperatorId(expr->opno);
-	switch (info->indexStrategy)
-	{
-		case BSON_INDEX_STRATEGY_DOLLAR_EQUAL:
-		{
-			equalityPrefixes[columnNumber] = true;
-			break;
-		}
-
-		case BSON_INDEX_STRATEGY_DOLLAR_GREATER_EQUAL:
-		{
-			/* this is not a full scan (only exists: true is allowed) */
-			if (optionalQueryValue->value_type != BSON_TYPE_MINKEY)
-			{
-				nonEqualityPrefixes[columnNumber] = true;
-			}
-
-			break;
-		}
-
-		case BSON_INDEX_STRATEGY_DOLLAR_LESS_EQUAL:
-		{
-			/* this is not a full scan (only <= MaxKey is allowed) */
-			if (optionalQueryValue->value_type != BSON_TYPE_MAXKEY)
-			{
-				nonEqualityPrefixes[columnNumber] = true;
-			}
-
-			break;
-		}
-
-		case BSON_INDEX_STRATEGY_INVALID:
-		{
-			if (expr->opno == BsonRangeMatchOperatorOid() &&
-				optionalQueryValue->value_type != BSON_TYPE_EOD)
-			{
-				DollarRangeParams rangeParams = { 0 };
-				InitializeQueryDollarRange(optionalQueryValue, &rangeParams);
-				if (!rangeParams.isFullScan)
-				{
-					nonEqualityPrefixes[columnNumber] = true;
-				}
-
-				orderScanDirection = rangeParams.orderScanDirection;
-			}
-			else if (isPartialFilterExpr && expr->opno ==
-					 BsonEqualMatchRuntimeOperatorId())
-			{
-				equalityPrefixes[columnNumber] = true;
-			}
-			else
-			{
-				nonEqualityPrefixes[columnNumber] = true;
-			}
-
-			break;
-		}
-
-		default:
-		{
-			/* Track the filters as being a non-equality (range predicate) */
-			nonEqualityPrefixes[columnNumber] = true;
-			break;
-		}
-	}
+	IndexStrategyClassify(info->indexStrategy, &equalityPrefixes[columnNumber],
+						  &nonEqualityPrefixes[columnNumber],
+						  expr->opno, isPartialFilterExpr, optionalQueryValue,
+						  &orderScanDirection, indexStrategy);
 
 	return orderScanDirection;
+}
+
+
+static int
+ProcessSingleCompositeFilter(Node *predQual, bytea *opClassOptions,
+							 bool equalityPrefixes[INDEX_MAX_KEYS],
+							 bool nonEqualityPrefixes[INDEX_MAX_KEYS],
+							 int32_t *indexStrategy)
+{
+	/* walk the index predicates and check if they match the index */
+	if (!IsA(predQual, OpExpr))
+	{
+		return -1;
+	}
+
+	OpExpr *expr = (OpExpr *) predQual;
+
+	const char *queryPath = NULL;
+	bson_value_t optionalQueryValue = { 0 };
+	if (!PopulateQueryPathAndValueFromOpExpr(expr, &queryPath, &optionalQueryValue))
+	{
+		return -1;
+	}
+
+	if (queryPath == NULL)
+	{
+		return -1;
+	}
+
+	int columnNumber = -1;
+	int8_t indexSortDirection = -1;
+	bool isPartialFilterExpr = true;
+	UpdateEqualityPrefixesAndGetSortOrder(
+		queryPath, opClassOptions, expr, isPartialFilterExpr,
+		&optionalQueryValue, equalityPrefixes, nonEqualityPrefixes, &columnNumber,
+		&indexSortDirection, indexStrategy);
+
+	return columnNumber;
 }
 
 
@@ -2467,32 +2804,15 @@ ProcessCompositePartialFilter(List *indexPredicate, bytea *opClassOptions,
 		Node *predQual = (Node *) lfirst(cell);
 
 		/* walk the index predicates and check if they match the index */
-		if (!IsA(predQual, OpExpr))
+		int indexStrategyIgnore = 0;
+		int columnNumber = ProcessSingleCompositeFilter(predQual, opClassOptions,
+														equalityPrefixes,
+														nonEqualityPrefixes,
+														&indexStrategyIgnore);
+		if (columnNumber < 0)
 		{
 			continue;
 		}
-
-		OpExpr *expr = (OpExpr *) predQual;
-
-		const char *queryPath = NULL;
-		bson_value_t optionalQueryValue = { 0 };
-		if (!PopulateQueryPathAndValueFromOpExpr(expr, &queryPath, &optionalQueryValue))
-		{
-			continue;
-		}
-
-		if (queryPath == NULL)
-		{
-			continue;
-		}
-
-		int columnNumber = -1;
-		int8_t indexSortDirection = -1;
-		bool isPartialFilterExpr = true;
-		UpdateEqualityPrefixesAndGetSortOrder(
-			queryPath, opClassOptions, expr, isPartialFilterExpr,
-			&optionalQueryValue, equalityPrefixes, nonEqualityPrefixes, &columnNumber,
-			&indexSortDirection);
 
 		if (columnNumber == 0)
 		{
@@ -2505,7 +2825,8 @@ ProcessCompositePartialFilter(List *indexPredicate, bytea *opClassOptions,
 
 
 bool
-TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerInfo *root)
+TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerInfo *root,
+								   bool *canSupportIndexOnlyScan)
 {
 	ListCell *cell;
 	bool firstFilterColumnFound = false;
@@ -2516,7 +2837,6 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 
 	if (getMultiKeyStatusFunc != NULL &&
 		indexPath->indexinfo->amcanorderbyop &&
-		EnableIndexOrderbyPushdown &&
 		list_length(root->query_pathkeys) > 0)
 	{
 		Relation indexRel = index_open(indexPath->indexinfo->indexoid, NoLock);
@@ -2527,6 +2847,15 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 	bool indexSupportsOrderByDesc = GetIndexSupportsBackwardsScan(
 		indexPath->indexinfo->relam, &indexCanOrder);
 
+
+	bool indexOnlyScanPossible = EnableIndexOnlyScan &&
+								 EnableIndexOnlyScanOnCostFunction &&
+								 indexPath->path.pathtype != T_IndexOnlyScan &&
+								 IsQueryValidForIndexOnlyScan(root) &&
+								 CompositeIndexSupportsIndexOnlyScan(indexPath);
+
+	bytea *indexOptions = indexPath->indexinfo->opclassoptions != NULL ?
+						  indexPath->indexinfo->opclassoptions[0] : NULL;
 	int32_t pathSortOrders[INDEX_MAX_KEYS] = { 0 };
 	bool equalityPrefixes[INDEX_MAX_KEYS] = { false };
 	bool nonEqualityPrefixes[INDEX_MAX_KEYS] = { false };
@@ -2537,6 +2866,13 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 	foreach(cell, indexPath->indexclauses)
 	{
 		IndexClause *clause = (IndexClause *) lfirst(cell);
+
+		if (indexOnlyScanPossible && !IndexClauseIsValidForIndexOnlyScan(clause,
+																		 indexOptions))
+		{
+			indexOnlyScanPossible = false;
+		}
+
 		ListCell *iclauseCell;
 		foreach(iclauseCell, clause->indexquals)
 		{
@@ -2564,11 +2900,11 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 			int columnNumber = -1;
 			int8_t indexSortDirection = 0;
 			bool isPartialFilterExpr = false;
+			int32_t indexStrategy = BSON_INDEX_STRATEGY_INVALID;
 			int8_t orderScanDirection = UpdateEqualityPrefixesAndGetSortOrder(
 				queryPath, indexPath->indexinfo->opclassoptions[0],
 				expr, isPartialFilterExpr, &optionalQueryValue, equalityPrefixes,
-				nonEqualityPrefixes, &columnNumber, &indexSortDirection);
-
+				nonEqualityPrefixes, &columnNumber, &indexSortDirection, &indexStrategy);
 			if (columnNumber < 0)
 			{
 				continue;
@@ -2639,8 +2975,172 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 		list_free(orderbyIndexClauses);
 	}
 
+	/* Check if the restrict info can be satisfied by the index. We don't have a replace context at this point since we're past the planning phase. */
+	if (indexOnlyScanPossible)
+	{
+		const RestrictInfo *shardKeyExpr = NULL;
+		int64 shardKeyValue = 0;
+		ListCell *rinfoCell;
+		foreach(rinfoCell, indexPath->indexinfo->indrestrictinfo)
+		{
+			RestrictInfo *baseRestrictInfo = (RestrictInfo *) lfirst(rinfoCell);
+
+			if (indexOnlyScanPossible && !IndexRestrictInfoSupportIndexOnlyScan(
+					baseRestrictInfo, indexOptions, &shardKeyExpr, &shardKeyValue))
+			{
+				indexOnlyScanPossible = false;
+				break;
+			}
+		}
+
+		if (indexOnlyScanPossible && shardKeyExpr != NULL)
+		{
+			/* If we have a shard key restrict info we need to validate the relation is unsharded. Get the relation oid and try to get the collection. */
+			Oid relationOid =
+				root->simple_rte_array[indexPath->indexinfo->rel->relid]->relid;
+
+			uint64_t collectionId = 0;
+			bool requireShardTable = true;
+			if (!TryGetCollectionIdByRelationOid(relationOid, &collectionId,
+												 requireShardTable))
+			{
+				indexOnlyScanPossible = false;
+			}
+			else
+			{
+				indexOnlyScanPossible = (int64) collectionId == shardKeyValue;
+			}
+		}
+	}
+
+	if (canSupportIndexOnlyScan != NULL)
+	{
+		*canSupportIndexOnlyScan = indexOnlyScanPossible;
+	}
+
 	/* Valid if we pushed some order by or a filter path was found on at least the first column */
 	return firstFilterColumnFound || indexPath->indexorderbys != NIL;
+}
+
+
+/*
+ * Extracts the boundary qualifiers for an index path. This basically includes
+ * all the equality prefixes fully specified for a path and the *first* inequality prefix.
+ * These will be the quals that will filter out portions of the index in a composite index.
+ * e.g. given an index a, b, c, d
+ * for a query that specifies a && d -> the boundary is "a"
+ * for a query that has EQ(A), RANGE(B), EQ(C) -> the boundary is "A, RANGE(B)"
+ * for a query that has RANGE(A), EQ(B), EQ(C) -> the boundary is "RANGE(A)"
+ * for a query that has EQ(A), EQ(B), RANGE(C) -> the boundary is "EQ(A), EQ(B), RANGE(C)"
+ * for a query that has EQ(A), EQ(C) -> the boundary is "EQ(A)"
+ */
+List *
+ExtractBoundaryQualsForOrderedIndexPath(IndexPath *indexPath, int *num_sa_scans)
+{
+	List *validRestrictInfos[INDEX_MAX_KEYS] = { 0 };
+	bool equalityPrefixesGlobal[INDEX_MAX_KEYS] = { 0 };
+	int32_t numSaopScans[INDEX_MAX_KEYS] = { 0 };
+	int maxGlobalColumnNumber = -1;
+	*num_sa_scans = 1;
+
+	ListCell *cell;
+	foreach(cell, indexPath->indexclauses)
+	{
+		bool equalityPrefixes[INDEX_MAX_KEYS] = { 0 };
+		bool nonEqualityPrefixes[INDEX_MAX_KEYS] = { 0 };
+
+		IndexClause *iclause = (IndexClause *) lfirst(cell);
+		ListCell *lc2;
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			Expr *clause = rinfo->clause;
+
+			if (!IsA(clause, OpExpr))
+			{
+				continue;
+			}
+
+			Expr *clauseArg = lsecond(((OpExpr *) clause)->args);
+			if (!IsA(clauseArg, Const))
+			{
+				/* We only support const args for now */
+				continue;
+			}
+
+			Const *clauseConst = (Const *) clauseArg;
+			if (clauseConst->constisnull)
+			{
+				/* We don't support null const args for now */
+				continue;
+			}
+
+			int32_t indexStrategy = 0;
+			int columnNumber = ProcessSingleCompositeFilter(
+				(Node *) clause, indexPath->indexinfo->opclassoptions[iclause->indexcol],
+				equalityPrefixes, nonEqualityPrefixes, &indexStrategy);
+			if (columnNumber < 0)
+			{
+				continue;
+			}
+
+			maxGlobalColumnNumber = Max(maxGlobalColumnNumber, columnNumber);
+
+			validRestrictInfos[columnNumber] = lappend(validRestrictInfos[columnNumber],
+													   rinfo);
+			if (indexStrategy == BSON_INDEX_STRATEGY_DOLLAR_IN)
+			{
+				equalityPrefixesGlobal[columnNumber] = true;
+				numSaopScans[columnNumber]++;
+			}
+			else if (indexStrategy == BSON_INDEX_STRATEGY_DOLLAR_NOT_IN)
+			{
+				numSaopScans[columnNumber]++;
+			}
+
+			if (equalityPrefixes[columnNumber])
+			{
+				equalityPrefixesGlobal[columnNumber] = true;
+			}
+		}
+	}
+
+	/* Now walk the paths from left to right, and only allow clauses until the first non-equality/range/missing */
+	int i;
+	List *finalBoundaryClauses = NIL;
+	for (i = 0; i <= maxGlobalColumnNumber; i++)
+	{
+		/* This path has no valid indexes, subsequent paths cannot be considered */
+		if (validRestrictInfos[i] == NIL)
+		{
+			break;
+		}
+
+		/* This path is valid for consideration with boundary clauses */
+		finalBoundaryClauses = list_concat(finalBoundaryClauses, validRestrictInfos[i]);
+
+		*num_sa_scans += numSaopScans[i];
+
+		list_free(validRestrictInfos[i]);
+		validRestrictInfos[i] = NIL;
+
+		/* If the current path does not have an equality match then subsequent paths cannot be considered */
+		if (!equalityPrefixesGlobal[i])
+		{
+			break;
+		}
+	}
+
+	for (; i <= maxGlobalColumnNumber; i++)
+	{
+		/* Free any remaining clauses that are not being considered */
+		if (validRestrictInfos[i] != NIL)
+		{
+			list_free(validRestrictInfos[i]);
+		}
+	}
+
+	return finalBoundaryClauses;
 }
 
 
@@ -3368,18 +3868,31 @@ ProcessRestrictionInfoAndRewriteFuncExpr(Expr *clause,
 			return (Expr *) GetOpExprClauseFromIndexOperator(operator, args,
 															 NULL);
 		}
-		else if (trimClauses && IsA(clause, FuncExpr))
+		else if (IsA(clause, FuncExpr))
 		{
 			FuncExpr *funcExpr = (FuncExpr *) clause;
-			if (funcExpr->funcid == BsonFullScanFunctionOid())
+			if (trimClauses && IsFuncExprTrimmable(funcExpr))
 			{
 				/* Trim these */
 				return NULL;
 			}
-			else if (funcExpr->funcid == BsonIndexHintFunctionOid())
+
+			if (funcExpr->funcid == BsonFullScanFunctionOid())
 			{
-				/* Trim these */
-				return NULL;
+				Expr *firstArg = linitial(funcExpr->args);
+				Expr *secondArg = lsecond(funcExpr->args);
+				if (!IsA(secondArg, Const))
+				{
+					return clause;
+				}
+
+				Const *secondConst = (Const *) secondArg;
+
+				/* Use the sort direction from the spec */
+				int querySortDirection = 0;
+				return CreateKnownFullScanExpr(
+					secondConst->constvalue,
+					firstArg, querySortDirection);
 			}
 		}
 	}
@@ -3392,10 +3905,8 @@ ProcessRestrictionInfoAndRewriteFuncExpr(Expr *clause,
 	{
 		if (context->inputData.isShardQuery && trimClauses)
 		{
-			ScalarArrayOpExpr *arrayOpExpr = (ScalarArrayOpExpr *) clause;
-			if (arrayOpExpr->opno == BsonIndexBoundsEqualOperatorId())
+			if (IsScalarArrayOpExprTrimmable((ScalarArrayOpExpr *) clause))
 			{
-				/* These are only used for index selectivity - trim it here */
 				return NULL;
 			}
 		}
@@ -4763,12 +5274,24 @@ ProcessFullScanForOrderBy(SupportRequestIndexCondition *req, List *args)
 		return NULL;
 	}
 
+	return CreateKnownFullScanExpr(queryValue, linitial(args), querySortDirection);
+}
+
+
+static Expr *
+CreateKnownFullScanExpr(Datum queryValue, Expr *documentExpr, int sortDirection)
+{
 	/* If the index is valid for the function, convert it to an OpExpr for a
 	 * $range full scan.
 	 */
 	pgbsonelement sourceElement;
 	PgbsonToSinglePgbsonElement(DatumGetPgBson(queryValue), &sourceElement);
 
-	return (Expr *) CreateFullScanOpExpr(
-		linitial(args), sourceElement.path, sourceElement.pathLength, querySortDirection);
+	if (sortDirection == 0)
+	{
+		sortDirection = BsonValueAsInt32(&sourceElement.bsonValue);
+	}
+
+	return (Expr *) CreateFullScanOpExpr(documentExpr, sourceElement.path,
+										 sourceElement.pathLength, sortDirection);
 }

@@ -18,7 +18,6 @@ SELECT documentdb_api.insert_one('db','bitwiseOperators','{"_id":"10", "a": {"$b
 SELECT documentdb_distributed_test_helpers.drop_primary_key('db', 'bitwiseOperators');
 BEGIN;
 set local enable_seqscan TO ON;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 
 --$bitsAllClear runtime
 EXPLAIN (COSTS OFF)  SELECT document FROM documentdb_api.collection('db', 'bitwiseOperators') WHERE document @@ '{ "a": { "$bitsAllClear" : 0} }';
@@ -55,7 +54,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('db', documentdb_
 
 BEGIN;
 set local enable_seqscan TO OFF;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 
 --$bitsAllClear Index
 EXPLAIN (COSTS OFF)  SELECT document FROM documentdb_api.collection('db', 'bitwiseOperators') WHERE document @@ '{ "a": { "$bitsAllClear" : 0} }';

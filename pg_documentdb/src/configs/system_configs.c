@@ -36,6 +36,9 @@ static const struct config_enum_entry VECTOR_ITERATIVE_SCAN_OPTIONS[] =
  */
 extern bool EnableCreateCollectionOnInsert;
 
+#define DEFAULT_ENABLE_DB_NAME_VALIDATION true
+bool EnableDbNameValidation = DEFAULT_ENABLE_DB_NAME_VALIDATION;
+
 #define DEFAULT_SHARDING_MAX_CHUNKS 128
 int ShardingMaxChunks = DEFAULT_SHARDING_MAX_CHUNKS;
 
@@ -86,9 +89,6 @@ int TdigestCompressionAccuracy = DEFAULT_TDIGEST_COMPRESSION_ACCURACY;
 
 #define DEFAULT_DOCUMENTDB_PG_READ_ONLY_FOR_DISK_FULL false
 bool DocumentDBPGReadOnlyForDiskFull = DEFAULT_DOCUMENTDB_PG_READ_ONLY_FOR_DISK_FULL;
-
-#define DEFAULT_FORCE_RUM_INDEXSCAN_TO_BITMAPHEAPSCAN true
-bool ForceRUMIndexScanToBitmapHeapScan = DEFAULT_FORCE_RUM_INDEXSCAN_TO_BITMAPHEAPSCAN;
 
 /* Setting this to true until we have statistics. When dealing with large number of records sequential
  * scan can win even if there is an index to be used, because index cost being not reflected properly.
@@ -161,6 +161,12 @@ int MaxCursorFileCount = DEFAULT_MAX_CURSOR_FILE_COUNT;
 #define DEFAULT_RUM_LIBRARY_LOAD_OPTION RumLibraryLoadOption_None
 #endif
 
+#define DEFAULT_ALTERNATE_INDEX_HANDLER ""
+char *AlternateIndexHandler = DEFAULT_ALTERNATE_INDEX_HANDLER;
+
+#define DEFAULT_MAX_NON_ORDERED_TERM_SCAN_THRESHOLD -1
+int MaxNonOrderedTermScanThreshold = DEFAULT_MAX_NON_ORDERED_TERM_SCAN_THRESHOLD;
+
 RumLibraryLoadOptions DocumentDBRumLibraryLoadOption = DEFAULT_RUM_LIBRARY_LOAD_OPTION;
 
 #define DEFAULT_ENABLE_STATEMENT_TIMEOUT true
@@ -192,6 +198,13 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		NULL, &EnableCreateCollectionOnInsert, true,
 		PGC_USERSET, GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		psprintf("%s.enableDbNameValidation", newGucPrefix),
+		gettext_noop(
+			"Whether to enforce that $db in the command body matches the database argument."),
+		NULL, &EnableDbNameValidation, DEFAULT_ENABLE_DB_NAME_VALIDATION,
+		PGC_USERSET, GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		psprintf("%s.query_plan_cache_size", prefix),
 		gettext_noop("Set the size of the query plan cache"),
@@ -208,17 +221,6 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		NULL,
 		&MaxWriteBatchSize,
 		DEFAULT_MAX_WRITE_BATCH_SIZE, 1, INT_MAX,
-		PGC_USERSET,
-		0,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.forceRumIndexScantoBitmapHeapScan", prefix),
-		gettext_noop(
-			"Force RUM Index Scan to BitMap Heap Scan"),
-		NULL,
-		&ForceRUMIndexScanToBitmapHeapScan,
-		DEFAULT_FORCE_RUM_INDEXSCAN_TO_BITMAPHEAPSCAN,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
@@ -468,4 +470,19 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 			"Whether to enable per statement backend timeout override in the backend."),
 		NULL, &EnableBackendStatementTimeout, DEFAULT_ENABLE_STATEMENT_TIMEOUT,
 		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable(
+		psprintf("%s.alternate_index_handler_name", newGucPrefix),
+		gettext_noop(
+			"The name of the index handler to use as opposed to rum."),
+		NULL, &AlternateIndexHandler, DEFAULT_ALTERNATE_INDEX_HANDLER,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.max_non_ordered_term_scan_threshold", newGucPrefix),
+		gettext_noop(
+			"The maximum threshold for non-ordered term scans."),
+		NULL, &MaxNonOrderedTermScanThreshold,
+		DEFAULT_MAX_NON_ORDERED_TERM_SCAN_THRESHOLD,
+		-1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 }

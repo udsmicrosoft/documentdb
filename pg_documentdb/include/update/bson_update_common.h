@@ -13,6 +13,7 @@
 #define BSON_UPDATE_COMMON_H
 
 #include <utils/hsearch.h>
+#include <storage/itemptr.h>
 
 #include "io/bson_core.h"
 #include "utils/documentdb_errors.h"
@@ -28,6 +29,10 @@ struct UpdateSetValueState;
 struct CurrentDocumentState;
 struct BsonIntermediatePathNode;
 
+#define BsonUpdateSourceIsValid(source) (source != NULL && \
+										 source->tableOid != InvalidOid && \
+										 ItemPointerIsValid(source->ctid))
+
 /* Any positional metadata available during building the update spec for
  * target documents */
 typedef struct PositionalUpdateSpec
@@ -41,6 +46,43 @@ typedef struct PositionalUpdateSpec
 	/* The processed positional query data from the original querySpec */
 	BsonPositionalQueryData *processedQuerySpec;
 } PositionalUpdateSpec;
+
+
+/* The type of positional operator a node has */
+typedef enum PositionalType
+{
+	/* It is not a positional update */
+	PositionalType_None = 0,
+
+	/* Matches the specified value $ path */
+	PositionalType_QueryFilter,
+
+	/* Corresponds to the $[identifier] path */
+	PositionalType_ArrayFilter,
+
+	/* Matches the $[] path */
+	PositionalType_All
+} PositionalType;
+
+
+/* Actual update type based on the operators */
+typedef enum CommandUpdateType
+{
+	CommandUpdateType_Invalid = 0,
+	CommandUpdateType_Update,
+	CommandUpdateType_Replacement
+} CommandUpdateType;
+
+
+typedef struct BsonUpdateSource
+{
+	/* Relation on which the update is being performed */
+	Oid tableOid;
+
+	/* Original item pointer before the update */
+	ItemPointer ctid;
+} BsonUpdateSource;
+
 
 /* WriteUpdatedValuesFunc function takes an existing value in the current document,
  * applies the update mutation pertinent to that operator, and writes the updated
@@ -111,12 +153,15 @@ struct AggregationPipelineUpdateState * GetAggregationPipelineUpdateState(const
 																		  updateSpec,
 																		  const
 																		  bson_value_t *
-																		  variableSpec);
+																		  variableSpec,
+																		  bool *
+																		  isReplaceStagePresent);
 
 pgbson * ProcessAggregationPipelineUpdate(pgbson *sourceDoc,
 										  const struct AggregationPipelineUpdateState *
 										  updateState,
-										  bool isUpsert);
+										  bool isUpsert,
+										  bool *isReplacement);
 
 
 /* Update workflows */

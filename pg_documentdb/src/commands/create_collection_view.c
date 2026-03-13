@@ -61,7 +61,7 @@ typedef struct CreateSpec
 
 static const StringView SystemPrefix = { .string = "system.", .length = 7 };
 
-static CreateSpec * ParseCreateSpec(Datum databaseDatum, pgbson *createSpec,
+static CreateSpec * ParseCreateSpec(Datum *databaseDatum, pgbson *createSpec,
 									bool *hasSchemaValidationSpec);
 
 static void ValidateCollectionOptionsEquivalent(CreateSpec *createDefinition,
@@ -88,12 +88,13 @@ extern bool EnableSchemaValidation;
 Datum
 command_create_collection_view(PG_FUNCTION_ARGS)
 {
-	Datum databaseDatum = PG_GETARG_DATUM(0);
 	pgbson *createSpec = PG_GETARG_PGBSON(1);
+	Datum databaseDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
 
 	bool hasSchemaValidationSpec = false;
-	CreateSpec *createDefinition = ParseCreateSpec(databaseDatum, createSpec,
+	CreateSpec *createDefinition = ParseCreateSpec(&databaseDatum, createSpec,
 												   &hasSchemaValidationSpec);
+
 	Datum createDatum = CStringGetTextDatum(createDefinition->name);
 	ValidateDatabaseCollection(databaseDatum, createDatum);
 	MongoCollection *collection =
@@ -238,7 +239,7 @@ ValidateIdIndexDocument(const bson_value_t *idIndexDocument)
  * collection or view.
  */
 static CreateSpec *
-ParseCreateSpec(Datum databaseDatum, pgbson *createSpec, bool *hasSchemaValidationSpec)
+ParseCreateSpec(Datum *databaseDatum, pgbson *createSpec, bool *hasSchemaValidationSpec)
 {
 	bson_iter_t createIter;
 	PgbsonInitIterator(createSpec, &createIter);
@@ -383,6 +384,10 @@ ParseCreateSpec(Datum databaseDatum, pgbson *createSpec, bool *hasSchemaValidati
 		{
 			/* ignore */
 		}
+		else if (strcmp(key, "$db") == 0)
+		{
+			ValidateOrExtractDatabaseNameFromSpec(&createIter, databaseDatum);
+		}
 		else if (!IsCommonSpecIgnoredField(key))
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_UNKNOWNBSONFIELD),
@@ -391,12 +396,17 @@ ParseCreateSpec(Datum databaseDatum, pgbson *createSpec, bool *hasSchemaValidati
 		}
 	}
 
+	if (*databaseDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errmsg("$db must be specified.")));
+	}
+
 	/* Validate */
 	if (spec->name == NULL || strlen(spec->name) == 0)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDNAMESPACE),
 						errmsg("The specified namespace is invalid: '%s'.",
-							   TextDatumGetCString(databaseDatum))));
+							   TextDatumGetCString(*databaseDatum))));
 	}
 
 	if (spec->viewOn == NULL && spec->pipeline.value_type != BSON_TYPE_EOD)

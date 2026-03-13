@@ -68,9 +68,6 @@ bool ForceDisableSeqScan = DEFAULT_FORCE_DISABLE_SEQ_SCAN;
 #define DEFAULT_CURRENTOP_ADD_SQL_COMMAND false
 bool CurrentOpAddSqlCommand = DEFAULT_CURRENTOP_ADD_SQL_COMMAND;
 
-#define DEFAULT_ALTERNATE_INDEX_HANDLER ""
-char *AlternateIndexHandler = DEFAULT_ALTERNATE_INDEX_HANDLER;
-
 #define DEFAULT_LOG_RELATION_INDEXES_ORDER false
 bool EnableLogRelationIndexesOrder = DEFAULT_LOG_RELATION_INDEXES_ORDER;
 
@@ -100,6 +97,20 @@ bool EnableRbacCompliantSchemas = DEFAULT_ENABLE_RBAC_COMPLIANT_SCHEMAS;
 
 #define DEFAULT_DISABLE_EXTENDED_RUM_EXPLAIN_PLANS false
 bool DisableExtendedRumExplainPlans = DEFAULT_DISABLE_EXTENDED_RUM_EXPLAIN_PLANS;
+
+/* Left behind for compat testing of older tables */
+#define DEFAULT_ENABLE_DATA_TABLES_WITHOUT_CREATION_TIME true
+bool EnableDataTableWithoutCreationTime =
+	DEFAULT_ENABLE_DATA_TABLES_WITHOUT_CREATION_TIME;
+
+#define DEFAULT_RUM_FAIL_ON_LOST_PATH false
+bool RumFailOnLostPath = DEFAULT_RUM_FAIL_ON_LOST_PATH;
+
+#define DEFAULT_FORCE_COLL_STATS_DATA_COLLECTION false
+bool ForceCollStatsDataCollection = DEFAULT_FORCE_COLL_STATS_DATA_COLLECTION;
+
+#define DEFAULT_FORCE_BITMAP_SCAN_FOR_LOOKUP false
+bool ForceBitmapScanForLookup = DEFAULT_FORCE_BITMAP_SCAN_FOR_LOOKUP;
 
 void
 InitializeTestConfigurations(const char *prefix, const char *newGucPrefix)
@@ -266,13 +277,6 @@ InitializeTestConfigurations(const char *prefix, const char *newGucPrefix)
 		NULL, &CurrentOpAddSqlCommand, DEFAULT_CURRENTOP_ADD_SQL_COMMAND,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
-	DefineCustomStringVariable(
-		psprintf("%s.alternate_index_handler_name", prefix),
-		gettext_noop(
-			"The name of the index handler to use as opposed to rum (currently for testing only)."),
-		NULL, &AlternateIndexHandler, DEFAULT_ALTERNATE_INDEX_HANDLER,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
 	DefineCustomBoolVariable(
 		psprintf("%s.logRelationIndexesOrder", newGucPrefix),
 		gettext_noop(
@@ -348,5 +352,36 @@ InitializeTestConfigurations(const char *prefix, const char *newGucPrefix)
 			"Disable extended rum explain plan overrides. Used to match default rum explains"),
 		NULL, &DisableExtendedRumExplainPlans,
 		DEFAULT_DISABLE_EXTENDED_RUM_EXPLAIN_PLANS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableDataTableWithoutCreationTime", newGucPrefix),
+		gettext_noop(
+			"Create data table without creation_time column."),
+		NULL, &EnableDataTableWithoutCreationTime,
+		DEFAULT_ENABLE_DATA_TABLES_WITHOUT_CREATION_TIME,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.rumFailOnLostPath", newGucPrefix),
+		gettext_noop(
+			"Whether or not to fail the query when a lost path is detected in RUM"),
+		NULL, &RumFailOnLostPath,
+		DEFAULT_RUM_FAIL_ON_LOST_PATH,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.forceCollStatsDataCollection", newGucPrefix),
+		gettext_noop(
+			"Whether to force fetching metadata during collstats operations."),
+		NULL, &ForceCollStatsDataCollection, DEFAULT_FORCE_COLL_STATS_DATA_COLLECTION,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.forceBitmapScanForLookup", newGucPrefix),
+		gettext_noop(
+			"Whether or not to force bitmap scan for lookup."),
+		NULL, &ForceBitmapScanForLookup,
+		DEFAULT_FORCE_BITMAP_SCAN_FOR_LOOKUP,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 }

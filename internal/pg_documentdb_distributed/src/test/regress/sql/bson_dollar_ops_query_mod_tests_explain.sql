@@ -26,7 +26,6 @@ SELECT documentdb_api.insert_one('db','dollarmodtests_explain','{"_id": 127, "a"
 SELECT documentdb_distributed_test_helpers.drop_primary_key('db', 'dollarmodtests_explain');
 BEGIN;
     set local enable_seqscan TO ON;
-    set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 
     EXPLAIN (COSTS OFF)  SELECT document FROM documentdb_api.collection('db', 'dollarmodtests_explain') where document @@ '{ "a" : {"$mod" : [5,0]} }';
     EXPLAIN (COSTS OFF)  SELECT document FROM documentdb_api.collection('db', 'dollarmodtests_explain') where document @@ '{ "a.b" : {"$mod" : [5,0]} }';
@@ -46,7 +45,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('db', documentdb_
 
 BEGIN;
 set local enable_seqscan TO OFF;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
     EXPLAIN (COSTS OFF)  SELECT document FROM documentdb_api.collection('db', 'dollarmodtests_explain') where document @@ '{ "a" : {"$mod" : [5,0]} }';
     EXPLAIN (COSTS OFF)  SELECT document FROM documentdb_api.collection('db', 'dollarmodtests_explain') where document @@ '{ "a.b" : {"$mod" : [5,0]} }';
     EXPLAIN (COSTS OFF)  SELECT document FROM documentdb_api.collection('db', 'dollarmodtests_explain') where document @@ '{ "a.c" : {"$mod" : [5,0]} }';

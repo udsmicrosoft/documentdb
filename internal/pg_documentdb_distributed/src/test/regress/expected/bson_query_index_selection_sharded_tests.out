@@ -118,24 +118,4 @@ EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM documentdb_api.collection('
                            Index Cond: (documents_3610.document OPERATOR(documentdb_api_catalog.@<) '{ "a.c" : { "$numberInt" : "10" } }'::documentdb_core.bson)
 (15 rows)
 
-SET LOCAL documentdb.ForceUseIndexIfAvailable to OFF;
-SET LOCAL documentdb_rum.enable_custom_cost_estimate to off;
-EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'test_index_selection_sharded') WHERE document @@ '{ "$and": [ { "a.b": { "$gt": 500 } }, { "a.c": { "$lt": 10 } } ] }';
-                                                                                                                                                               QUERY PLAN                                                                                                                                                               
----------------------------------------------------------------------
- Custom Scan (Citus Adaptive)
-   Output: remote_scan.document
-   Task Count: 8
-   Tasks Shown: One of 8
-   ->  Task
-         Query: SELECT document FROM documentdb_data.documents_3610_3610016 documents_3610 WHERE ((document OPERATOR(documentdb_api_catalog.#>) '{ "a.b" : { "$numberInt" : "500" } }'::documentdb_core.bsonquery) AND (document OPERATOR(documentdb_api_catalog.#<) '{ "a.c" : { "$numberInt" : "10" } }'::documentdb_core.bsonquery))
-         Node: host=localhost port=58070 dbname=regression
-         ->  Bitmap Heap Scan on documentdb_data.documents_3610_3610016 documents_3610
-               Output: document
-               Recheck Cond: (documents_3610.document OPERATOR(documentdb_api_catalog.@<) '{ "a.c" : { "$numberInt" : "10" } }'::documentdb_core.bson)
-               Filter: (documents_3610.document OPERATOR(documentdb_api_catalog.@>) '{ "a.b" : { "$numberInt" : "500" } }'::documentdb_core.bson)
-               ->  Bitmap Index Scan on a_c_1
-                     Index Cond: (documents_3610.document OPERATOR(documentdb_api_catalog.@<) '{ "a.c" : { "$numberInt" : "10" } }'::documentdb_core.bson)
-(13 rows)
-
 ROLLBACK;

@@ -76,7 +76,7 @@ check-minimal:
 
 check-documentdb-minimal: check-minimal
 
-check-docdb-rum-minimal:
+check-extended-rum-minimal:
 	$(MAKE) -C src/test/extended_rum_tests check-minimal
 
 check-valgrind:

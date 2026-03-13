@@ -546,6 +546,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                              run_explain_and_trim                             
 ------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=12 loops=1)
+   namespaceName: compdb.compwildcard
    indexName: a_1
    indexKey: {"a.$**": 1}
    isMultiKey: true
@@ -555,13 +556,14 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
          Heap Blocks: exact=1
          ->  Bitmap Index Scan on a_1 (actual rows=12 loops=1)
                Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(10 rows)
+(11 rows)
 
 SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
     EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, BUFFERS OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('compdb', '{ "find": "compwildcard", "filter": { "a.b": { "$exists": true } }}') $cmd$);
                               run_explain_and_trim                              
 --------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=3 loops=1)
+   namespaceName: compdb.compwildcard
    indexName: a_1
    indexKey: {"a.$**": 1}
    isMultiKey: true
@@ -571,7 +573,7 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
          Heap Blocks: exact=1
          ->  Bitmap Index Scan on a_1 (actual rows=3 loops=1)
                Index Cond: (document @>= '{ "a.b" : { "$minKey" : 1 } }'::bson)
-(10 rows)
+(11 rows)
 
 -- operator validation: $eq
 SELECT document FROM bson_aggregation_find('compdb', '{ "find": "compwildcard", "filter": { "a": { "$eq": 1 } }}');
@@ -830,26 +832,28 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                                  run_explain_and_trim                                 
 --------------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=12 loops=1)
+   namespaceName: compdb.compwildcard
    indexName: $**_1
    indexKey: {"$**": 1}
    isMultiKey: true
    indexBounds: ["a": [ { "a": MinKey } ,  { "a": MaxKey } ]]
    ->  Index Scan using "$**_1" on documents_5401 collection (actual rows=12 loops=1)
          Index Cond: (document @>= '{ "a" : { "$minKey" : 1 } }'::bson)
-(7 rows)
+(8 rows)
 
 SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
     EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, BUFFERS OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('compdb', '{ "find": "compwildcard", "filter": { "a.b": { "$exists": true } }}') $cmd$);
                                 run_explain_and_trim                                 
 -------------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=3 loops=1)
+   namespaceName: compdb.compwildcard
    indexName: $**_1
    indexKey: {"$**": 1}
    isMultiKey: true
    indexBounds: ["a.b": [ { "a.b": MinKey } ,  { "a.b": MaxKey } ]]
    ->  Index Scan using "$**_1" on documents_5401 collection (actual rows=3 loops=1)
          Index Cond: (document @>= '{ "a.b" : { "$minKey" : 1 } }'::bson)
-(7 rows)
+(8 rows)
 
 -- operator validation: $eq
 SELECT document FROM bson_aggregation_find('compdb', '{ "find": "compwildcard", "filter": { "a": { "$eq": 1 } }}');
@@ -1116,13 +1120,14 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                                 run_explain_and_trim                                 
 -------------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=1 loops=1)
+   namespaceName: compdb.compwildcard
    indexName: $**_1
    indexKey: {"$**": 1}
    isMultiKey: true
    indexBounds: ["h.b": [ { "h.b": MinKey } ,  { "h.b": MaxKey } ]]
    ->  Index Scan using "$**_1" on documents_5401 collection (actual rows=1 loops=1)
          Index Cond: (document @>= '{ "h.b" : { "$minKey" : 1 } }'::bson)
-(7 rows)
+(8 rows)
 
 SELECT documentdb_api.insert_one('compdb', 'compwildcard', '{ "_id": 18, "h": { "b!c": 1 } }');
                               insert_one                              
@@ -1216,26 +1221,28 @@ SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
                                                                                            run_explain_and_trim                                                                                            
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=3 loops=1)
+   namespaceName: compdb.compwildcard2
    indexName: $**_1
    indexKey: {"$**": 1}
    isMultiKey: false
    indexBounds: ["a.b": [ { "a.b": 2 } ,  { "a.b": 4 } )], ["a.c": [ { "a.c": -Infinity } ,  { "a.c": 9 } )]
    ->  Index Scan using "$**_1" on documents_5402 collection (actual rows=3 loops=1)
          Index Cond: ((document @>= '{ "a.b" : { "$numberInt" : "2" } }'::bson) AND (document @< '{ "a.b" : { "$numberInt" : "4" } }'::bson) AND (document @< '{ "a.c" : { "$numberInt" : "9" } }'::bson))
-(7 rows)
+(8 rows)
 
 SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
    EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, BUFFERS OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('compdb', '{ "find": "compwildcard2", "filter": { "a.b": { "$gte": 2, "$lt": 4 } }}') $cmd$);
                                                              run_explain_and_trim                                                             
 ----------------------------------------------------------------------------------------------------------------------------------------------
  Custom Scan (DocumentDBApiExplainQueryScan) (actual rows=3 loops=1)
+   namespaceName: compdb.compwildcard2
    indexName: $**_1
    indexKey: {"$**": 1}
    isMultiKey: false
    indexBounds: ["a.b": [ { "a.b": 2 } ,  { "a.b": 4 } )]
    ->  Index Scan using "$**_1" on documents_5402 collection (actual rows=3 loops=1)
          Index Cond: ((document @>= '{ "a.b" : { "$numberInt" : "2" } }'::bson) AND (document @< '{ "a.b" : { "$numberInt" : "4" } }'::bson))
-(7 rows)
+(8 rows)
 
 SELECT documentdb_api_internal.create_indexes_non_concurrently('compdb', '{ "createIndexes": "notfoundwildcard", "indexes": [ { "key": { "a.$**": 1 }, "name": "a_1", "enableOrderedIndex": true }]}', TRUE);
 NOTICE:  creating collection

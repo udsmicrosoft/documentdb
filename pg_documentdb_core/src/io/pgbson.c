@@ -1056,6 +1056,45 @@ PgbsonWriterStartArray(pgbson_writer *writer, const char *path, uint32_t pathLen
 
 
 /*
+ * Appends a "start document" to the heap writer and returns a heap writer to append to the child.
+ */
+void
+PgbsonHeapWriterStartDocument(pgbson_heap_writer *writer, const char *path,
+							  uint32_t pathLength, pgbson_heap_writer *childWriter)
+{
+	if (!bson_append_document_begin(writer->innerBsonRef, path, pathLength,
+									childWriter->innerBsonRef))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+							"adding StartDocument value: failed due to value being too large"))
+				);
+	}
+}
+
+
+/*
+ * Ends writing a document written with "Start document" to the current writer.
+ */
+void
+PgbsonHeapWriterEndDocument(pgbson_heap_writer *writer, pgbson_heap_writer *childWriter)
+{
+	if (!bson_append_document_end(writer->innerBsonRef, childWriter->innerBsonRef))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+							"adding EndDocument value: failed due to value being too large"))
+				);
+	}
+}
+
+
+pgbson *
+PgbsonHeapWriterGetPgbson(pgbson_heap_writer *writer)
+{
+	return CreatePgbsonfromBson_t(writer->innerBsonRef, true);
+}
+
+
+/*
  * Appends a "start array" to the writer and returns a writer to append to the child array inserted.
  */
 void
@@ -1192,7 +1231,7 @@ PgbsonWriterStartDocument(pgbson_writer *writer, const char *path, uint32_t path
 									&(childWriter->innerBson)))
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
-							"adding StartDocument( value: failed due to value being too large"))
+							"adding StartDocument value: failed due to value being too large"))
 				);
 	}
 }

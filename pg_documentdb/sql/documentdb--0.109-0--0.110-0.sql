@@ -1,4 +1,9 @@
 #include "rbac/extension_schema_setup--0.110-0.sql"
+#include "types/bsonaggvalue--0.110-0.sql"
+
+-- New optimized group aggregate implementations
+#include "udfs/aggregation/group_aggregates_support--0.110-0.sql"
+#include "udfs/aggregation/group_aggregates--0.110-0.sql"
 
 #include "udfs/commands_crud/delete--0.110-0.sql"
 #include "udfs/commands_crud/find_and_modify--0.110-0.sql"
@@ -36,6 +41,16 @@ REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA documentdb_api_v2 FROM PUBLIC;
 
 -- Adding new built-in roles
 #include "rbac/extension_readwrite_setup--0.110-0.sql"
+
+-- Roles metadata table for custom role RBAC
+#include "schema/roles_metadata--0.110-0.sql"
+
+-- Privileged Action System Roles
+#include "rbac/custom_role_find--0.110-0.sql"
+#include "rbac/custom_role_insert--0.110-0.sql"
+#include "rbac/custom_role_update--0.110-0.sql"
+#include "rbac/custom_role_remove--0.110-0.sql"
+
 #include "types/bsonindexterm--0.110-0.sql"
 #include "udfs/index_mgmt/bson_index_term_functions--0.110-0.sql"
 #include "operators/bsonindexterm_btree_operators--0.110-0.sql"
@@ -45,3 +60,6 @@ REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA documentdb_api_v2 FROM PUBLIC;
 #include "udfs/query/bson_orderby--0.110-0.sql"
 
 #include "udfs/rum/composite_path_operator_functions--0.110-0.sql"
+
+-- pg_read_all_settings is required for metrics instrumentation to read documentdb.* GUCs
+GRANT pg_read_all_settings TO __API_BG_WORKER_ROLE__;

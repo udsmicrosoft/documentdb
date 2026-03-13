@@ -25,6 +25,7 @@
 #include <optimizer/paths.h>
 #include <access/relscan.h>
 #include <optimizer/tlist.h>
+#include <customscan/bson_custom_scan_private.h>
 
 #if PG_VERSION_NUM >= 180000
 #include <commands/explain_format.h>
@@ -41,6 +42,8 @@
 #include "customscan/bson_custom_query_scan.h"
 #include "index_am/index_am_utils.h"
 #include "index_am/documentdb_rum.h"
+#include "utils/query_utils.h"
+#include "commands/commands_common.h"
 
 
 /* --------------------------------------------------------- */
@@ -52,6 +55,8 @@ typedef struct ExplainInputQueryState
 {
 	/* Must be the first field */
 	ExtensibleNode extensible;
+	uint64_t collectionId;
+	Oid relOid;
 } ExplainInputQueryState;
 
 
@@ -101,7 +106,7 @@ static bool EqualUnsupportedExtensionQueryScanNode(const struct ExtensibleNode *
 												   const struct ExtensibleNode *b);
 static TupleTableSlot * ExplainQueryScanNext(CustomScanState *node);
 static bool ExplainQueryScanNextRecheck(ScanState *state, TupleTableSlot *slot);
-static List * AddExplainCustomPathCore(List *pathList);
+static List * AddExplainCustomPathCore(List *pathList, Oid relOid, uint64 collectionId);
 
 /* --------------------------------------------------------- */
 /* Top level exports */
@@ -139,6 +144,8 @@ static const ExtensibleNodeMethods InputQueryStateMethods =
 };
 
 extern bool EnableExtendedExplainOnAnalyzeOff;
+extern bool EnableExplainScanIndexCosts;
+extern bool EnableExplainScanNamespaceName;
 
 
 /*
@@ -155,9 +162,9 @@ RegisterExplainScanNodes(void)
 
 void
 AddExplainCustomScanWrapper(PlannerInfo *root, RelOptInfo *rel,
-							RangeTblEntry *rte)
+							RangeTblEntry *rte, uint64 collectionId)
 {
-	rel->pathlist = AddExplainCustomPathCore(rel->pathlist);
+	rel->pathlist = AddExplainCustomPathCore(rel->pathlist, rte->relid, collectionId);
 }
 
 
@@ -171,7 +178,7 @@ AddExplainCustomScanWrapper(PlannerInfo *root, RelOptInfo *rel,
  * and adds a custom path wrapper that contains the queryState.
  */
 static List *
-AddExplainCustomPathCore(List *pathList)
+AddExplainCustomPathCore(List *pathList, Oid relOid, uint64 collectionId)
 {
 	List *customPlanPaths = NIL;
 	ListCell *cell;
@@ -190,7 +197,8 @@ AddExplainCustomPathCore(List *pathList)
 		else if (inputPath->pathtype == T_BitmapHeapScan)
 		{
 			BitmapHeapPath *bitmapHeapPath = (BitmapHeapPath *) inputPath;
-			if (bitmapHeapPath->bitmapqual->pathtype == T_IndexScan)
+			if (bitmapHeapPath->bitmapqual->pathtype == T_IndexScan ||
+				bitmapHeapPath->bitmapqual->pathtype == T_IndexOnlyScan)
 			{
 				IndexPath *indexPath = (IndexPath *) bitmapHeapPath->bitmapqual;
 				isValidPath = IsBsonRegularIndexAm(indexPath->indexinfo->relam);
@@ -205,7 +213,8 @@ AddExplainCustomPathCore(List *pathList)
 				foreach(bitmapCell, bitmapAndPath->bitmapquals)
 				{
 					Path *childPath = (Path *) lfirst(bitmapCell);
-					if (childPath->pathtype != T_IndexScan ||
+					if ((childPath->pathtype != T_IndexScan &&
+						 childPath->pathtype != T_IndexOnlyScan) ||
 						!IsBsonRegularIndexAm(
 							((IndexPath *) childPath)->indexinfo->relam))
 					{
@@ -223,7 +232,8 @@ AddExplainCustomPathCore(List *pathList)
 				foreach(bitmapCell, bitmapOrPath->bitmapquals)
 				{
 					Path *childPath = (Path *) lfirst(bitmapCell);
-					if (childPath->pathtype != T_IndexScan ||
+					if ((childPath->pathtype != T_IndexScan &&
+						 childPath->pathtype != T_IndexOnlyScan) ||
 						!IsBsonRegularIndexAm(
 							((IndexPath *) childPath)->indexinfo->relam))
 					{
@@ -290,6 +300,8 @@ AddExplainCustomPathCore(List *pathList)
 		/* Save the continuation data into storage */
 		queryState->extensible.type = T_ExtensibleNode;
 		queryState->extensible.extnodename = InputContinuationNodeName;
+		queryState->collectionId = collectionId;
+		queryState->relOid = relOid;
 
 		/* Store the input state to be used later.
 		 * NOTE: Anything added here must be of type ExtensibleNode and must be registered
@@ -462,6 +474,7 @@ ExplainQueryScanEndCustomScan(CustomScanState *node)
 {
 	ExplainQueryScanState *queryScanState = (ExplainQueryScanState *) node;
 	ExecEndNode((PlanState *) queryScanState->innerScanState);
+	ResetReportedIndexCosts();
 }
 
 
@@ -571,6 +584,35 @@ WalkAndExplainScanState(PlanState *scanState, ExplainState *es)
 }
 
 
+static const char *
+ExplainGetNamespaceNameFromCollectionId(uint64 collectionId)
+{
+	StringInfo namespaceNameQuery = makeStringInfo();
+	const char *namespaceName = NULL;
+	appendStringInfo(namespaceNameQuery,
+					 "SELECT database_name || '.' || collection_name FROM %s.collections WHERE collection_id = %ld",
+					 ApiCatalogSchemaName, collectionId);
+
+	if (DefaultInlineWriteOperations)
+	{
+		bool isNull = false;
+		Datum result = ExtensionExecuteQueryViaSPI(namespaceNameQuery->data, true,
+												   SPI_OK_SELECT, &isNull);
+		if (!isNull)
+		{
+			namespaceName = TextDatumGetCString(result);
+		}
+	}
+	else
+	{
+		namespaceName = ExtensionExecuteQueryOnLocalhostViaLibPQ(
+			namespaceNameQuery->data);
+	}
+
+	return namespaceName;
+}
+
+
 static void
 ExplainQueryScanExplainCustomScan(CustomScanState *node, List *ancestors,
 								  ExplainState *es)
@@ -578,9 +620,27 @@ ExplainQueryScanExplainCustomScan(CustomScanState *node, List *ancestors,
 	/* Add any scan related information here */
 	ExplainQueryScanState *queryScanState = (ExplainQueryScanState *) node;
 
+	if (queryScanState->inputQueryState->collectionId != 0 &&
+		EnableExplainScanNamespaceName)
+	{
+		const char *namespaceName = ExplainGetNamespaceNameFromCollectionId(
+			queryScanState->inputQueryState->collectionId);
+		if (namespaceName != NULL)
+		{
+			ExplainPropertyText("namespaceName", namespaceName, es);
+		}
+	}
+
 	ExplainOpenGroup("custom_scan", "IndexDetails", false, es);
 	WalkAndExplainScanState(&queryScanState->innerScanState->ps, es);
 	ExplainCloseGroup("custom_scan", "IndexDetails", false, es);
+
+	if (EnableExplainScanIndexCosts)
+	{
+		ExplainOpenGroup("custom_scan", "IndexCosts", false, es);
+		LogReportedIndexCosts(queryScanState->inputQueryState->relOid, es);
+		ExplainCloseGroup("custom_scan", "IndexCosts", false, es);
+	}
 }
 
 
@@ -606,6 +666,8 @@ CopyNodeInputQueryState(struct ExtensibleNode *target_node, const struct
 	ExplainInputQueryState *newNode = (ExplainInputQueryState *) target_node;
 	newNode->extensible.type = T_ExtensibleNode;
 	newNode->extensible.extnodename = InputContinuationNodeName;
+	newNode->collectionId = ((ExplainInputQueryState *) source_node)->collectionId;
+	newNode->relOid = ((ExplainInputQueryState *) source_node)->relOid;
 }
 
 
@@ -615,7 +677,9 @@ CopyNodeInputQueryState(struct ExtensibleNode *target_node, const struct
 static void
 OutInputQueryScanNode(StringInfo str, const struct ExtensibleNode *raw_node)
 {
-	/* TODO: This doesn't seem needed */
+	ExplainInputQueryState *node = (ExplainInputQueryState *) raw_node;
+	WRITE_UINT64_FIELD(collectionId);
+	WRITE_OID_FIELD(relOid);
 }
 
 
@@ -625,7 +689,11 @@ OutInputQueryScanNode(StringInfo str, const struct ExtensibleNode *raw_node)
 static void
 ReadUnsupportedExtensionQueryScanNode(struct ExtensibleNode *node)
 {
-	ExplainInputQueryState *newNode = (ExplainInputQueryState *) node;
-	newNode->extensible.type = T_ExtensibleNode;
-	newNode->extensible.extnodename = InputContinuationNodeName;
+	const char *token;
+	int length;
+	ExplainInputQueryState *local_node = (ExplainInputQueryState *) node;
+	local_node->extensible.type = T_ExtensibleNode;
+	local_node->extensible.extnodename = InputContinuationNodeName;
+	READ_UINT64_FIELD(collectionId);
+	READ_OID_FIELD(relOid);
 }

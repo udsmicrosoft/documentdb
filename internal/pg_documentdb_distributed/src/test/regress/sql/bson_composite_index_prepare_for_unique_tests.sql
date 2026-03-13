@@ -33,7 +33,6 @@ ROLLBACK;
 
 BEGIN;
 set local documentdb.enableExtendedExplainPlans to on;
-set local documentdb.enableIndexOrderByPushdown to on;
 SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE ON, TIMING OFF, SUMMARY OFF, BUFFERS OFF) select document FROM bson_aggregation_find('prep_unique_db', '{ "find": "collection", "filter": {"a": {"$gt": 2}}, "sort": {"a": 1} }') $cmd$);
 ROLLBACK;
 

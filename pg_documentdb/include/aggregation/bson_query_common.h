@@ -40,4 +40,9 @@ bool TryGetRangeParamsForRangeArgs(List *args, DollarRangeParams *params);
 void InitializeQueryDollarRange(const bson_value_t *rangeValue,
 								DollarRangeParams *params);
 
+void ElemMatchIndexOpStrategyClassify(DollarRangeParams *params,
+									  int32_t *queryStrategy,
+									  bool *equalityPrefixes,
+									  bool *nonEqualityPrefixes);
+
 #endif

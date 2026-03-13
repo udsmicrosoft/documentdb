@@ -139,6 +139,12 @@ PGDLLEXPORT char *ApiRootRole = "documentdb_root_role";
 PGDLLEXPORT char *ApiSettingsManagerRole = "";
 PGDLLEXPORT char *ApiUserAdminRole = "documentdb_user_admin_role";
 
+/* Privileged Action System Roles */
+PGDLLEXPORT char *ApiCollectionFindRole = "documentdb_api_find_role";
+PGDLLEXPORT char *ApiCollectionInsertRole = "documentdb_api_insert_role";
+PGDLLEXPORT char *ApiCollectionUpdateRole = "documentdb_api_update_role";
+PGDLLEXPORT char *ApiCollectionRemoveRole = "documentdb_api_remove_role";
+
 /* Schema functions migrated from a public API to an internal API schema
  * (e.g. from documentdb_api -> documentdb_api_internal)
  * TODO: These should be transition and removed in subsequent releases.
@@ -184,6 +190,9 @@ typedef struct DocumentDBApiOidCacheData
 
 	/* OID of the <bson> OPERATOR(ApiCatalogSchemaName.=) <bson> operator */
 	Oid BsonEqualOperatorId;
+
+	/* OID of the function for bson_equals UDF */
+	Oid BsonEqualFunctionOid;
 
 	/* OID of the <bson> OPERATOR(ApiCatalogSchemaName.@=) <bson> operator */
 	Oid BsonEqualMatchOperatorId;
@@ -875,6 +884,12 @@ typedef struct DocumentDBApiOidCacheData
 
 	/* OID of the BSONMIN aggregate function */
 	Oid ApiCatalogBsonMinAggregateFunctionOid;
+
+	/* OID of the BSONMAXWITHEXPR aggregate function */
+	Oid ApiInternalBsonMaxWithExprAggregateFunctionOid;
+
+	/* OID of the BSONMINWITHEXPR aggregate function */
+	Oid ApiInternalBsonMinWithExprAggregateFunctionOid;
 
 	/* OID of the BSONFIRSTONSORTED aggregate function */
 	Oid ApiCatalogBsonFirstOnSortedAggregateFunctionOid;
@@ -2277,6 +2292,19 @@ BsonEqualOperatorId(void)
 {
 	return GetCoreBinaryOperatorId(&Cache.BsonEqualOperatorId,
 								   BsonTypeId(), "=", BsonTypeId());
+}
+
+
+/*
+ * BsonEqualFunctionOid returns the OID of the CoreSchema.bson_equal function UDF.
+ */
+Oid
+BsonEqualFunctionOid(void)
+{
+	return GetBinaryOperatorFunctionIdWithSchema(&Cache.BsonEqualFunctionOid,
+												 "bson_equal",
+												 BsonTypeId(), BsonTypeId(),
+												 CoreSchemaName);
 }
 
 
@@ -4189,10 +4217,28 @@ BsonMaxAggregateFunctionOid(void)
 
 
 Oid
+BsonMaxWithExprAggregateFunctionOid(void)
+{
+	return GetAggregateFunctionByName(
+		&Cache.ApiInternalBsonMaxWithExprAggregateFunctionOid,
+		DocumentDBApiInternalSchemaName, "bsonmaxwithexpr");
+}
+
+
+Oid
 BsonMinAggregateFunctionOid(void)
 {
 	return GetAggregateFunctionByName(&Cache.ApiCatalogBsonMinAggregateFunctionOid,
 									  ApiCatalogSchemaName, "bsonmin");
+}
+
+
+Oid
+BsonMinWithExprAggregateFunctionOid(void)
+{
+	return GetAggregateFunctionByName(
+		&Cache.ApiInternalBsonMinWithExprAggregateFunctionOid,
+		DocumentDBApiInternalSchemaName, "bsonminwithexpr");
 }
 
 

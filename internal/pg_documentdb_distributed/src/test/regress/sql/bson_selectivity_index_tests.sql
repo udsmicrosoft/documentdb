@@ -25,7 +25,7 @@ ANALYZE documentdb_data.documents_10140;
 EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'selectivity_index_tests') WHERE document @@ '{ "a": 1, "b": { "$in": [ 2, 3, 4, 5 ] }, "a": { "$in": [ 1, 5, 6, 7 ] }, "$or": [ { "c": 3, "d": { "$gt": 500 } }, { "c": { "$gt": 4 } }] }';
 
 BEGIN;
-set local documentdb.enableNewSelectivityMode to on;
+set local documentdb.enableCompositeIndexPlanner to on;
 EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'selectivity_index_tests') WHERE document @@ '{ "a": 1, "b": { "$in": [ 2, 3, 4, 5 ] }, "a": { "$in": [ 1, 5, 6, 7 ] }, "$or": [ { "c": 3, "d": { "$gt": 500 } }, { "c": { "$gt": 4 } }] }';
 ROLLBACK;
 
@@ -41,11 +41,14 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('seldb', '{ "crea
 
 ANALYZE documentdb_data.documents_10142;
 
-set documentdb.enableNewSelectivityMode to off;
+set documentdb.enableCompositeIndexPlanner to off;
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('seldb', '{ "find" : "bimap_or_selectivity", "filter" : { "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } }, "$and" : [ { "$or" : [ { "productionDate" : { "$exists" : false } }, { "stoppingDate" : { "$exists" : false } }, { "noticeDate" : { "$exists" : false } } ] } ] }, "limit" : { "$numberInt" : "10" } }');
 
-set documentdb.enableNewSelectivityMode to on;
+set documentdb.enableCompositeIndexPlanner to on;
+set documentdb.forceDisableSeqScan to on;
+set random_page_cost to 0.01;
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('seldb', '{ "find" : "bimap_or_selectivity", "filter" : { "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } }, "$and" : [ { "$or" : [ { "productionDate" : { "$exists" : false } }, { "stoppingDate" : { "$exists" : false } }, { "noticeDate" : { "$exists" : false } } ] } ] }, "limit" : { "$numberInt" : "10" } }');
 
-set documentdb.enableNewSelectivityMode to off;
+set documentdb.enableCompositeIndexPlanner to off;
+reset random_page_cost;
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('seldb', '{ "find" : "bimap_or_selectivity", "filter" : { "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } }, "$and" : [ { "$or" : [ { "productionDate" : { "$exists" : false } }, { "stoppingDate" : { "$exists" : false } }, { "noticeDate" : { "$exists" : false } } ] } ] }, "limit" : { "$numberInt" : "10" } }');

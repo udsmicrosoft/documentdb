@@ -65,11 +65,7 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('db', '{
 	"$db" : "tetsts",
 	"db": "test2"	
 	}', true);
-                                                                                                   create_indexes_non_concurrently                                                                                                    
----------------------------------------------------------------------
- { "raw" : { "defaultShard" : { "numIndexesBefore" : { "$numberInt" : "1" }, "numIndexesAfter" : { "$numberInt" : "2" }, "createdCollectionAutomatically" : false, "ok" : { "$numberInt" : "1" } } }, "ok" : { "$numberInt" : "1" } }
-(1 row)
-
+ERROR:  $db in body does not match the database in the request: "tetsts" vs "db"
 -- quey 
 SELECT bson_dollar_project(document, '{ "a" : 1 }') FROM documentdb_api.collection('db', 'ignoreCommonSpec') ORDER BY object_id;
                         bson_dollar_project                         
@@ -90,7 +86,7 @@ CALL documentdb_api.drop_indexes('db', '{
 	}');
                           retval                          
 ---------------------------------------------------------------------
- { "ok" : true, "nIndexesWas" : { "$numberLong" : "2" } }
+ { "ok" : true, "nIndexesWas" : { "$numberLong" : "1" } }
 (1 row)
 
 -- query

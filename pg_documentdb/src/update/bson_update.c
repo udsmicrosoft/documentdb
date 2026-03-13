@@ -66,6 +66,8 @@ typedef struct BsonUpdateMetadata
 		 */
 		const BsonIntermediatePathNode *operatorState;
 	};
+
+	CommandUpdateType commandUpdateType;
 } BsonUpdateMetadata;
 
 /* Context used in ProcessQueryProjectionValue*/
@@ -77,6 +79,7 @@ typedef struct
 	/* Type of update */
 	UpdateType updateType;
 } QueryProjectionContext;
+
 
 extern bool EnableVariablesSupportForWriteCommands;
 
@@ -94,7 +97,9 @@ static void BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata,
 
 static pgbson * BsonUpdateDocumentCore(pgbson *sourceDocument, const
 									   bson_value_t *updateSpec,
-									   BsonUpdateMetadata *metadata);
+									   BsonUpdateMetadata *metadata,
+									   BsonUpdateSource *updateSource,
+									   pgbson **updateDescription);
 
 static pgbson * ProcessReplaceDocument(pgbson *sourceDoc, const bson_value_t *updateSpec,
 									   bool isUpsert);
@@ -156,6 +161,7 @@ ValidateIdForUpdateTypeReplacement(const bson_value_t *idValue)
 
 PG_FUNCTION_INFO_V1(bson_update_document);
 PG_FUNCTION_INFO_V1(bson_update_returned_value);
+PG_FUNCTION_INFO_V1(bson_update_document_with_update_desc);
 
 
 /*
@@ -244,6 +250,19 @@ bson_update_document(PG_FUNCTION_ARGS)
 		arrayFilters = &arrayFiltersBase.bsonValue;
 	}
 
+	BsonUpdateSource updateSource = { 0 };
+	if (callerIsUpdateBsonDocument && PG_NARGS() > 7)
+	{
+		if (!PG_ARGISNULL(6))
+		{
+			updateSource.ctid = (ItemPointer) DatumGetPointer(PG_GETARG_DATUM(6));
+		}
+		if (!PG_ARGISNULL(7) && PG_GETARG_OID(7) != InvalidOid)
+		{
+			updateSource.tableOid = PG_GETARG_OID(7);
+		}
+	}
+
 	/* An empty document will be processed as an upsert operation. */
 	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
 
@@ -267,12 +286,13 @@ bson_update_document(PG_FUNCTION_ARGS)
 		BuildBsonUpdateMetadata(&localMetadata, &updateSpecElement.bsonValue, &querySpec,
 								arrayFilters, &variableSpec, buildSourceDocOnUpsert);
 		document = BsonUpdateDocumentCore(sourceDocument, &updateSpecElement.bsonValue,
-										  &localMetadata);
+										  &localMetadata, &updateSource, NULL);
 	}
 	else
 	{
 		document = BsonUpdateDocumentCore(sourceDocument,
-										  &updateSpecElement.bsonValue, metadata);
+										  &updateSpecElement.bsonValue, metadata,
+										  &updateSource, NULL);
 	}
 
 	if (callerIsUpdateBsonDocument)
@@ -332,6 +352,110 @@ bson_update_returned_value(PG_FUNCTION_ARGS)
 
 
 /*
+ * bson_update_document_with_update_desc is a test function that processes the update
+ * operation on a given document and returns both the updated document and the update
+ * description as a RECORD(newDocument bson, updateDesc bson).
+ *
+ * This is useful for testing and verifying that update descriptions are correctly built
+ * without requiring the full change stream infrastructure. The update description is
+ * still published to xlog for non-test callers via the normal hook path; this function
+ * simply also captures and returns it.
+ *
+ * Arguments:
+ *   0: document (bson) - source document (empty = upsert)
+ *   1: updateSpec (bson) - wrapped update spec { "": <update|replace|pipeline> }
+ *   2: querySpec (bson) - query used for the update
+ *   3: arrayFilters (bson, optional) - array filter definitions
+ *   4: variableSpec (bson, optional) - let variables
+ */
+Datum
+bson_update_document_with_update_desc(PG_FUNCTION_ARGS)
+{
+	TupleDesc tupleDescriptor = NULL;
+	if (get_call_result_type(fcinfo, NULL, &tupleDescriptor) != TYPEFUNC_COMPOSITE)
+	{
+		elog(ERROR, "return type must be a row type");
+	}
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+	{
+		ereport(ERROR, (errmsg("sourceDocument / updateSpec / querySpec "
+							   "cannot be NULL")));
+	}
+
+	pgbson *sourceDocument = PG_GETARG_PGBSON(0);
+	pgbson *updateSpecDoc = PG_GETARG_PGBSON(1);
+	pgbson *querySpecDoc = PG_GETARG_PGBSON(2);
+	pgbson *arrayFiltersDoc = PG_GETARG_MAYBE_NULL_PGBSON(3);
+
+	bson_value_t variableSpec = { 0 };
+	if (PG_NARGS() > 4 && !PG_ARGISNULL(4))
+	{
+		pgbson *variableSpecDoc = PG_GETARG_PGBSON(4);
+		variableSpec = ConvertPgbsonToBsonValue(variableSpecDoc);
+	}
+
+	pgbsonelement updateSpecElement;
+	PgbsonToSinglePgbsonElement(updateSpecDoc, &updateSpecElement);
+	bson_value_t querySpec = ConvertPgbsonToBsonValue(querySpecDoc);
+	pgbsonelement arrayFiltersBase = { 0 };
+	bson_value_t *arrayFilters = NULL;
+
+	if (arrayFiltersDoc != NULL)
+	{
+		PgbsonToSinglePgbsonElement(arrayFiltersDoc, &arrayFiltersBase);
+		arrayFilters = &arrayFiltersBase.bsonValue;
+	}
+
+	/* Dummy source for test: allocate a real ItemPointerData so ctid is non-NULL */
+	ItemPointerData sourceCtid;
+	ItemPointerSet(&sourceCtid, 0, 1);
+	BsonUpdateSource updateSource = {
+		.ctid = &sourceCtid,
+		.tableOid = 12345,
+	};
+
+	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
+
+	BsonUpdateMetadata metadata = { 0 };
+	BuildBsonUpdateMetadata(&metadata, &updateSpecElement.bsonValue, &querySpec,
+							arrayFilters, &variableSpec, buildSourceDocOnUpsert);
+
+	pgbson *updateDescription = NULL;
+	pgbson *document = BsonUpdateDocumentCore(sourceDocument,
+											  &updateSpecElement.bsonValue,
+											  &metadata, &updateSource,
+											  &updateDescription);
+
+	Datum values[2];
+	bool nulls[2];
+	memset(values, 0, sizeof(values));
+	memset(nulls, 0, sizeof(nulls));
+
+	if (document != NULL)
+	{
+		values[0] = PointerGetDatum(document);
+	}
+	else
+	{
+		nulls[0] = true;
+	}
+
+	if (updateDescription != NULL)
+	{
+		values[1] = PointerGetDatum(updateDescription);
+	}
+	else
+	{
+		nulls[1] = true;
+	}
+
+	HeapTuple ret = heap_form_tuple(tupleDescriptor, values, nulls);
+	return HeapTupleGetDatum(ret);
+}
+
+
+/*
  * ValidateUpdateDocument is a wrapper around BsonUpdateDocument that
  * can be used to validate given update document.
  */
@@ -356,13 +480,41 @@ BsonUpdateDocument(pgbson *sourceDocument, const bson_value_t *updateSpec,
 				   const bson_value_t *variableSpec)
 {
 	BsonUpdateMetadata metadata = { 0 };
+	BsonUpdateSource updateSource = { 0 };
 
 	/* An empty document will be processed as an upsert operation. */
 	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
 
 	BuildBsonUpdateMetadata(&metadata, updateSpec, querySpec, arrayFilters,
 							variableSpec, buildSourceDocOnUpsert);
-	return BsonUpdateDocumentCore(sourceDocument, updateSpec, &metadata);
+	return BsonUpdateDocumentCore(sourceDocument, updateSpec, &metadata, &updateSource,
+								  NULL);
+}
+
+
+/*
+ * Similar to BsonUpdateDocument but with additional information about the origin of the update such as the ctid and tableOid.
+ * This is used for building update descriptions for change stream.
+ */
+pgbson *
+BsonUpdateDocumentWithSource(pgbson *sourceDocument, const bson_value_t *updateSpec,
+							 const bson_value_t *querySpec, const
+							 bson_value_t *arrayFilters, const bson_value_t *variableSpec,
+							 ItemPointer ctid, Oid tableOid)
+{
+	BsonUpdateMetadata metadata = { 0 };
+	BsonUpdateSource updateSource = {
+		.ctid = ctid,
+		.tableOid = tableOid,
+	};
+
+	/* An empty document will be processed as an upsert operation. */
+	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
+
+	BuildBsonUpdateMetadata(&metadata, updateSpec, querySpec, arrayFilters,
+							variableSpec, buildSourceDocOnUpsert);
+	return BsonUpdateDocumentCore(sourceDocument, updateSpec, &metadata, &updateSource,
+								  NULL);
 }
 
 
@@ -373,12 +525,15 @@ BsonUpdateDocument(pgbson *sourceDocument, const bson_value_t *updateSpec,
 /*
  * The core implementation of BsonUpdateDocument.
  * Processes an update based on the updateMetadata on the sourceDocument and updateSpec.
+ * If updateDescription is non-NULL, the update description pgbson will be written to it.
  *
  * Returns NULL if update was a no-op.
  */
-pgbson *
+static pgbson *
 BsonUpdateDocumentCore(pgbson *sourceDocument, const bson_value_t *updateSpec,
-					   BsonUpdateMetadata *updateMetadata)
+					   BsonUpdateMetadata *updateMetadata,
+					   BsonUpdateSource *updateSource,
+					   pgbson **updateDescription)
 {
 	bson_iter_t sourceDocumentIterator;
 	PgbsonInitIterator(sourceDocument, &sourceDocumentIterator);
@@ -391,19 +546,21 @@ BsonUpdateDocumentCore(pgbson *sourceDocument, const bson_value_t *updateSpec,
 		sourceDocument = updateMetadata->sourceDocOnUpsert;
 	}
 
-	/* first look up the updateSpec to determine what kind of update it is. */
 	pgbson *document;
+	BsonUpdateTracker *updateTracker = NULL;
+	if (create_update_tracker_hook != NULL)
+	{
+		updateTracker = create_update_tracker_hook(updateSource);
+	}
+
+	/* first look up the updateSpec to determine what kind of update it is. */
 	switch (updateMetadata->updateType)
 	{
 		case UpdateType_ReplaceDocument:
 		{
+			/* Replacement is always treated as modified document, even if the content is the same */
 			document = ProcessReplaceDocument(sourceDocument, updateSpec,
 											  isUpsert);
-			if (PgbsonEquals(sourceDocument, document) && !isUpsert)
-			{
-				/* signal that update was a no-op */
-				document = NULL;
-			}
 			break;
 		}
 
@@ -412,17 +569,18 @@ BsonUpdateDocumentCore(pgbson *sourceDocument, const bson_value_t *updateSpec,
 			document = ProcessUpdateOperatorWithState(sourceDocument,
 													  updateMetadata->operatorState,
 													  isUpsert,
-													  NULL);
+													  updateTracker);
 
 			break;
 		}
 
 		case UpdateType_AggregationPipeline:
 		{
+			bool isReplacement = false;
 			document = ProcessAggregationPipelineUpdate(sourceDocument,
 														updateMetadata->
 														aggregationState,
-														isUpsert);
+														isUpsert, &isReplacement);
 
 			/*
 			 * TODO: Using PgbsonEquals() here might result in incorrectly deciding
@@ -439,7 +597,8 @@ BsonUpdateDocumentCore(pgbson *sourceDocument, const bson_value_t *updateSpec,
 			 *       To do that, we might want to use a single update-spec tree
 			 *       across all the stages in ProcessAggregationPipelineUpdate().
 			 */
-			if (PgbsonEquals(sourceDocument, document) && !isUpsert)
+			if (!isReplacement && !isUpsert &&
+				PgbsonEquals(sourceDocument, document))
 			{
 				/* signal that update was a no-op */
 				document = NULL;
@@ -454,6 +613,28 @@ BsonUpdateDocumentCore(pgbson *sourceDocument, const bson_value_t *updateSpec,
 								updateMetadata->updateType)));
 			break;
 		}
+	}
+
+	/*
+	 * Don't build updateDescription unnecessarily if document is NULL
+	 * because it means that update was a no-op.
+	 */
+	pgbson *updateDescResult = NULL;
+	if (document && build_update_description_hook != NULL)
+	{
+		updateDescResult = build_update_description_hook(updateTracker,
+														 updateMetadata->
+														 commandUpdateType);
+	}
+
+	if (updateDescription != NULL)
+	{
+		*updateDescription = updateDescResult;
+	}
+	else
+	{
+		/* Clean the updateDescResult if caller is not interested in knowing what is built */
+		PgbsonFreeIfNotNull(updateDescResult);
 	}
 
 	if (document != NULL)
@@ -508,8 +689,19 @@ BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata, const bson_value_t *update
 				}
 			}
 
+			bool isReplaceStagePresent = false;
 			metadata->aggregationState = GetAggregationPipelineUpdateState(updateSpec,
-																		   variableSpec);
+																		   variableSpec,
+																		   &
+																		   isReplaceStagePresent);
+			if (isReplaceStagePresent)
+			{
+				metadata->commandUpdateType = CommandUpdateType_Replacement;
+			}
+			else
+			{
+				metadata->commandUpdateType = CommandUpdateType_Update;
+			}
 			break;
 		}
 
@@ -518,6 +710,7 @@ BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata, const bson_value_t *update
 			metadata->operatorState = GetOperatorUpdateState(updateSpec, querySpec,
 															 arrayFilters,
 															 buildSourceDocOnUpsert);
+			metadata->commandUpdateType = CommandUpdateType_Update;
 			break;
 		}
 
@@ -530,6 +723,7 @@ BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata, const bson_value_t *update
 									"Expected value to contain 'document' type but found '%s' type",
 									BsonTypeName(updateSpec->value_type))));
 			}
+			metadata->commandUpdateType = CommandUpdateType_Replacement;
 			break;
 		}
 

@@ -52,6 +52,7 @@
 #include "query/bson_compare.h"
 #include "planner/documents_custom_planner.h"
 #include "index_am/index_am_utils.h"
+#include "index_am/documentdb_rum.h"
 
 
 typedef enum DocumentDbQueryFlag
@@ -125,13 +126,12 @@ static void ExtensionRelPathlistHookCoreNew(PlannerInfo *root, RelOptInfo *rel, 
 											RangeTblEntry *rte, uint64 collectionId, bool
 											isShardQuery);
 
-extern bool ForceRUMIndexScanToBitmapHeapScan;
 extern bool EnableCollation;
 extern bool EnableLetAndCollationForQueryMatch;
 extern bool EnableVariablesSupportForWriteCommands;
-extern bool EnableIndexOrderbyPushdown;
 extern bool ForceDisableSeqScan;
 extern bool EnableExtendedExplainPlans;
+extern bool EnableExplainScanIndexCosts;
 extern bool EnableLogRelationIndexesOrder;
 extern bool ForceBitmapScanForLookup;
 extern bool EnableIndexOnlyScan;
@@ -144,45 +144,6 @@ planner_hook_type ExtensionPreviousPlannerHook = NULL;
 set_rel_pathlist_hook_type ExtensionPreviousSetRelPathlistHook = NULL;
 explain_get_index_name_hook_type ExtensionPreviousIndexNameHook = NULL;
 get_relation_info_hook_type ExtensionPreviousGetRelationInfoHook = NULL;
-
-
-/*
- * Checks if for the given query we need to consider bitmap heap conversion.
- * Few places where we do not consider bitmap heap conversion:
- * - If the query is a $merge outer query.
- * - If the query is a $lookup query and has join RTEs.
- */
-static inline bool
-IsBitmapHeapConversionSupported(PlannerInfo *root, RelOptInfo *rel)
-{
-	if (!ForceRUMIndexScanToBitmapHeapScan)
-	{
-		return false;
-	}
-
-	if (EnableIndexOrderbyPushdown || EnableIndexOnlyScan)
-	{
-		return false;
-	}
-
-	/*
-	 * Determine if the current relation is the outer query of a $merge stage.
-	 * We do not push this relation to the bitmap index.
-	 * For the outer relation, the relid will always be 1 since $merge is the last stage of the pipeline.
-	 */
-	if (root->parse->commandType == CMD_MERGE && rel->relid == 1)
-	{
-		return false;
-	}
-
-	/* Not supported for lookup, check if no JOIN RTEs */
-	if (!ForceBitmapScanForLookup && root->hasJoinRTEs)
-	{
-		return false;
-	}
-
-	return true;
-}
 
 
 /*
@@ -520,10 +481,7 @@ ExtensionRelPathlistHookCoreNew(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	ReplaceExtensionFunctionOperatorsInPaths(root, rel, rel->pathlist, PARENTTYPE_NONE,
 											 &indexContext);
 
-	if (EnableIndexOrderbyPushdown)
-	{
-		ConsiderIndexOrderByPushdownForId(root, rel, rte, rti, &indexContext);
-	}
+	ConsiderIndexOrderByPushdownForId(root, rel, rte, rti, &indexContext);
 
 	if (EnableIndexOnlyScan)
 	{
@@ -546,11 +504,7 @@ ExtensionRelPathlistHookCoreNew(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 */
 	if (!updatedPaths)
 	{
-		if (IsBitmapHeapConversionSupported(root, rel))
-		{
-			UpdatePathsToForceRumIndexScanToBitmapHeapScan(root, rel);
-		}
-		else if (indexContext.forceIndexQueryOpData.type == ForceIndexOpType_Text)
+		if (indexContext.forceIndexQueryOpData.type == ForceIndexOpType_Text)
 		{
 			/* Text indexes require bitmap paths since we leverage bitmapquals
 			 * to run the meta_qual.
@@ -582,7 +536,7 @@ ExtensionRelPathlistHookCoreNew(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (EnableExtendedExplainPlans)
 	{
 		/* Finally: Add the custom scan wrapper for explain plans */
-		AddExplainCustomScanWrapper(root, rel, rte);
+		AddExplainCustomScanWrapper(root, rel, rte, indexContext.inputData.collectionId);
 	}
 
 	if (ForceParallelScanIfAvailable)
@@ -826,6 +780,11 @@ ExtensionGetRelationInfoHookCore(PlannerInfo *root, Oid relationObjectId,
 	if (EnableLogRelationIndexesOrder)
 	{
 		LogRelationIndexesOrder(rel);
+	}
+
+	if (EnableExtendedExplainPlans && EnableExplainScanIndexCosts)
+	{
+		ResetReportedIndexCosts();
 	}
 }
 
@@ -1441,33 +1400,6 @@ HasUnresolvedExternParamsWalker(Node *expression, ParamListInfo boundParams)
 }
 
 
-static bool
-CheckRelNameValidity(const char *relName, uint64_t *collectionId)
-{
-	if (relName == NULL ||
-		strncmp(relName, "documents_", 10) != 0)
-	{
-		return false;
-	}
-
-	/* We use strtoull since it returns the first character that didn't match
-	 * We expect this to return the '_' character when it's a collection shard
-	 * like ApiDataSchemaName.documents_1_111 and the parsed value will be 1.
-	 * Alternatively, this will be \0 and the parsed value will be 1 if the
-	 * table is documents_1 (parent table).
-	 */
-	char *numEndPointer = NULL;
-	uint64 parsedCollectionId = strtoull(&relName[10], &numEndPointer, 10);
-	if (IsShardTableForDocumentDbTable(relName, numEndPointer))
-	{
-		*collectionId = parsedCollectionId;
-		return true;
-	}
-
-	return false;
-}
-
-
 /*
  * Returns true if the relation of RTE pointed to
  * is a DocumentDB table base collection. e.g.
@@ -1507,7 +1439,9 @@ IsRTEShardForDocumentDbCollection(RangeTblEntry *rte, bool *isDocumentDbDataName
 	{
 		Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tp);
 		const char *relNameStr = NameStr(reltup->relname);
-		bool isValid = CheckRelNameValidity(relNameStr, collectionId);
+		bool validateShardTableName = true;
+		bool isValid = CheckRelNameValidity(relNameStr, collectionId,
+											validateShardTableName);
 		ReleaseSysCache(tp);
 		return isValid;
 	}
@@ -1784,7 +1718,7 @@ ExpandAggregationFunction(Query *query, ParamListInfo boundParams, PlannedStmt *
 
 	Const *databaseConst = (Const *) databaseArg;
 	Const *aggregationConst = (Const *) secondArg;
-	if (databaseConst->constisnull || aggregationConst->constisnull)
+	if (aggregationConst->constisnull)
 	{
 		ereport(ERROR, (errmsg(
 							"Aggregation pipeline arguments should not be null. This is unexpected")));
@@ -1795,29 +1729,31 @@ ExpandAggregationFunction(Query *query, ParamListInfo boundParams, PlannedStmt *
 	QueryData queryData = GenerateFirstPageQueryData();
 	bool enableCursorParam = false;
 	bool setStatementTimeout = false;
+	text *databaseName = databaseConst->constisnull ? NULL : DatumGetTextPP(
+		databaseConst->constvalue);
 	Query *finalQuery;
 	if (aggregationFunc->funcid == ApiCatalogAggregationPipelineFunctionId())
 	{
-		finalQuery = GenerateAggregationQuery(DatumGetTextPP(databaseConst->constvalue),
+		finalQuery = GenerateAggregationQuery(databaseName,
 											  pipeline,
 											  &queryData,
 											  enableCursorParam, setStatementTimeout);
 	}
 	else if (aggregationFunc->funcid == ApiCatalogAggregationFindFunctionId())
 	{
-		finalQuery = GenerateFindQuery(DatumGetTextPP(databaseConst->constvalue),
+		finalQuery = GenerateFindQuery(databaseName,
 									   pipeline, &queryData,
 									   enableCursorParam, setStatementTimeout);
 	}
 	else if (aggregationFunc->funcid == ApiCatalogAggregationCountFunctionId())
 	{
-		finalQuery = GenerateCountQuery(DatumGetTextPP(databaseConst->constvalue),
+		finalQuery = GenerateCountQuery(databaseName,
 										pipeline,
 										setStatementTimeout);
 	}
 	else if (aggregationFunc->funcid == ApiCatalogAggregationDistinctFunctionId())
 	{
-		finalQuery = GenerateDistinctQuery(DatumGetTextPP(databaseConst->constvalue),
+		finalQuery = GenerateDistinctQuery(databaseName,
 										   pipeline,
 										   setStatementTimeout);
 	}
@@ -1830,7 +1766,7 @@ ExpandAggregationFunction(Query *query, ParamListInfo boundParams, PlannedStmt *
 								"Aggregation pipeline arguments should not be null. This is unexpected")));
 		}
 
-		finalQuery = GenerateGetMoreQuery(DatumGetTextPP(databaseConst->constvalue),
+		finalQuery = GenerateGetMoreQuery(databaseName,
 										  pipeline, DatumGetPgBson(
 											  thirdConst->constvalue),
 										  &queryData, enableCursorParam,
@@ -1902,10 +1838,11 @@ TrimPathListForSeqTypeScans(List *pathList)
 		Path *path = (Path *) lfirst(cell);
 
 		if (path->pathtype != T_IndexScan &&
-			path->pathtype != T_BitmapHeapScan)
+			path->pathtype != T_BitmapHeapScan &&
+			path->pathtype != T_IndexOnlyScan)
 		{
-			elog(DEBUG1, "Excluding path non-index path %d for scan",
-				 path->pathtype);
+			ereport(DEBUG1, errmsg("Excluding path non-index path %d for scan",
+								   path->pathtype));
 			pathList = foreach_delete_current(pathList, cell);
 			continue;
 		}
@@ -1916,8 +1853,9 @@ TrimPathListForSeqTypeScans(List *pathList)
 		 */
 		if (IsPrimaryKeyScanOnJustShardKey(path))
 		{
-			elog(DEBUG1, "Excluding primary key scan on just shard key %d for scan",
-				 path->pathtype);
+			ereport(DEBUG1, errmsg(
+						"Excluding primary key scan on just shard key %d for scan",
+						path->pathtype));
 			pathList = foreach_delete_current(pathList, cell);
 			continue;
 		}
@@ -1927,8 +1865,9 @@ TrimPathListForSeqTypeScans(List *pathList)
 			if (bitmapHeapPath->bitmapqual != NULL &&
 				IsPrimaryKeyScanOnJustShardKey(bitmapHeapPath->bitmapqual))
 			{
-				elog(DEBUG1, "Excluding bitmap heap scan on just shard key %d for scan",
-					 path->pathtype);
+				ereport(DEBUG1, errmsg(
+							"Excluding bitmap heap scan on just shard key %d for scan",
+							path->pathtype));
 				pathList = foreach_delete_current(pathList, cell);
 				continue;
 			}

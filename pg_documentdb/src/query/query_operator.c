@@ -145,6 +145,7 @@ extern bool EnableLetAndCollationForQueryMatch;
 extern bool EnableVariablesSupportForWriteCommands;
 extern bool EnableIdIndexPushdown;
 extern bool EnableDollarInToScalarArrayOpExprConversion;
+extern bool EnableIdIndexPushdownForQueryOp;
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
@@ -188,10 +189,15 @@ static Expr * ExpandExprForDollarAll(const char *path,
 									 bson_iter_t *operatorDocIterator,
 									 BsonQueryOperatorContext *context,
 									 const MongoQueryOperator *operator);
-static MongoCollection * GetCollectionReferencedByDocumentVar(Expr *documentExpr,
-															  Query *currentQuery,
-															  Index *collectionVarno,
-															  ParamListInfo boundParams);
+static MongoCollection * GetCollectionByDocumentVarLegacy(Expr *documentExpr,
+														  Query *currentQuery,
+														  Index *collectionVarno,
+														  ParamListInfo boundParams);
+static MongoCollection * GetCollectionByDocumentVar(Expr *documentExpr,
+													Query *currentQuery,
+													Index *collectionVarno,
+													ParamListInfo boundParams,
+													bool *isCollectionBasedRTE);
 static MongoCollection * GetCollectionForRTE(RangeTblEntry *rte, ParamListInfo
 											 boundParams);
 static Expr * CreateExprForDollarRegex(bson_iter_t *currIter, bson_value_t **options,
@@ -1625,16 +1631,33 @@ ExpandBsonQueryOperator(OpExpr *queryOpExpr, Node *queryNode,
 	if (quals != NIL)
 	{
 		Index collectionVarno;
+		MongoCollection *collection = NULL;
+		bool isCollectionBasedRTE = false;
+		if (EnableIdIndexPushdownForQueryOp)
+		{
+			/* if query is on a collection, get the collection metadata */
+			collection = GetCollectionByDocumentVar(context.documentExpr,
+													currentQuery,
+													&collectionVarno, boundParams,
+													&isCollectionBasedRTE);
+		}
+		else
+		{
+			/* if query is on a collection, get the collection metadata */
+			collection = GetCollectionByDocumentVarLegacy(context.documentExpr,
+														  currentQuery,
+														  &collectionVarno,
+														  boundParams);
+		}
 
-		/* if query is on a collection, get the collection metadata */
-		MongoCollection *collection =
-			GetCollectionReferencedByDocumentVar(context.documentExpr,
-												 currentQuery,
-												 &collectionVarno, boundParams);
 		if (collection != NULL)
 		{
 			bool hasShardKeyFilters = false;
-			if (collection->shardKey != NULL)
+
+			/* TODO: Remove this condition once the GUC is deprecated, as shard key constant filters can always be appended for non-sharded collections */
+			/* For collection-based RTE on unsharded collections, shard_key_value is already appended, so skip here */
+			if ((EnableIdIndexPushdownForQueryOp && !isCollectionBasedRTE) ||
+				collection->shardKey != NULL)
 			{
 				/* Retrieve the shard_key_value filter applicable to the specified collection */
 				bson_value_t queryDocValue = ConvertPgbsonToBsonValue(queryDocument);
@@ -3755,15 +3778,15 @@ CreateShardKeyFiltersForQuery(const bson_value_t *queryDocument, pgbson *shardKe
 
 
 /*
- * GetCollectionReferencedByDocumentVar finds the collection referenced by
+ * GetCollectionByDocumentVarLegacy finds the collection referenced by
  * documentExpr if it contains a single Var, or NULL if it not a single Var,
  * or the FROM clause entry is not a ApiSchema.collection call.
  */
 static MongoCollection *
-GetCollectionReferencedByDocumentVar(Expr *documentExpr,
-									 Query *currentQuery,
-									 Index *collectionVarno,
-									 ParamListInfo boundParams)
+GetCollectionByDocumentVarLegacy(Expr *documentExpr,
+								 Query *currentQuery,
+								 Index *collectionVarno,
+								 ParamListInfo boundParams)
 {
 	List *documentVars = pull_var_clause((Node *) documentExpr, 0);
 	if (list_length(documentVars) != 1)
@@ -3786,6 +3809,49 @@ GetCollectionReferencedByDocumentVar(Expr *documentExpr,
 	}
 
 	return GetCollectionForRTE(rte, boundParams);
+}
+
+
+/*
+ * GetCollectionByDocumentVar finds the collection referenced by
+ * documentExpr if it contains a single Var, or NULL if it not a single Var.
+ * First tries to get the collection from a DocumentDb relation (RTE_RELATION with
+ * DocumentDb namespace), otherwise falls back to getting it from an ApiSchema.collection call.
+ */
+static MongoCollection *
+GetCollectionByDocumentVar(Expr *documentExpr,
+						   Query *currentQuery,
+						   Index *collectionVarno,
+						   ParamListInfo boundParams,
+						   bool *isCollectionBasedRTE)
+{
+	List *documentVars = pull_var_clause((Node *) documentExpr, 0);
+	*isCollectionBasedRTE = false;
+
+	if (list_length(documentVars) != 1)
+	{
+		return NULL;
+	}
+
+	Var *documentVar = linitial(documentVars);
+	*collectionVarno = documentVar->varno;
+
+	RangeTblEntry *rte = rt_fetch(documentVar->varno, currentQuery->rtable);
+
+	if (rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_RELATION)
+	{
+		bool requireShardTable = false;
+		return GetMongoCollectionByRelationOid(rte->relid, requireShardTable);
+	}
+	else if (IsResolvableDocumentDbCollectionBasedRTE(rte, boundParams))
+	{
+		*isCollectionBasedRTE = true;
+		return GetCollectionForRTE(rte, boundParams);
+	}
+	else
+	{
+		return NULL;
+	}
 }
 
 
@@ -3942,25 +4008,18 @@ CheckAndAddIdFilter(List *opArgs, IdFilterWalkerContext *context,
 		   secondConst->consttype == BsonQueryTypeId());
 
 	pgbson *qual = DatumGetPgBson(secondConst->constvalue);
-
 	pgbsonelement qualElement;
-	if (EnableCollation)
-	{
-		PgbsonToSinglePgbsonElementWithCollation(qual, &qualElement);
+	const char *collationString = PgbsonToSinglePgbsonElementWithCollation(qual,
+																		   &qualElement);
 
-		/*  regex. _id can take Code, but Code is agnostic to collation
-		 * _id can't be array accrording to mongo senmantics, but it can
-		 * be an array in documentdb since we rewrite $or conditions on _id as $in. */
-		if (qualElement.bsonValue.value_type == BSON_TYPE_UTF8 ||
-			qualElement.bsonValue.value_type == BSON_TYPE_DOCUMENT ||
-			qualElement.bsonValue.value_type == BSON_TYPE_ARRAY)
-		{
-			context->isCollationAware = true;
-		}
-	}
-	else
+	/*  regex. _id can take Code, but Code is agnostic to collation
+	 * _id can't be array accrording to mongo senmantics, but it can
+	 * be an array in documentdb since we rewrite $or conditions on _id as $in. */
+	if (qualElement.bsonValue.value_type == BSON_TYPE_UTF8 ||
+		qualElement.bsonValue.value_type == BSON_TYPE_DOCUMENT ||
+		qualElement.bsonValue.value_type == BSON_TYPE_ARRAY)
 	{
-		PgbsonToSinglePgbsonElement(qual, &qualElement);
+		context->isCollationAware = IsCollationApplicable(collationString);
 	}
 
 	if (qualElement.pathLength == IdFieldStringView.length &&
@@ -4081,6 +4140,7 @@ CheckAndAddIdFilter(List *opArgs, IdFilterWalkerContext *context,
 					ScalarArrayOpExpr *inOperator = makeNode(ScalarArrayOpExpr);
 					inOperator->useOr = true;
 					inOperator->opno = BsonEqualOperatorId();
+					inOperator->opfuncid = BsonEqualFunctionOid();
 
 					/* First arg is the object_id var */
 					AttrNumber documentIdAttnum = 2;
@@ -4773,16 +4833,9 @@ TryProcessOrIntoDollarIn(BsonQueryOperatorContext *context,
 		pgbson *value = DatumGetPgBson(argConst->constvalue);
 		pgbsonelement valueElement;
 
-		if (IsCollationApplicable(context->collationString))
-		{
-			/* we can safely ignore any appended collation string here */
-			/* as it will be appended when creating the funcExpr */
-			PgbsonToSinglePgbsonElementWithCollation(value, &valueElement);
-		}
-		else
-		{
-			PgbsonToSinglePgbsonElement(value, &valueElement);
-		}
+		/* we can safely ignore any appended collation string here */
+		/* as it will be appended when creating the funcExpr */
+		PgbsonToSinglePgbsonElement(value, &valueElement);
 
 		StringView currentPath = {
 			.length = valueElement.pathLength, .string = valueElement.path
@@ -4904,16 +4957,9 @@ TryOptimizeDollarOrExpr(BsonQueryOperatorContext *context,
 		pgbson *value = DatumGetPgBson(argConst->constvalue);
 		pgbsonelement valueElement;
 
-		if (EnableCollation)
-		{
-			/* Since, we are optimizing Or expression not br rewriting a the expression, but by getting rid of
-			 * redundant quals from the Quals list, we can ignore the collation*/
-			PgbsonToSinglePgbsonElementWithCollation(value, &valueElement);
-		}
-		else
-		{
-			PgbsonToSinglePgbsonElement(value, &valueElement);
-		}
+		/* Since, we are optimizing Or expression not br rewriting a the expression, but by getting rid of
+		 * redundant quals from the Quals list, we can ignore the collation*/
+		PgbsonToSinglePgbsonElement(value, &valueElement);
 
 		if (funcId == eqop->postgresRuntimeFunctionOidLookup())
 		{

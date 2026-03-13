@@ -162,9 +162,14 @@ void PgbsonWriterConcatBytes(pgbson_writer *writer, const uint8_t *bsonBytes, ui
 uint32_t PgbsonArrayWriterGetIndex(pgbson_array_writer *arrayWriter);
 bool IsPgbsonWriterEmptyDocument(pgbson_writer *writer);
 pgbson_heap_writer * PgbsonHeapWriterInit(void);
+pgbson * PgbsonHeapWriterGetPgbson(pgbson_heap_writer *writer);
 void PgbsonHeapWriterReset(pgbson_heap_writer *writer);
 void PgbsonHeapWriterFree(pgbson_heap_writer *writer);
 uint32_t PgbsonHeapWriterGetSize(pgbson_heap_writer *writer);
+void PgbsonHeapWriterStartDocument(pgbson_heap_writer *writer, const char *path,
+								   uint32_t pathLength, pgbson_heap_writer *childWriter);
+void PgbsonHeapWriterEndDocument(pgbson_heap_writer *writer,
+								 pgbson_heap_writer *childWriter);
 bool IsPgbsonHeapWriterEmptyDocument(pgbson_heap_writer *writer);
 void PgbsonWriterConcatHeapWriter(pgbson_writer *writer,
 								  pgbson_heap_writer *writerToConcat);

@@ -25,6 +25,14 @@ ALLOW_DEFAULT_VISIBILITY=yes
 
 # compilation configuration
 include $(OSS_SRC_DIR)/Makefile.cflags
+
+INTEL_DECIMAL_MATH_LIB = $(shell pkg-config --cflags intelmathlib)
+PCRE2_LIB = $(shell pkg-config --cflags libpcre2-8)
+
+PG_CPPFLAGS += $(INTEL_DECIMAL_MATH_LIB) $(PCRE2_LIB)
+PG_CFLAGS += $(INTEL_DECIMAL_MATH_LIB) $(PCRE2_LIB)
+PG_LDFLAGS +=  $(shell pkg-config --static --libs --cflags intelmathlib) $(shell pkg-config --static --libs --cflags libpcre2-8)
+
 SOURCES = $(wildcard src/*.c) $(wildcard src/**/*.c)
 
 OBJS = $(patsubst %.c,%.o,$(SOURCES))

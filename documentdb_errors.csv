@@ -549,3 +549,4 @@ OrdinalPosition,ErrorName
 548,TransactionCommitted
 549,TooManyLogicalSessions
 550,ReauthenticationRequired
+551,Location15948

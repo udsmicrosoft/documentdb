@@ -120,7 +120,6 @@ set local documentdb.enableCompositeWildcardIndex to on;
 set local enable_seqscan TO off;
 set local documentdb.forceUseIndexIfAvailable to on;
 set local documentdb.enableExtendedExplainPlans to on;
-set local documentdb.forceRumIndexScanToBitmapHeapScan to off;
 \i sql/bson_query_operator_tests_explain_core.sql
 \i sql/bson_query_operator_tests_insert.sql
 SELECT documentdb_api.insert_one('db','queryoperator', '{"_id": 1, "a" : { "b" : 0 }}', NULL);
@@ -1347,7 +1346,7 @@ SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$ EXPLAIN (C
 (9 rows)
 
 SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT object_id, document FROM documentdb_api.collection('db', 'queryoperator') WHERE document @@ '{ "a"  : {"$all" : [{"$elemMatch" : {"b" : "M", "c" : {"$gt" : 50} } }, {"$elemMatch" : {"c" : 100, "d" : "Y" } }]}}' ORDER BY object_id$cmd$ );
-                                                                                                                                                                                                                                                                                                                                                                                                                        run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                                                                                                                                                                     run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                     
 ---------------------------------------------------------------------
  Custom Scan (Citus Adaptive) (actual rows=2 loops=1)
    Task Count: 1
@@ -1367,12 +1366,10 @@ SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$ EXPLAIN (C
                      innerScanLoops: 3 loops
                      scanType: regular
                      scanKeyDetails: key 1: [(isInequality: false, estimatedEntryCount: 2), (isInequality: true, estimatedEntryCount: 3), (isInequality: false, estimatedEntryCount: 3), (isInequality: false, estimatedEntryCount: 3)]
-                     ->  Bitmap Heap Scan on documents_1100_1100001 collection (actual rows=2 loops=1)
+                     ->  Index Scan using queryoperator_a on documents_1100_1100001 collection (actual rows=2 loops=1)
+                           Index Cond: ((document OPERATOR(documentdb_api_catalog.@<>) '{ "a.b" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "1" }, "value" : "M", "isTopLevel" : false } ] } }'::documentdb_core.bson) AND (document OPERATOR(documentdb_api_catalog.@<>) '{ "a.c" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "2" }, "value" : { "$numberInt" : "50" }, "isTopLevel" : false } ] } }'::documentdb_core.bson) AND (document OPERATOR(documentdb_api_catalog.@<>) '{ "a.c" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "1" }, "value" : { "$numberInt" : "100" }, "isTopLevel" : false } ] } }'::documentdb_core.bson) AND (document OPERATOR(documentdb_api_catalog.@<>) '{ "a.d" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "1" }, "value" : "Y", "isTopLevel" : false } ] } }'::documentdb_core.bson))
                            Filter: ((document OPERATOR(documentdb_api_catalog.@#?) '{ "a" : { "b" : "M", "c" : { "$gt" : { "$numberInt" : "50" } } } }'::documentdb_core.bson) AND (document OPERATOR(documentdb_api_catalog.@#?) '{ "a" : { "c" : { "$numberInt" : "100" }, "d" : "Y" } }'::documentdb_core.bson))
-                           Heap Blocks: exact=1
-                           ->  Bitmap Index Scan on queryoperator_a (actual rows=2 loops=1)
-                                 Index Cond: ((document OPERATOR(documentdb_api_catalog.@<>) '{ "a.b" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "1" }, "value" : "M", "isTopLevel" : false } ] } }'::documentdb_core.bson) AND (document OPERATOR(documentdb_api_catalog.@<>) '{ "a.c" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "2" }, "value" : { "$numberInt" : "50" }, "isTopLevel" : false } ] } }'::documentdb_core.bson) AND (document OPERATOR(documentdb_api_catalog.@<>) '{ "a.c" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "1" }, "value" : { "$numberInt" : "100" }, "isTopLevel" : false } ] } }'::documentdb_core.bson) AND (document OPERATOR(documentdb_api_catalog.@<>) '{ "a.d" : { "elemMatchIndexOp" : [ { "op" : { "$numberInt" : "1" }, "value" : "Y", "isTopLevel" : false } ] } }'::documentdb_core.bson))
-(23 rows)
+(21 rows)
 
 -- $or gets converted to $in for simple expressions.
 SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT object_id, document FROM documentdb_api.collection('db', 'queryoperator') WHERE document @@ '{ "$or" : [ { "a": 3 }, { "b": 4 } ] }' ORDER BY object_id$cmd$ );

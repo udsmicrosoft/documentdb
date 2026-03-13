@@ -13,7 +13,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('db', documentdb_
 BEGIN;
 set local enable_seqscan to off;
 set local enable_bitmapscan to off;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 set local citus.enable_local_execution TO OFF;
 set local documentdb.forceUseIndexIfAvailable to on;
 \i sql/bson_query_modifier_orderby_tests_explain_core.sql

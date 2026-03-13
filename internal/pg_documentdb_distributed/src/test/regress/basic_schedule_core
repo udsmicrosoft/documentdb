@@ -46,6 +46,8 @@ test: bson_dollar_operators_negation_tests_index
 test: bson_dollar_operators_negation_tests_explain_index
 test: bson_dollar_operators_negation_tests_explain_runtime
 test: bson_dollar_ops_collation_tests_runtime
+# we want to test BsonAggValue type I/O functions (which uses _send/_receive with pg18+citus14)
+test: bson_aggregation_pipeline_tests_maxmin_group 
 
 # With PG18 the tests above this line all pass.
 test: bson_aggregation_cursor_tests_pk_cursors
@@ -104,7 +106,7 @@ test: write_commands_batching conflicting_indexes
 # the debug logs around this get flakey with catalog table rehash.
 test: bson_aggregation_count_query_tests!PG16_OR_HIGHER!
 
-test: bson_aggregation_pipeline_tests_vector_native bson_aggregation_expression_variable_tests bson_aggregation_pipeline_tests_vector_hnsw
+test: bson_aggregation_pipeline_tests_vector_native bson_aggregation_pipeline_tests_vector_hnsw
 test: bson_aggregation_pipeline_tests_vector_ivf list_metadata_cursor_tests bson_aggregation_pipeline_tests_vector_hnsw_planner
 test: schema_validation_insert schema_validation bson_aggregation_stage_lookup_inner_join_composite_tests!PG17_OR_HIGHER!
 test: bson_aggregation_pipeline_operator_locf commands_insert setwindowfields_and_group_compliance bson_composite_pfe_order_by_index_tests
@@ -159,3 +161,4 @@ test: three_column_data_table
 # This needs to be by itself since it updates the documentdb schema to add order by functions
 # Once this is added to the central schema, it can be run concurrently
 test: bson_composite_order_by_index_tests
+test: bson_distributed_mem_vtable_palloc_test

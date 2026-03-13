@@ -1199,4 +1199,6 @@ typedef int DocumentdbErrorEreportCode;
 #define ERRCODE_DOCUMENTDB_REAUTHENTICATIONREQUIRED \
 	MAKE_SQLSTATE('M', '0', '0', 'F', '9')
 
+#define ERRCODE_DOCUMENTDB_LOCATION15948 MAKE_SQLSTATE('M', '0', '0', 'F', 'A')
+
 #endif

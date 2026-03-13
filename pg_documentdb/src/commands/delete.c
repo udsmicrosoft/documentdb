@@ -101,7 +101,8 @@ PG_FUNCTION_INFO_V1(command_delete_worker);
 
 
 static BatchDeletionSpec * BuildBatchDeletionSpec(bson_iter_t *deleteCommandIter,
-												  pgbsonsequence *deleteDocs);
+												  pgbsonsequence *deleteDocs,
+												  Datum *databaseNameDatum);
 static List * BuildDeletionSpecList(bson_iter_t *deleteArrayIter,
 									const bson_value_t *variableSpec);
 static List * BuildDeletionSpecListFromSequence(pgbsonsequence *sequence,
@@ -163,17 +164,12 @@ static pgbson * SerializeDeleteWorkerSpecForUnsharded(BatchDeletionSpec *batchSp
 Datum
 command_delete(PG_FUNCTION_ARGS)
 {
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("Database name must not be NULL value")));
-	}
-
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("delete document cannot be NULL")));
 	}
 
-	Datum databaseNameDatum = PG_GETARG_DATUM(0);
+	Datum databaseNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
 	pgbson *deleteSpec = PG_GETARG_PGBSON(1);
 
 	pgbsonsequence *deleteDocs = PG_GETARG_MAYBE_NULL_PGBSON_SEQUENCE(2);
@@ -205,7 +201,8 @@ command_delete(PG_FUNCTION_ARGS)
 	/*
 	 * We first validate delete command BSON and build a specification.
 	 */
-	BatchDeletionSpec *batchSpec = BuildBatchDeletionSpec(&deleteCommandIter, deleteDocs);
+	BatchDeletionSpec *batchSpec = BuildBatchDeletionSpec(&deleteCommandIter, deleteDocs,
+														  &databaseNameDatum);
 
 	pgbson *batchResponse;
 
@@ -280,7 +277,8 @@ command_delete(PG_FUNCTION_ARGS)
  * a BatchDeletionSpec.
  */
 static BatchDeletionSpec *
-BuildBatchDeletionSpec(bson_iter_t *deleteCommandIter, pgbsonsequence *deleteDocs)
+BuildBatchDeletionSpec(bson_iter_t *deleteCommandIter, pgbsonsequence *deleteDocs,
+					   Datum *databaseNameDatum)
 {
 	const char *collectionName = NULL;
 	bson_value_t deletions = { 0 };
@@ -348,6 +346,10 @@ BuildBatchDeletionSpec(bson_iter_t *deleteCommandIter, pgbsonsequence *deleteDoc
 								errmsg("'delete.let' is not yet supported")));
 			}
 		}
+		else if (strcmp(field, "$db") == 0)
+		{
+			ValidateOrExtractDatabaseNameFromSpec(deleteCommandIter, databaseNameDatum);
+		}
 		else if (IsCommonSpecIgnoredField(field))
 		{
 			elog(DEBUG1, "Command field not recognized: delete.%s", field);
@@ -365,6 +367,12 @@ BuildBatchDeletionSpec(bson_iter_t *deleteCommandIter, pgbsonsequence *deleteDoc
 								"The BSON field 'delete.%s' is not recognized as a valid field name.",
 								field)));
 		}
+	}
+
+	if (*databaseNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+						errmsg("$db must not be NULL")));
 	}
 
 	if (collectionName == NULL)

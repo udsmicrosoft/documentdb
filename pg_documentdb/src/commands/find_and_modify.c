@@ -121,7 +121,8 @@ const char *const NotImplementedOptions[] = {
 PG_FUNCTION_INFO_V1(command_find_and_modify);
 
 
-static FindAndModifySpec ParseFindAndModifyMessage(pgbson *message);
+static FindAndModifySpec ParseFindAndModifyMessage(pgbson *message,
+												   Datum *databaseNameDatum);
 static FindAndModifyResult ProcessFindAndModifySpec(MongoCollection *collection,
 													FindAndModifySpec *spec,
 													text *transactionId);
@@ -138,16 +139,12 @@ extern bool EnableVariablesSupportForWriteCommands;
 Datum
 command_find_and_modify(PG_FUNCTION_ARGS)
 {
-	if (PG_ARGISNULL(0))
-	{
-		ereport(ERROR, (errmsg("The parameter p_database_name must not be NULL")));
-	}
-	Datum databaseNameDatum = PG_GETARG_DATUM(0);
-
 	if (PG_ARGISNULL(1))
 	{
 		ereport(ERROR, (errmsg("p_message cannot be NULL")));
 	}
+
+	Datum databaseNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
 	pgbson *message = PgbsonDeduplicateFields(PG_GETARG_PGBSON(1));
 
 	text *transactionId = !PG_ARGISNULL(2) ? PG_GETARG_TEXT_P(2) : NULL;
@@ -166,7 +163,7 @@ command_find_and_modify(PG_FUNCTION_ARGS)
 	}
 
 	ThrowIfServerOrTransactionReadOnly();
-	FindAndModifySpec spec = ParseFindAndModifyMessage(message);
+	FindAndModifySpec spec = ParseFindAndModifyMessage(message, &databaseNameDatum);
 
 	Datum collectionNameDatum = CStringGetTextDatum(spec.collectionName);
 	MongoCollection *collection = GetMongoCollectionByNameDatum(databaseNameDatum,
@@ -239,7 +236,7 @@ command_find_and_modify(PG_FUNCTION_ARGS)
  * message passed to a findAndModify command.
  */
 static FindAndModifySpec
-ParseFindAndModifyMessage(pgbson *message)
+ParseFindAndModifyMessage(pgbson *message, Datum *databaseNameDatum)
 {
 	bson_value_t let = { 0 };
 	FindAndModifySpec spec = { 0 };
@@ -392,6 +389,11 @@ ParseFindAndModifyMessage(pgbson *message)
 								errmsg("findAndModify.let is not yet supported")));
 			}
 		}
+		else if (strcmp(key, "$db") == 0)
+		{
+			ValidateOrExtractDatabaseNameFromSpec(&messageIter, databaseNameDatum);
+			continue;
+		}
 		else
 		{
 			knownField = false;
@@ -433,6 +435,12 @@ ParseFindAndModifyMessage(pgbson *message)
 						errmsg(
 							"The BSON field 'findAndModify.%s' is not recognized as a valid field.",
 							key)));
+	}
+
+	if (*databaseNameDatum == (Datum) 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
+						errmsg("$db must not be specified")));
 	}
 
 	if (spec.collectionName == NULL)

@@ -31,6 +31,7 @@
 #include "operators/bson_expression_operators.h"
 
 extern bool EnableAddToSetAggregationRewrite;
+extern bool BsonTextUseJsonRepresentation;
 
 /* --------------------------------------------------------- */
 /* Data-types */
@@ -86,6 +87,29 @@ typedef struct DynamicHeapState
 	int64_t maxElements;
 	int32_t currentSizeWritten;
 } DynamicHeapState;
+
+typedef struct BsonAggValue
+{
+	int32 vl_len_;          /* PostgreSQL varlena header */
+	bson_value_t value;     /* The aggregate value (pointers valid in current memory context) */
+} BsonAggValue;
+
+/*
+ * Cached expression state for aggregates that need to parse expressions.
+ * Stores both the source expression (for cache invalidation check)
+ * and the parsed expression state.
+ */
+typedef struct CachedExpressionState
+{
+	/* The source expression pgbson - used to detect if expression changed */
+	pgbson *sourceExpression;
+
+	/* The source variable spec pgbson - used to detect if variables changed */
+	pgbson *sourceVariableSpec;
+
+	/* The parsed expression state */
+	BsonExpressionState expressionState;
+} CachedExpressionState;
 
 const char charset[] = "abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -145,6 +169,17 @@ PG_FUNCTION_INFO_V1(bson_count_transition);
 PG_FUNCTION_INFO_V1(bson_count_combine);
 PG_FUNCTION_INFO_V1(bson_count_final);
 PG_FUNCTION_INFO_V1(bson_command_count_final);
+PG_FUNCTION_INFO_V1(bson_max_with_expr_transition);
+PG_FUNCTION_INFO_V1(bson_max_with_expr_combine);
+PG_FUNCTION_INFO_V1(bson_min_with_expr_transition);
+PG_FUNCTION_INFO_V1(bson_min_with_expr_combine);
+PG_FUNCTION_INFO_V1(bson_min_max_with_expr_final);
+
+/* BsonAggValue type I/O functions */
+PG_FUNCTION_INFO_V1(bsonaggvalue_in);
+PG_FUNCTION_INFO_V1(bsonaggvalue_out);
+PG_FUNCTION_INFO_V1(bsonaggvalue_send);
+PG_FUNCTION_INFO_V1(bsonaggvalue_recv);
 
 Datum
 bson_out_transition(PG_FUNCTION_ARGS)
@@ -2042,4 +2077,396 @@ bson_command_count_final(PG_FUNCTION_ARGS)
 	bool isCommandCount = true;
 
 	PG_RETURN_POINTER(CreateCountBson(finalCount, isCommandCount));
+}
+
+
+/*
+ * Helper function to get or create a cached expression state.
+ * Checks if a valid cached state exists in fn_extra, and if not, parses
+ * the expression and caches it for reuse across calls.
+ *
+ * @param flinfo: The function info containing fn_extra for caching.
+ * @param expressionBson: The expression pgbson pointer (used for cache validation and parsing).
+ * @param variableSpec: Optional variable specification pgbson.
+ * @return: Pointer to the cached BsonExpressionState.
+ */
+static const BsonExpressionState *
+GetOrCreateCachedExpressionState(FmgrInfo *flinfo,
+								 pgbson *expressionBson,
+								 pgbson *variableSpec)
+{
+	/*
+	 * Check if we have a cached expression state and if it's still valid.
+	 * We compare the source expression pointer to determine validity -
+	 * if the pointer is the same, it's the same expression within this query.
+	 * We cannot use SetCachedFunctionStateMultiArgsWithAggContext->IsSafeToReuseFmgrFunctionExtraMultiArgs
+	 * as the params are always called as PARAM_EXEC and thus considered unsafe to reuse.
+	 * (See parse_agg.c -> make_agg_arg)
+	 */
+	CachedExpressionState *cachedState = (CachedExpressionState *) flinfo->fn_extra;
+
+	if (cachedState != NULL)
+	{
+		/* Check if the cached expression pointer matches the current one */
+		bool expressionMatches = (cachedState->sourceExpression == expressionBson);
+		bool variableSpecMatches = (cachedState->sourceVariableSpec == variableSpec);
+
+		if (expressionMatches && variableSpecMatches)
+		{
+			return &cachedState->expressionState;
+		}
+
+		/*
+		 * Expression changed - free the old cached state.
+		 * Note: The memory was allocated in flinfo->fn_mcxt which will be cleaned
+		 * up automatically, but we free explicitly to avoid memory growth if
+		 * expressions change within a query.
+		 */
+		pfree(cachedState);
+		flinfo->fn_extra = NULL;
+		cachedState = NULL;
+	}
+
+	/* No valid cache - parse the expression */
+	MemoryContext originalContext = MemoryContextSwitchTo(flinfo->fn_mcxt);
+
+	CachedExpressionState *newCachedState = palloc0(sizeof(CachedExpressionState));
+
+	/* Store the source expression pointers for future comparison */
+	newCachedState->sourceExpression = expressionBson;
+	newCachedState->sourceVariableSpec = variableSpec;
+
+	pgbsonelement expressionElement;
+	PgbsonToSinglePgbsonElement(expressionBson, &expressionElement);
+
+	/* Parse the expression state */
+	ParseBsonExpressionState(&newCachedState->expressionState,
+							 &expressionElement.bsonValue,
+							 variableSpec);
+
+	flinfo->fn_extra = newCachedState;
+
+	MemoryContextSwitchTo(originalContext);
+
+	return &newCachedState->expressionState;
+}
+
+
+static Datum
+BsonMinMaxWithExprTransitionCore(PG_FUNCTION_ARGS, bool isMax)
+{
+	MemoryContext aggregateContext;
+	if (!AggCheckCallContext(fcinfo, &aggregateContext))
+	{
+		ereport(ERROR, errmsg(
+					"aggregate function BsonMinMaxWithExprTransitionCore called in non-aggregate context"));
+	}
+
+	pgbson *inputDocument = PG_GETARG_MAYBE_NULL_PGBSON_PACKED(1);
+	pgbson *expressionBson = PG_GETARG_PGBSON(2);
+
+	/* If input document is null, return current accumulated state (or NULL if no state) */
+	if (inputDocument == NULL)
+	{
+		if (PG_ARGISNULL(0))
+		{
+			PG_RETURN_NULL();
+		}
+		PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+	}
+
+	pgbson *variableSpec = NULL;
+	if (PG_NARGS() > 3)
+	{
+		variableSpec = PG_GETARG_MAYBE_NULL_PGBSON(3);
+	}
+
+	/* Collation string is optional 5th argument (index = 4) for comparison - unsupported for now. */
+
+	const BsonExpressionState *expressionState = GetOrCreateCachedExpressionState(
+		fcinfo->flinfo,
+		expressionBson,
+		variableSpec);
+
+	/* Evaluate the expression on the document directly to bson_value_t */
+	ExpressionLifetimeTracker tracker = { 0 };
+	ExpressionResultPrivate resultPrivate;
+	memset(&resultPrivate, 0, sizeof(ExpressionResultPrivate));
+	resultPrivate.tracker = &tracker;
+	resultPrivate.variableContext.parent = expressionState->variableContext;
+
+	ExpressionResult expressionResult = { { 0 }, false, false, resultPrivate };
+
+	EvaluateAggregationExpressionData(expressionState->expressionData, inputDocument,
+									  &expressionResult, false /* isNullOnEmpty */);
+	bson_value_t evaluatedValue = expressionResult.value;
+
+	/* Check for empty/missing property in document with BSON_TYPE_EOD */
+	if (evaluatedValue.value_type == BSON_TYPE_EOD)
+	{
+		list_free_deep(tracker.itemsToFree);
+		if (PG_ARGISNULL(0))
+		{
+			PG_RETURN_NULL();
+		}
+		PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+	}
+
+	/* If state is NULL, create new state with this value */
+	if (PG_ARGISNULL(0))
+	{
+		/* First non-null value - allocate BsonAggValue and store value directly */
+		MemoryContext oldContext = MemoryContextSwitchTo(aggregateContext);
+		BsonAggValue *newState = (BsonAggValue *) palloc0(sizeof(BsonAggValue));
+		SET_VARSIZE(newState, sizeof(BsonAggValue));
+		bson_value_copy(&evaluatedValue, &newState->value);
+		MemoryContextSwitchTo(oldContext);
+
+		list_free_deep(tracker.itemsToFree);
+		PG_RETURN_POINTER(newState);
+	}
+
+	/* Get existing state and compare values directly */
+	BsonAggValue *existingState = (BsonAggValue *) PG_GETARG_POINTER(0);
+
+	/* 'isComparisonValidIgnored' to maintain compatibility with older BSONMAX implementation */
+	bool isComparisonValidIgnored = false;
+	int32_t compResult = CompareBsonValueAndType(&existingState->value,
+												 &evaluatedValue,
+												 &isComparisonValidIgnored);
+
+	/* Older max/min behavior, takes incoming document on equality so preserving same behavior here */
+	bool shouldReplace = isMax ? (compResult <= 0) : (compResult >= 0);
+	if (!shouldReplace)
+	{
+		/* Current state wins - no allocation needed */
+		list_free_deep(tracker.itemsToFree);
+		PG_RETURN_POINTER(existingState);
+	}
+
+	/* New value wins - copy new value in aggregate context */
+	MemoryContext oldContext = MemoryContextSwitchTo(aggregateContext);
+	bson_value_destroy(&existingState->value);
+	bson_value_copy(&evaluatedValue, &existingState->value);
+	MemoryContextSwitchTo(oldContext);
+
+	list_free_deep(tracker.itemsToFree);
+	PG_RETURN_POINTER(existingState);
+}
+
+
+static Datum
+BsonMinMaxWithExprCombineCore(PG_FUNCTION_ARGS, bool isMax)
+{
+	MemoryContext aggregateContext;
+	if (!AggCheckCallContext(fcinfo, &aggregateContext))
+	{
+		ereport(ERROR, errmsg(
+					"aggregate function bson_min_max_with_expr_combine called in non-aggregate context"));
+	}
+
+	/* Handle null states - matches BSONMAX behavior */
+	if (PG_ARGISNULL(0) && PG_ARGISNULL(1))
+	{
+		PG_RETURN_NULL();
+	}
+
+	BsonAggValue *result;
+	if (PG_ARGISNULL(0))
+	{
+		result = (BsonAggValue *) PG_GETARG_POINTER(1);
+	}
+	else if (PG_ARGISNULL(1))
+	{
+		result = (BsonAggValue *) PG_GETARG_POINTER(0);
+	}
+	else
+	{
+		BsonAggValue *leftState = (BsonAggValue *) PG_GETARG_POINTER(0);
+		BsonAggValue *rightState = (BsonAggValue *) PG_GETARG_POINTER(1);
+
+		/* Compare values directly */
+		bool isComparisonValidIgnored = false;
+		int32_t compResult = CompareBsonValueAndType(&leftState->value,
+													 &rightState->value,
+													 &isComparisonValidIgnored);
+		result = isMax ? (compResult >= 0 ? leftState : rightState) :
+				 (compResult <= 0 ? leftState : rightState);
+	}
+
+	MemoryContext oldContext = MemoryContextSwitchTo(aggregateContext);
+	BsonAggValue *finalResult = (BsonAggValue *) palloc0(sizeof(BsonAggValue));
+	SET_VARSIZE(finalResult, sizeof(BsonAggValue));
+	bson_value_copy(&result->value, &finalResult->value);
+	MemoryContextSwitchTo(oldContext);
+
+	PG_RETURN_POINTER(finalResult);
+}
+
+
+Datum
+bson_max_with_expr_transition(PG_FUNCTION_ARGS)
+{
+	bool isMax = true;
+	return BsonMinMaxWithExprTransitionCore(fcinfo, isMax);
+}
+
+
+Datum
+bson_min_with_expr_transition(PG_FUNCTION_ARGS)
+{
+	bool isMax = false;
+	return BsonMinMaxWithExprTransitionCore(fcinfo, isMax);
+}
+
+
+Datum
+bson_max_with_expr_combine(PG_FUNCTION_ARGS)
+{
+	bool isMax = true;
+	return BsonMinMaxWithExprCombineCore(fcinfo, isMax);
+}
+
+
+Datum
+bson_min_with_expr_combine(PG_FUNCTION_ARGS)
+{
+	bool isMax = false;
+	return BsonMinMaxWithExprCombineCore(fcinfo, isMax);
+}
+
+
+Datum
+bson_min_max_with_expr_final(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0))
+	{
+		/* Mongo returns $null for empty sets */
+		pgbsonelement finalValue;
+		finalValue.path = "";
+		finalValue.pathLength = 0;
+		finalValue.bsonValue.value_type = BSON_TYPE_NULL;
+		PG_RETURN_POINTER(PgbsonElementToPgbson(&finalValue));
+	}
+
+	/* Get value directly from BsonAggValue state */
+	BsonAggValue *state = (BsonAggValue *) PG_GETARG_POINTER(0);
+
+	pgbsonelement finalValue;
+	finalValue.path = "";
+	finalValue.pathLength = 0;
+	finalValue.bsonValue = state->value;
+	PG_RETURN_POINTER(PgbsonElementToPgbson(&finalValue));
+}
+
+
+/*
+ * --------------------------------------------------------
+ * BsonAggValue type I/O functions
+ * --------------------------------------------------------
+ */
+
+/*
+ * bsonaggvalue_in: Parse text input to BsonAggValue.
+ * Accepts both hex (BSONHEX...) and extended JSON formats, wrapped as {"": value}.
+ */
+Datum
+bsonaggvalue_in(PG_FUNCTION_ARGS)
+{
+	char *inputStr = PG_GETARG_CSTRING(0);
+
+	if (inputStr == NULL)
+	{
+		PG_RETURN_NULL();
+	}
+
+	pgbson *bson = NULL;
+	if (IsBsonHexadecimalString(inputStr))
+	{
+		bson = PgbsonInitFromHexadecimalString(inputStr);
+	}
+	else
+	{
+		bson = PgbsonInitFromJson(inputStr);
+	}
+	pgbsonelement element;
+	PgbsonToSinglePgbsonElement(bson, &element);
+
+	/* Allocate BsonAggValue and deep-copy the value */
+	BsonAggValue *state = (BsonAggValue *) palloc(sizeof(BsonAggValue));
+	SET_VARSIZE(state, sizeof(BsonAggValue));
+	bson_value_copy(&element.bsonValue, &state->value);
+
+	PG_RETURN_POINTER(state);
+}
+
+
+/*
+ * bsonaggvalue_out: Convert BsonAggValue to text output.
+ * Returns the value wrapped as {"": value}.
+ * Uses hex representation by default, or extended JSON when the GUC is set.
+ */
+Datum
+bsonaggvalue_out(PG_FUNCTION_ARGS)
+{
+	BsonAggValue *state = (BsonAggValue *) PG_GETARG_POINTER(0);
+
+	/* Wrap value as {"": value} and convert to text */
+	pgbson *bson = BsonValueToDocumentPgbson(&state->value);
+
+	const char *outputString = NULL;
+	if (BsonTextUseJsonRepresentation)
+	{
+		outputString = PgbsonToCanonicalExtendedJson(bson);
+	}
+	else
+	{
+		outputString = PgbsonToHexadecimalString(bson);
+	}
+
+	PG_RETURN_CSTRING(outputString);
+}
+
+
+/*
+ * bsonaggvalue_send: Serialize BsonAggValue to binary for network transfer.
+ * Converts the value to pgbson format for transmission.
+ */
+Datum
+bsonaggvalue_send(PG_FUNCTION_ARGS)
+{
+	BsonAggValue *state = (BsonAggValue *) PG_GETARG_POINTER(0);
+
+	/* Convert value to pgbson (which is a varlena/bytea-compatible format) */
+	pgbson *bson = BsonValueToDocumentPgbson(&state->value);
+
+	PG_RETURN_POINTER(bson);
+}
+
+
+/*
+ * bsonaggvalue_recv: Deserialize BsonAggValue from binary network data.
+ * Parses pgbson bytes and extracts the value with deep copy.
+ */
+Datum
+bsonaggvalue_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo buf = (StringInfo) PG_GETARG_POINTER(0);
+
+	/* Parse the buffer as pgbson */
+	pgbson *bson = PgbsonInitFromBuffer(buf->data, buf->len);
+
+	/* Mark buffer as consumed */
+	buf->cursor = buf->len;
+
+	/* Extract the value from the pgbson {"": value} wrapper */
+	pgbsonelement element;
+	PgbsonToSinglePgbsonElement(bson, &element);
+
+	/* Allocate BsonAggValue and deep-copy the value */
+	BsonAggValue *state = (BsonAggValue *) palloc(sizeof(BsonAggValue));
+	SET_VARSIZE(state, sizeof(BsonAggValue));
+	bson_value_copy(&element.bsonValue, &state->value);
+
+	PG_RETURN_POINTER(state);
 }

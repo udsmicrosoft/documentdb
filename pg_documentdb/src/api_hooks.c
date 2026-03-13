@@ -81,6 +81,13 @@ PasswordValidation_HookType
 DefaultEnableCompositeOpClass_HookType
 	default_enable_composite_op_class_hook = NULL;
 
+CreateTtlMetricsContext_HookType
+	create_ttl_metrics_context_hook = NULL;
+RecordTtlMetric_HookType
+	record_ttl_metric_hook = NULL;
+FinalizeTtlMetrics_HookType
+	finalize_ttl_metrics_hook = NULL;
+
 /*
  * Single node scenario is always a metadata coordinator
  */
@@ -470,12 +477,11 @@ EnsureMetadataTableReplicated(const char *tableName)
  * after the cluster has been initialized or upgraded.
  */
 void
-PostSetupClusterHook(bool isInitialize, bool (shouldUpgradeFunc(void *, int, int, int)),
-					 void *state)
+PostSetupClusterHook(bool (shouldUpgradeFunc(void *, int, int, int)), void *state)
 {
 	if (post_setup_cluster_hook != NULL)
 	{
-		return post_setup_cluster_hook(isInitialize, shouldUpgradeFunc, state);
+		return post_setup_cluster_hook(shouldUpgradeFunc, state);
 	}
 }
 
@@ -637,4 +643,58 @@ ShouldUseCompositeOpClassByDefault()
 	}
 
 	return DefaultUseCompositeOpClass;
+}
+
+
+/*
+ * Create a TTL metrics context for collecting metrics during TTL purge.
+ * Returns an opaque context pointer, or NULL if no hook is set.
+ */
+void *
+CreateTtlMetricsContext(MemoryContext metricsMemoryContext, int numTtlIndexEntries)
+{
+	if (create_ttl_metrics_context_hook != NULL)
+	{
+		return create_ttl_metrics_context_hook(metricsMemoryContext,
+											   numTtlIndexEntries);
+	}
+
+	return NULL;
+}
+
+
+/*
+ * Record a single TTL metric entry after a batch delete.
+ * If no hook is set, this is a no-op.
+ */
+void
+RecordTtlMetric(void *metricsContext,
+				uint64 collectionId,
+				uint64 indexId,
+				uint64 shardId,
+				const char *indexName,
+				double saturationRatio,
+				double batchDeleteElapsedTimeMs,
+				uint64 rowsDeleted)
+{
+	if (record_ttl_metric_hook != NULL && metricsContext != NULL)
+	{
+		record_ttl_metric_hook(metricsContext, collectionId, indexId, shardId,
+							   indexName, saturationRatio,
+							   batchDeleteElapsedTimeMs, rowsDeleted);
+	}
+}
+
+
+/*
+ * Finalize and emit TTL metrics, then clean up the metrics context.
+ * If no hook is set, this is a no-op.
+ */
+void
+FinalizeTtlMetrics(void *metricsContext)
+{
+	if (finalize_ttl_metrics_hook != NULL && metricsContext != NULL)
+	{
+		finalize_ttl_metrics_hook(metricsContext);
+	}
 }

@@ -187,7 +187,7 @@ PG_FUNCTION_INFO_V1(command_delete_cursors);
 Datum
 command_aggregate_cursor_first_page(PG_FUNCTION_ARGS)
 {
-	text *database = PG_GETARG_TEXT_P(0);
+	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *aggregationSpec = PG_GETARG_PGBSON(1);
 	int64_t cursorId = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT64(2);
 
@@ -222,7 +222,7 @@ aggregate_cursor_first_page(text *database, pgbson *aggregationSpec,
 Datum
 command_find_cursor_first_page(PG_FUNCTION_ARGS)
 {
-	text *database = PG_GETARG_TEXT_P(0);
+	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *findSpec = PG_GETARG_PGBSON(1);
 	int64_t cursorId = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT64(2);
 
@@ -258,7 +258,7 @@ find_cursor_first_page(text *database, pgbson *findSpec, int64_t cursorId)
 Datum
 command_list_collections_cursor_first_page(PG_FUNCTION_ARGS)
 {
-	text *database = PG_GETARG_TEXT_P(0);
+	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *listCollectionsSpec = PG_GETARG_PGBSON(1);
 
 	Datum response = list_collections_first_page(database, listCollectionsSpec);
@@ -297,7 +297,7 @@ list_collections_first_page(text *database, pgbson *listCollectionsSpec)
 Datum
 command_list_indexes_cursor_first_page(PG_FUNCTION_ARGS)
 {
-	text *database = PG_GETARG_TEXT_P(0);
+	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *listIndexesSpec = PG_GETARG_PGBSON(1);
 
 	Datum response = list_indexes_first_page(database, listIndexesSpec);
@@ -336,7 +336,7 @@ list_indexes_first_page(text *database, pgbson *listIndexesSpec)
 Datum
 command_cursor_get_more(PG_FUNCTION_ARGS)
 {
-	text *database = PG_GETARG_TEXT_P(0);
+	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *getMoreSpec = PG_GETARG_PGBSON(1);
 	pgbson *cursorSpec = PG_GETARG_PGBSON(2);
 
@@ -553,7 +553,7 @@ command_distinct_query(PG_FUNCTION_ARGS)
 {
 	ReportFeatureUsage(FEATURE_COMMAND_DISTINCT);
 
-	text *database = PG_GETARG_TEXT_P(0);
+	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *distinctSpec = PG_GETARG_PGBSON(1);
 
 	bool setStatementTimeout = true;
@@ -583,7 +583,7 @@ command_count_query(PG_FUNCTION_ARGS)
 {
 	ReportFeatureUsage(FEATURE_COMMAND_COUNT);
 
-	text *database = PG_GETARG_TEXT_P(0);
+	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *countSpec = PG_GETARG_PGBSON(1);
 
 	bool setStatementTimeout = true;

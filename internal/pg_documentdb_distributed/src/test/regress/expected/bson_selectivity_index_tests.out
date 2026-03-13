@@ -49,7 +49,7 @@ EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'select
 (8 rows)
 
 BEGIN;
-set local documentdb.enableNewSelectivityMode to on;
+set local documentdb.enableCompositeIndexPlanner to on;
 EXPLAIN (COSTS OFF) SELECT document FROM documentdb_api.collection('db', 'selectivity_index_tests') WHERE document @@ '{ "a": 1, "b": { "$in": [ 2, 3, 4, 5 ] }, "a": { "$in": [ 1, 5, 6, 7 ] }, "$or": [ { "c": 3, "d": { "$gt": 500 } }, { "c": { "$gt": 4 } }] }';
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
 ---------------------------------------------------------------------
@@ -113,7 +113,7 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('seldb', '{ "crea
 (1 row)
 
 ANALYZE documentdb_data.documents_10142;
-set documentdb.enableNewSelectivityMode to off;
+set documentdb.enableCompositeIndexPlanner to off;
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('seldb', '{ "find" : "bimap_or_selectivity", "filter" : { "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } }, "$and" : [ { "$or" : [ { "productionDate" : { "$exists" : false } }, { "stoppingDate" : { "$exists" : false } }, { "noticeDate" : { "$exists" : false } } ] } ] }, "limit" : { "$numberInt" : "10" } }');
                                                                                  QUERY PLAN                                                                                 
 ---------------------------------------------------------------------
@@ -127,23 +127,21 @@ EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bs
                Index Cond: (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson)
 (8 rows)
 
-set documentdb.enableNewSelectivityMode to on;
+set documentdb.enableCompositeIndexPlanner to on;
+set documentdb.forceDisableSeqScan to on;
+set random_page_cost to 0.01;
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('seldb', '{ "find" : "bimap_or_selectivity", "filter" : { "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } }, "$and" : [ { "$or" : [ { "productionDate" : { "$exists" : false } }, { "stoppingDate" : { "$exists" : false } }, { "noticeDate" : { "$exists" : false } } ] } ] }, "limit" : { "$numberInt" : "10" } }');
-                                                                                                                                                                                                                                                      QUERY PLAN                                                                                                                                                                                                                                                      
+                                                                                 QUERY PLAN                                                                                 
 ---------------------------------------------------------------------
  Limit (actual rows=0 loops=1)
-   ->  Bitmap Heap Scan on documents_10142_1014018 collection (actual rows=0 loops=1)
-         Recheck Cond: (((document @? '{ "productionDate" : false }'::bson) AND (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson)) OR ((document @? '{ "stoppingDate" : false }'::bson) AND (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson)) OR ((document @? '{ "noticeDate" : false }'::bson) AND (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson)))
-         ->  BitmapOr (actual rows=0 loops=1)
-               ->  Bitmap Index Scan on "plane_productionDate_index" (actual rows=0 loops=1)
-                     Index Cond: ((document @? '{ "productionDate" : false }'::bson) AND (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson))
-               ->  Bitmap Index Scan on "plane_stoppingDate_index" (actual rows=0 loops=1)
-                     Index Cond: ((document @? '{ "stoppingDate" : false }'::bson) AND (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson))
-               ->  Bitmap Index Scan on "plane_noticeDate_index" (actual rows=0 loops=1)
-                     Index Cond: ((document @? '{ "noticeDate" : false }'::bson) AND (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson))
-(10 rows)
+   ->  Index Scan using "plane_noticeDate_index" on documents_10142_1014018 collection (actual rows=0 loops=1)
+         Index Cond: (document @~ '{ "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } } }'::bson)
+         Filter: ((document @? '{ "productionDate" : false }'::bson) OR (document @? '{ "stoppingDate" : false }'::bson) OR (document @? '{ "noticeDate" : false }'::bson))
+         Rows Removed by Filter: 150
+(5 rows)
 
-set documentdb.enableNewSelectivityMode to off;
+set documentdb.enableCompositeIndexPlanner to off;
+reset random_page_cost;
 EXPLAIN (COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('seldb', '{ "find" : "bimap_or_selectivity", "filter" : { "plane" : { "$regularExpression" : { "pattern" : "A.+", "options" : "i" } }, "$and" : [ { "$or" : [ { "productionDate" : { "$exists" : false } }, { "stoppingDate" : { "$exists" : false } }, { "noticeDate" : { "$exists" : false } } ] } ] }, "limit" : { "$numberInt" : "10" } }');
                                                                                  QUERY PLAN                                                                                 
 ---------------------------------------------------------------------

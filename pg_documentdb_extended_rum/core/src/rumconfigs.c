@@ -65,10 +65,6 @@ PGDLLEXPORT bool RumPreferOrderedIndexScan = RUM_DEFAULT_PREFER_ORDERED_INDEX_SC
 PGDLLEXPORT bool RumEnableSkipIntermediateEntry =
 	RUM_DEFAULT_ENABLE_SKIP_INTERMEDIATE_ENTRY;
 
-/* ruminsert.c */
-#define RUM_DEFAULT_ENABLE_PARALLEL_INDEX_BUILD true
-PGDLLEXPORT bool RumEnableParallelIndexBuild = RUM_DEFAULT_ENABLE_PARALLEL_INDEX_BUILD;
-
 #define RUM_DEFAULT_PARALLEL_INDEX_WORKERS_OVERRIDE -1
 PGDLLEXPORT int RumParallelIndexWorkersOverride =
 	RUM_DEFAULT_PARALLEL_INDEX_WORKERS_OVERRIDE;
@@ -110,9 +106,9 @@ PGDLLEXPORT bool RumSkipGlobalVisibilityCheckOnPrune =
 PGDLLEXPORT bool RumEnableSupportDeadIndexItems =
 	RUM_DEFAULT_ENABLE_SUPPORT_DEAD_INDEX_ITEMS;
 
-/* rumselfuncs.c */
-#define RUM_DEFAULT_ENABLE_CUSTOM_COST_ESTIMATE true
-PGDLLEXPORT bool RumEnableCustomCostEstimate = RUM_DEFAULT_ENABLE_CUSTOM_COST_ESTIMATE;
+#define RUM_DEFAULT_ENABLE_ORDERED_OPERATOR_SCANS true
+PGDLLEXPORT bool RumEnableOrderedOperatorScans =
+	RUM_DEFAULT_ENABLE_ORDERED_OPERATOR_SCANS;
 
 PGDLLEXPORT rum_format_log_hook rum_unredacted_log_emit_hook = NULL;
 
@@ -168,15 +164,6 @@ InitializeCommonDocumentDBGUCs(const char *rumGucPrefix, const
 		NULL,
 		&RumDisableFastScan,
 		RUM_DEFAULT_DISABLE_FAST_SCAN,
-		PGC_USERSET, 0,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enable_parallel_index_build", documentDBRumGucPrefix),
-		"Sets whether or not to enable parallel index build",
-		NULL,
-		&RumEnableParallelIndexBuild,
-		RUM_DEFAULT_ENABLE_PARALLEL_INDEX_BUILD,
 		PGC_USERSET, 0,
 		NULL, NULL, NULL);
 
@@ -239,15 +226,6 @@ InitializeCommonDocumentDBGUCs(const char *rumGucPrefix, const
 		NULL,
 		&RumInjectPageSplitIncomplete,
 		RUM_DEFAULT_ENABLE_INJECT_PAGE_SPLIT_INCOMPLETE,
-		PGC_USERSET, 0,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enable_custom_cost_estimate", documentDBRumGucPrefix),
-		"Temporary flag to enable using the custom rum cost estimate logic",
-		NULL,
-		&RumEnableCustomCostEstimate,
-		RUM_DEFAULT_ENABLE_CUSTOM_COST_ESTIMATE,
 		PGC_USERSET, 0,
 		NULL, NULL, NULL);
 
@@ -350,6 +328,16 @@ InitializeCommonDocumentDBGUCs(const char *rumGucPrefix, const
 		RUM_DEFAULT_FIX_INCOMPLETE_SPLIT,
 		PGC_USERSET, 0,
 		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_ordered_operator_scans", documentDBRumGucPrefix),
+		"Sets whether or not to enable ordered operator scans",
+		NULL,
+		&RumEnableOrderedOperatorScans,
+		RUM_DEFAULT_ENABLE_ORDERED_OPERATOR_SCANS,
+		PGC_USERSET, 0,
+		NULL, NULL, NULL);
+
 	rum_relopt_kind = add_reloption_kind();
 
 	add_string_reloption(rum_relopt_kind, "attach",

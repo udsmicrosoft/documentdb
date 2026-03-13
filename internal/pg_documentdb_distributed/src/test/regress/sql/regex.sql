@@ -106,7 +106,6 @@ SELECT document from collection('db', 'regex') where document @@ '{ "a": {"$rege
 BEGIN;
 /* Make use of Index */
 SET LOCAL enable_seqscan to OFF;
-SET LOCAL documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 -- 111 117   Multiple regex in a single query. Ensuring multiple regexes, in the same query, are cached as separate entry in the cache
 SELECT document from collection('db', 'regex') where document @@ '{ "a": {"$regex": "a.vaLue", "$options": "i"}, "b": {"$regex": "b va.ue", "$options": ""}}';
 ROLLBACK;
@@ -114,7 +113,6 @@ ROLLBACK;
 BEGIN;
 /* Make use of Index */
 SET LOCAL enable_seqscan to OFF;
-SET LOCAL documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 -- 111 117   Multiple regex in a single query. Ensuring multiple regexes, in the same query, are cached as separate entry in the cache
 EXPLAIN (COSTS OFF) SELECT document from collection('db', 'regex') where document @@ '{ "a": {"$regex": "a.vaLue", "$options": "i"}, "b": {"$regex": "b va.ue", "$options": ""}}';
 ROLLBACK;
@@ -124,14 +122,12 @@ select documentdb_api.shard_collection('db', 'regex', '{"_id": "hashed"}', false
 
 BEGIN;
 SET LOCAL enable_seqscan to OFF;
-SET LOCAL documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 -- 111 117   Multiple regex in a single query on sharded collection. Index Path. Ensuring multiple regexes, in the same query, are cached as separate entry in the cache
 SELECT document from collection('db', 'regex') where document @@ '{ "a": {"$regex": "a.vaLue", "$options": "i"}, "b": {"$regex": "b va.ue", "$options": ""}}';
 ROLLBACK;
 
 BEGIN;
 SET LOCAL enable_seqscan to OFF;
-SET LOCAL documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 -- 111 117   Multiple regex in a single query on sharded collection. Index Path. Ensuring multiple regexes, in the same query, are cached as separate entry in the cache
 EXPLAIN (COSTS OFF) SELECT document from collection('db', 'regex') where document @@ '{ "a": {"$regex": "a.vaLue", "$options": "i"}, "b": {"$regex": "b va.ue", "$options": ""}}';
 ROLLBACK;

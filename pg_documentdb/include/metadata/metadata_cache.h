@@ -50,6 +50,12 @@ extern PGDLLIMPORT char *ApiRootRole;
 extern PGDLLEXPORT char *ApiSettingsManagerRole;
 extern PGDLLEXPORT char *ApiUserAdminRole;
 
+/* Privileged Action System Roles */
+extern PGDLLEXPORT char *ApiCollectionFindRole;
+extern PGDLLEXPORT char *ApiCollectionInsertRole;
+extern PGDLLEXPORT char *ApiCollectionUpdateRole;
+extern PGDLLEXPORT char *ApiCollectionRemoveRole;
+
 extern MemoryContext DocumentDBApiMetadataCacheContext;
 
 /* functions related with pg_documentdb "extension" itself */
@@ -145,6 +151,7 @@ Oid TextEqualOperatorId(void);
 Oid TextNotEqualOperatorId(void);
 Oid TextLessOperatorId(void);
 Oid BsonEqualOperatorId(void);
+Oid BsonEqualFunctionOid(void);
 Oid BsonEqualMatchOperatorId(void);
 Oid BsonInOperatorId(void);
 Oid BsonQueryOperatorId(void);
@@ -378,7 +385,9 @@ Oid BsonExpressionMapFunctionOid(void);
 Oid BsonExpressionMapWithLetFunctionOid(void);
 Oid BsonExpressionAppendCollationFunctionOid(void);
 Oid BsonMaxAggregateFunctionOid(void);
+Oid BsonMaxWithExprAggregateFunctionOid(void);
 Oid BsonMinAggregateFunctionOid(void);
+Oid BsonMinWithExprAggregateFunctionOid(void);
 Oid PgRandomFunctionOid(void);
 Oid BsonArrayAggregateFunctionOid(void);
 Oid BsonArrayAggregateAllArgsFunctionOid(void);

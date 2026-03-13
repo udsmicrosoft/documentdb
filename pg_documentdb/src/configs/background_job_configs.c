@@ -44,17 +44,17 @@ int SingleTTLTaskTimeBudget = DEFAULT_SINGLE_TTL_TASK_TIME_BUDGET;
 #define DEFAULT_TTL_TASK_MAX_RUNTIME_IN_MS 60000
 int TTLTaskMaxRunTimeInMS = DEFAULT_TTL_TASK_MAX_RUNTIME_IN_MS;
 
-#define DEFAULT_TTL_DELETE_SATURATION_RATIO_THRESHOLD 0.9
-double TTLDeleteSaturationThreshold = DEFAULT_TTL_DELETE_SATURATION_RATIO_THRESHOLD;
-
-#define DEFAULT_SLOW_TTL_BATCH_DELETE_THRESHOLD_IN_MS 10000
-int TTLSlowBatchDeleteThresholdInMS = DEFAULT_SLOW_TTL_BATCH_DELETE_THRESHOLD_IN_MS;
-
 #define DEFAULT_REPEAT_PURGE_INDEXES_FOR_TTL_TASK true
 bool RepeatPurgeIndexesForTTLTask = DEFAULT_REPEAT_PURGE_INDEXES_FOR_TTL_TASK;
 
 #define DEFAULT_SKIP_CAUGHT_UP_TTL_INDEXES true
 bool TTLSkipCaughtUpIndexes = DEFAULT_SKIP_CAUGHT_UP_TTL_INDEXES;
+
+#define DEFAULT_SKIP_REPEAT_DELETE_FOR_UNORDERED_INDEX true
+bool SkipRepeatDeleteForUnOrderedIndex = DEFAULT_SKIP_REPEAT_DELETE_FOR_UNORDERED_INDEX;
+
+#define DEFAULT_MAX_TTL_BATCH_SIZE_UNORDERED_INDEX 10000
+int MaxTTLBatchSizeUnorderedIndex = DEFAULT_MAX_TTL_BATCH_SIZE_UNORDERED_INDEX;
 
 
 #define DEFAULT_ENABLE_TTL_DESC_SORT false
@@ -78,9 +78,6 @@ int LatchTimeOutSec = DEFAULT_BG_LATCH_TIMEOUT_SEC;
 #define DEFAULT_LOG_TTL_PROGRESS_ACTIVITY false
 bool LogTTLProgressActivity = DEFAULT_LOG_TTL_PROGRESS_ACTIVITY;
 
-#define DEFAULT_ENABLE_SELECTIVE_TTL_LOGGING true
-bool EnableSelectiveTTLLogging = DEFAULT_ENABLE_SELECTIVE_TTL_LOGGING;
-
 #define DEFAULT_ENABLE_TTL_BATCH_OBSERVABILITY true
 bool EnableTTLBatchObservability = DEFAULT_ENABLE_TTL_BATCH_OBSERVABILITY;
 
@@ -89,6 +86,7 @@ bool ForceIndexScanForTTLTask = DEFAULT_FORCE_INDEX_SCAN_TTL_TASK;
 
 #define DEFAULT_USE_INDEX_HINTS_TTL_TASK true
 bool UseIndexHintsForTTLTask = DEFAULT_USE_INDEX_HINTS_TTL_TASK;
+
 
 void
 InitializeBackgroundJobConfigurations(const char *prefix, const char *newGucPrefix)
@@ -112,16 +110,9 @@ InitializeBackgroundJobConfigurations(const char *prefix, const char *newGucPref
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		psprintf("%s.enableSelectiveTTLLogging", prefix),
-		gettext_noop(
-			"Whether to log highly saturated or slow ttl batches. It's turned off by default to reduce noise."),
-		NULL, &EnableSelectiveTTLLogging, DEFAULT_ENABLE_SELECTIVE_TTL_LOGGING,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
 		psprintf("%s.enableTTLBatchObservability", prefix),
 		gettext_noop(
-			"Whether to calculate and emit feature counters ttl_saturated_batches and ttl_slow_batches."),
+			"Whether to calculate and emit TTL batch observability metrics."),
 		NULL, &EnableTTLBatchObservability, DEFAULT_ENABLE_TTL_BATCH_OBSERVABILITY,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
@@ -184,24 +175,24 @@ InitializeBackgroundJobConfigurations(const char *prefix, const char *newGucPref
 		0,
 		NULL, NULL, NULL);
 
-	DefineCustomRealVariable(
-		psprintf("%s.TTLDeleteSaturationThreshold", prefix),
+	DefineCustomBoolVariable(
+		psprintf("%s.skipRepeatDeleteForUnOrderedIndex", newGucPrefix),
 		gettext_noop(
-			"Logging threshold for ttl delete saturation ratio defined as total rows deleted in an invocation divided by the batch size."),
+			"Whether to skip repeat delete and use a larger batch size for non-ordered TTL indexes."),
 		NULL,
-		&TTLDeleteSaturationThreshold,
-		DEFAULT_TTL_DELETE_SATURATION_RATIO_THRESHOLD, 0.0, 1.0,
+		&SkipRepeatDeleteForUnOrderedIndex,
+		DEFAULT_SKIP_REPEAT_DELETE_FOR_UNORDERED_INDEX,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		psprintf("%s.TTLSlowBatchDeleteThresholdInMS", prefix),
+		psprintf("%s.maxTTLBatchSizeUnorderedIndex", newGucPrefix),
 		gettext_noop(
-			"Threshold for considering a single batch of ttl deletes to be slow."),
+			"The max batch size for TTL deletes on non-ordered indexes."),
 		NULL,
-		&TTLSlowBatchDeleteThresholdInMS,
-		DEFAULT_SLOW_TTL_BATCH_DELETE_THRESHOLD_IN_MS, 0, INT_MAX,
+		&MaxTTLBatchSizeUnorderedIndex,
+		DEFAULT_MAX_TTL_BATCH_SIZE_UNORDERED_INDEX, 1, INT_MAX,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);

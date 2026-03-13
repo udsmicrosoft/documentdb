@@ -26,5 +26,5 @@ void AddExtensionQueryScanForVectorQuery(PlannerInfo *root, RelOptInfo *rel,
 
 
 void AddExplainCustomScanWrapper(PlannerInfo *root, RelOptInfo *rel,
-								 RangeTblEntry *rte);
+								 RangeTblEntry *rte, uint64 collectionId);
 #endif

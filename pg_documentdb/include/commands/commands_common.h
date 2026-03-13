@@ -42,6 +42,12 @@ extern PGDLLIMPORT const StringView IdFieldStringView;
 extern bool EnableCreateCollectionOnInsert;
 
 /*
+ * Whether to enforce that $db in the command body matches the database
+ * passed as a function argument. When off, mismatches are silently ignored.
+ */
+extern bool EnableDbNameValidation;
+
+/*
  * Whether or not write operations are inlined or if they are dispatched
  * to a remote shard. For single node scenarios like DocumentDB that don't need
  * distributed dispatch. Reset in scenarios that need distributed dispatch.
@@ -76,6 +82,9 @@ bool FindShardKeyValueForDocumentId(MongoCollection *collection, const
 									const char *collationString);
 
 bool IsCommonSpecIgnoredField(const char *fieldName);
+void ValidateOrExtractDatabaseNameFromSpec(bson_iter_t *iter, Datum *databaseNameDatum);
+void ValidateOrExtractDatabaseNameTextFromSpec(bson_iter_t *iter,
+											   text **databaseNameText);
 
 WriteError * GetWriteErrorFromErrorData(ErrorData *errorData, int writeErrorIdx);
 bool TryGetErrorMessageAndCode(ErrorData *errorData, int *code, char **errmessage);

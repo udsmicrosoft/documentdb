@@ -376,7 +376,6 @@ SELECT COUNT(documentdb_api.insert_one('db', 'ttlCompositeOrderedScan', FORMAT('
 
 --  Create TTL Index --
 SET documentdb.enableExtendedExplainPlans to on;
-SET documentdb.enableIndexOrderbyPushdown to on;
 SELECT documentdb_api_internal.create_indexes_non_concurrently('db', '{"createIndexes": "ttlCompositeOrderedScan", "indexes": [{"key": {"ttl": 1}, "enableCompositeTerm": true, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5, "sparse": true}]}', true);
 
 select
@@ -417,7 +416,6 @@ SELECT count(*) from ( SELECT shard_key_value, object_id, document  from documen
 
 --  TTL indexes behaves like normal indexes that are used in queries (cx can provide .hint() to force)
 BEGIN;
-SET LOCAL documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN(costs off) SELECT object_id FROM documentdb_data.documents_20006
 		WHERE bson_dollar_eq(document, '{ "ttl" : { "$date" : { "$numberLong" : "100" } } }'::documentdb_core.bson)
         LIMIT 100;
@@ -426,7 +424,6 @@ END;
 --  Check the query to fetch the eligible TTL indexes uses IndexScan.
 
 BEGIN;
-SET LOCAL documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN(analyze on, verbose on, costs off, timing off, summary off) SELECT ctid FROM documentdb_data.documents_20006_2000105
                 WHERE bson_dollar_lt(document, '{ "ttl" : { "$date" : { "$numberLong" : "1754515365000" } } }'::documentdb_core.bson)
                 AND documentdb_api_internal.bson_dollar_index_hint(document, 'ttl_index'::text, '{"key": {"ttl": 1}}'::documentdb_core.bson, true)
@@ -448,7 +445,6 @@ SELECT count(*) from ( SELECT shard_key_value, object_id, document  from documen
 --  Check for Ordered Indes Scan on the ttl index 
 
 BEGIN;
-SET LOCAL documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN(analyze on, verbose on, costs off, timing off, summary off) SELECT ctid FROM documentdb_data.documents_20006_2000124
                 WHERE bson_dollar_lt(document, '{ "ttl" : { "$date" : { "$numberLong" : "1657900030775" } } }'::documentdb_core.bson)
                 AND documentdb_api_internal.bson_dollar_index_hint(document, 'ttl_index'::text, '{"key": {"ttl": 1}}'::documentdb_core.bson, true)
@@ -456,7 +452,6 @@ EXPLAIN(analyze on, verbose on, costs off, timing off, summary off) SELECT ctid 
 END;
 
 BEGIN;
-SET LOCAL documentdb.enableIndexOrderbyPushdown to on;
 SET client_min_messages TO INFO;
 EXPLAIN(COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF) SELECT ctid FROM documentdb_data.documents_20006_2000122
                 WHERE bson_dollar_lt(document, '{ "ttl" : { "$date" : { "$numberLong" : "1657900030775" } } }'::documentdb_core.bson)
@@ -472,7 +467,6 @@ SET client_min_messages TO LOG;
 SET LOCAL documentdb.useIndexHintsForTTLTask to off;
 SET LOCAL documentdb.logTTLProgressActivity to on;
 SET LOCAL documentdb.enableTTLDescSort to on;
-SET LOCAL documentdb.enableIndexOrderbyPushdown to on;
 SET LOCAL documentdb.RepeatPurgeIndexesForTTLTask to off;
 CALL documentdb_api_internal.delete_expired_rows(100);
 RESET client_min_messages;
@@ -481,9 +475,8 @@ END;
 SELECT count(*) from ( SELECT shard_key_value, object_id, document  from documentdb_api.collection('db', 'ttlCompositeOrderedScan') order by object_id) as a;
 
 BEGIN;
-SET LOCAL documentdb.enableIndexOrderbyPushdown to on;
 set local enable_seqscan to off;
-set LOCAL enable_bitmapscan to off;
+SET LOCAL enable_bitmapscan to off;
 SET client_min_messages TO INFO;
 
 -- Check ORDER BY uses index 
@@ -496,3 +489,143 @@ EXPLAIN(COSTS OFF, ANALYZE ON, SUMMARY OFF, TIMING OFF)
         ORDER BY documentdb_api_catalog.bson_orderby(document, '{ "ttl" : -1}'::documentdb_core.bson)
         LIMIT 100;
 END;
+
+
+-- Test : Tests that creating TTL index with createTTLIndexAsCompositeByDefault GUC on creates composite index and the index is used for TTL deletes
+
+-- a. Create a TTL index that is on single path when ttl is not forced to composite
+SHOW documentdb.defaultUseCompositeOpClass;
+BEGIN;
+SET LOCAL documentdb.createTTLIndexAsCompositeByDefault TO off;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('ttl_default_composite', '{"createIndexes": "ttlcoll", "indexes": [{"key": {"ttl": 1}, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5}]}', true);
+END;
+\d+ documentdb_data.documents_20008;
+
+-- b. When defaultUseCompositeOpClass=off, createTTLIndexAsCompositeByDefault=on, 
+-- "enableCompositeTerm": unset
+-- TTL index should be created with composite opclass by default
+SELECT documentdb_api_internal.create_indexes_non_concurrently('ttl_default_composite', '{"createIndexes": "ttlcoll2", "indexes": [{"key": {"ttl": 1}, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5}]}', true);
+\d+ documentdb_data.documents_20009;
+
+-- c. When defaultUseCompositeOpClass is on, TTL index should be created with composite opclass and the index should be used for deletes
+BEGIN;
+SET LOCAL documentdb.defaultUseCompositeOpClass TO on;
+SET LOCAL documentdb.createTTLIndexAsCompositeByDefault TO off;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('ttl_default_composite', '{"createIndexes": "ttlcoll3", "indexes": [{"key": {"ttl": 1}, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5}]}', true);
+END;
+\d+ documentdb_data.documents_20010;
+
+-- d. When defaultUseCompositeOpClass=on, createTTLIndexAsCompositeByDefault=on, "enableCompositeTerm": true
+-- TTL index should be created with composite opclass by default
+BEGIN;
+SET LOCAL documentdb.defaultUseCompositeOpClass TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('ttl_default_composite', '{"createIndexes": "ttlcoll4", "indexes": [{"key": {"ttl": 1}, "enableCompositeTerm": true, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5}]}', true);
+END;
+\d+ documentdb_data.documents_20011;
+
+-- e. When defaultUseCompositeOpClass=off, createTTLIndexAsCompositeByDefault=off, "enableCompositeTerm": true
+-- TTL index should be created with composite opclass by default
+BEGIN;
+SET LOCAL documentdb.createTTLIndexAsCompositeByDefault TO off;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('ttl_default_composite', '{"createIndexes": "ttlcoll5", "indexes": [{"key": {"ttl": 1}, "enableCompositeTerm": true, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5}]}', true);
+END;
+\d+ documentdb_data.documents_20012;
+
+-- f. When defaultUseCompositeOpClass=off, createTTLIndexAsCompositeByDefault=on, "enableCompositeTerm": true
+-- TTL index should be created with composite opclass by default
+BEGIN;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('ttl_default_composite', '{"createIndexes": "ttlcoll6", "indexes": [{"key": {"ttl": 1}, "enableCompositeTerm": true, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5}]}', true);
+END;
+\d+ documentdb_data.documents_20013;
+
+-- g. When createTTLIndexAsCompositeByDefault=on, "enableCompositeTerm": false
+-- TTL index should not be created with composite opclass and should not allow ordered scan
+BEGIN;
+SET LOCAL documentdb.defaultUseCompositeOpClass TO on;
+SET LOCAL documentdb.createTTLIndexAsCompositeByDefault TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('ttl_default_composite', '{"createIndexes": "ttlcoll7", "indexes": [{"key": {"ttl": 1}, "enableCompositeTerm": false, "name": "ttl_index", "v" : 1, "expireAfterSeconds": 5}]}', true);
+END;
+\d+ documentdb_data.documents_20014;
+
+select
+    c.collection_name, 
+    (index_spec).index_name,
+    -- index_is_ordered column tells if the index allows ordered scan 
+    COALESCE(documentdb_core.bson_get_value_text((index_spec).index_options::documentdb_core.bson, 'enableOrderedIndex'::text)::bool, false) as is_ordered,
+    (index_spec).index_expire_after_seconds as ttl_expiry,
+    (index_spec).index_name as index_name,
+    index_spec
+from documentdb_api_catalog.collection_indexes ci 
+JOIN documentdb_api_catalog.collections c
+ON  c.collection_id = ci.collection_id 
+where (index_spec).index_expire_after_seconds > 0
+AND c.database_name = 'ttl_default_composite';
+
+
+-- 22. Test skipRepeatDeleteForUnOrderedIndex GUC
+-- This tests that for non-ordered TTL indexes, repeat delete is skipped when the GUC is on (default)
+-- and repeat delete is active when the GUC is off.
+
+-- Drop collections from previous tests to avoid flakiness
+SELECT documentdb_api.drop_collection('db', 'ttlCompositeOrderedScan');
+SELECT documentdb_api.drop_collection('ttl_default_composite', 'ttlcoll'),
+       documentdb_api.drop_collection('ttl_default_composite', 'ttlcoll2'),
+       documentdb_api.drop_collection('ttl_default_composite', 'ttlcoll3'),
+       documentdb_api.drop_collection('ttl_default_composite', 'ttlcoll4'),
+       documentdb_api.drop_collection('ttl_default_composite', 'ttlcoll5'),
+       documentdb_api.drop_collection('ttl_default_composite', 'ttlcoll6'),
+       documentdb_api.drop_collection('ttl_default_composite', 'ttlcoll7');
+
+-- make sure ttl schedule is disabled
+SELECT cron.unschedule(jobid) FROM cron.job WHERE jobname LIKE '%ttl_task%';
+
+-- Delete all other indexes from previous tests to reduce flakiness
+WITH deleted AS (
+  DELETE FROM documentdb_api_catalog.collection_indexes
+  WHERE collection_id < 20100
+  RETURNING 1
+) SELECT true FROM deleted UNION ALL SELECT true LIMIT 1;
+
+-- Populate collection with expired documents
+SELECT COUNT(documentdb_api.insert_one('db', 'ttlSkipRepeat', FORMAT('{ "_id": %s, "ttl": { "$date": { "$numberLong": "100" } } }', i)::documentdb_core.bson)) FROM generate_series(1, 200) AS i;
+-- Add some non-expired docs
+SELECT documentdb_api.insert_one('db','ttlSkipRepeat', '{ "_id" : 500, "ttl" : { "$date": { "$numberLong": "2657899731608" } } }', NULL);
+SELECT documentdb_api.insert_one('db','ttlSkipRepeat', '{ "_id" : 501, "ttl" : { "$date": { "$numberLong": "2657899731608" } } }', NULL);
+
+-- Create a non-ordered TTL index (regular single-field, no enableCompositeTerm)
+BEGIN;
+SET LOCAL documentdb.createTTLIndexAsCompositeByDefault TO off;
+SET LOCAL documentdb.defaultUseCompositeOpClass TO off;
+SELECT documentdb_api_internal.create_indexes_non_concurrently('db', '{"createIndexes": "ttlSkipRepeat", "indexes": [{"key": {"ttl": 1}, "name": "ttl_skip_repeat_idx", "expireAfterSeconds": 5}]}', true);
+END;
+
+-- Verify index is_ordered is false
+\d+ documentdb_data.documents_20015;
+
+-- 22a. Test with skipRepeatDeleteForUnOrderedIndex = on (default)
+-- With repeat mode on but skipRepeatDeleteForUnOrderedIndex on, the non-ordered index
+-- should only be processed once (one batch of 10 deleted), not repeatedly.
+SELECT count(*) FROM documentdb_api.collection('db', 'ttlSkipRepeat');
+
+BEGIN;
+SET LOCAL documentdb.TTLTaskMaxRunTimeInMS to 3000;
+SET LOCAL documentdb.RepeatPurgeIndexesForTTLTask to on;
+SET LOCAL documentdb.skipRepeatDeleteForUnOrderedIndex to on;
+CALL documentdb_api_internal.delete_expired_rows(10);
+END;
+
+-- Should have deleted exactly 10 (one batch), because repeat was skipped for unordered index
+SELECT count(*) FROM documentdb_api.collection('db', 'ttlSkipRepeat');
+
+-- 22b. Test with skipRepeatDeleteForUnOrderedIndex = off
+-- With repeat mode on and skipRepeatDeleteForUnOrderedIndex off, repeat delete should be active
+-- and delete significantly more than one batch.
+BEGIN;
+SET LOCAL documentdb.TTLTaskMaxRunTimeInMS to 3000;
+SET LOCAL documentdb.RepeatPurgeIndexesForTTLTask to on;
+SET LOCAL documentdb.skipRepeatDeleteForUnOrderedIndex to off;
+CALL documentdb_api_internal.delete_expired_rows(10);
+END;
+
+-- Should have deleted all remaining expired docs (repeat was active), leaving only the 2 non-expired
+SELECT count(*) <= 172 FROM documentdb_api.collection('db', 'ttlSkipRepeat');

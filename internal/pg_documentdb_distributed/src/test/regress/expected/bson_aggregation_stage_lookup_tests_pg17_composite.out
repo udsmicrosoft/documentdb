@@ -533,7 +533,6 @@ ROLLBACK;
 -- Adding a $sort that can be pushed down in the pipeline
 BEGIN;
 SET LOCAL enable_seqscan TO off;
-set local documentdb.enableIndexOrderbyPushdown to on;
 EXPLAIN(costs off) SELECT document from bson_aggregation_pipeline('compdb', 
   '{ "aggregate": "menu", "pipeline": [ { "$lookup": { "from": "establishments", "pipeline": [ { "$match": { "order_quantity": { "$gt": 110 } }}, { "$sort": { "establishment_name": 1 }}], "as": "matched_docs", "localField": "establishment_name", "foreignField": "establishment_name" }} ], "cursor": {} }');
                                                                                                                                                 QUERY PLAN                                                                                                                                                
@@ -842,7 +841,7 @@ EXPLAIN(costs off) SELECT document from bson_aggregation_pipeline('compdb',
 ROLLBACK;
 -- Lookup Tests for array index-based paths
 SELECT documentdb_api.insert_one('compdb','array_path_purchases',' { "_id" : 1, "a" : [{"x" : 1}] }', NULL);
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:280: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:279: NOTICE:  creating collection
                               insert_one                              
 ---------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -897,7 +896,7 @@ SELECT documentdb_api.insert_one('compdb','array_path_purchases',' { "_id" : 9, 
 (1 row)
 
 SELECT documentdb_api.insert_one('compdb','array_path_items',' { "_id" : 1, "b" : 1 }', NULL);
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:290: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:289: NOTICE:  creating collection
                               insert_one                              
 ---------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -925,7 +924,7 @@ SELECT document FROM bson_aggregation_pipeline('compdb', '{ "aggregate": "array_
 
 -- Test for Index push down crash when Foreign Field = '_id' and the target collection is sharded 
 SELECT documentdb_api.insert_one('compdb','purchases_pushdown_test',' { "_id" : 1, "item_name" : "itemA", "price" : 12, "order_quantity" : 2 }', NULL);
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:297: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:296: NOTICE:  creating collection
                               insert_one                              
 ---------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -968,7 +967,7 @@ SELECT documentdb_api.insert_one('compdb','purchases_pushdown_test',' { "_id" : 
 (1 row)
 
 SELECT documentdb_api.insert_one('compdb','items_pushdown_test',' { "_id" :  "itemA", "item_description": "product 1", "in_stock" : 120 }', NULL);
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:305: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:304: NOTICE:  creating collection
                               insert_one                              
 ---------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -1251,28 +1250,28 @@ EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_pipeline('
 ROLLBACK;
 -- do a multi layer lookup that matches on _id
 SELECT COUNT(documentdb_api.insert_one('compdb', 'source1', FORMAT('{ "_id": %s, "field1": "value%s", "fieldsource1": "foo" }', i, i)::bson)) FROM generate_series(1, 100) i;
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:360: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:359: NOTICE:  creating collection
  count 
 ---------------------------------------------------------------------
    100
 (1 row)
 
 SELECT COUNT(documentdb_api.insert_one('compdb', 'source2', FORMAT('{ "_id": "value%s", "field2": "othervalue%s", "fieldsource2": "foobar" }', i, i)::bson)) FROM generate_series(1, 100) i;
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:361: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:360: NOTICE:  creating collection
  count 
 ---------------------------------------------------------------------
    100
 (1 row)
 
 SELECT COUNT(documentdb_api.insert_one('compdb', 'source3', FORMAT('{ "_id": "othervalue%s", "field3": "someothervalue%s", "fieldsource3": "foobarfoo" }', i, i)::bson)) FROM generate_series(1, 100) i;
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:362: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:361: NOTICE:  creating collection
  count 
 ---------------------------------------------------------------------
    100
 (1 row)
 
 SELECT COUNT(documentdb_api.insert_one('compdb', 'source4', FORMAT('{ "_id": "someothervalue%s", "field4": "yetsomeothervalue%s", "fieldsource4": "foobarbaz" }', i, i)::bson)) FROM generate_series(1, 100) i;
-psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:363: NOTICE:  creating collection
+psql:sql/bson_aggregation_stage_lookup_tests_composite.sql:362: NOTICE:  creating collection
  count 
 ---------------------------------------------------------------------
    100

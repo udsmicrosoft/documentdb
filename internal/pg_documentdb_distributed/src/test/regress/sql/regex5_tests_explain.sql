@@ -27,7 +27,6 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('db', documentdb_
 
 BEGIN;
 set local enable_seqscan TO OFF;
-set local documentdb.forceRumIndexScantoBitmapHeapScan TO OFF;
 
 -- When x is non-array
 EXPLAIN (COSTS OFF) SELECT document FROM collection('db', 'regex5') WHERE document @@ '{"x": {"$in": [{"$regex" : ".*Yc", "$options": "i"}]}}';
