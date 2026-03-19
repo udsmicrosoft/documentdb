@@ -17,7 +17,7 @@ use documentdb_gateway_core::{
     service::TlsProvider,
     shutdown_controller::SHUTDOWN_CONTROLLER,
     startup::{create_postgres_object, get_service_context},
-    telemetry::{OtelTelemetryProvider, TelemetryConfig, TelemetryManager, TelemetryProvider},
+    telemetry::{TelemetryConfig, TelemetryManager, TelemetryProvider},
 };
 use opentelemetry::KeyValue;
 use tokio::signal;
@@ -55,16 +55,16 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
         KeyValue::new("service.version", telemetry_config.service_version()),
     ];
 
-    let (telemetry_manager, telemetry_initialized) = if telemetry_config.any_signal_enabled() {
+    let telemetry_manager = if telemetry_config.any_signal_enabled() {
         match TelemetryManager::init_telemetry(telemetry_config, attributes) {
-            Ok(manager) => (Some(manager), true),
+            Ok(manager) => Some(manager),
             Err(e) => {
                 eprintln!("Failed to initialize OpenTelemetry: {e}");
-                (None, false)
+                None
             }
         }
     } else {
-        (None, false)
+        None
     };
 
     tracing::info!("Starting server with configuration: {setup_configuration:?}");
@@ -112,11 +112,7 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
         tls_provider,
     );
 
-    let telemetry: Option<Box<dyn TelemetryProvider>> = if telemetry_initialized {
-        Some(Box::new(OtelTelemetryProvider::new()))
-    } else {
-        None
-    };
+    let telemetry: Option<Box<dyn TelemetryProvider>> = None;
     run_gateway::<DocumentDBDataClient>(service_context, telemetry, shutdown_token)
         .await
         .unwrap();

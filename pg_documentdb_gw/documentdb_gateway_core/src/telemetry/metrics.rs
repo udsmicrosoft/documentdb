@@ -6,6 +6,7 @@
  *-------------------------------------------------------------------------
  */
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use either::Either;
@@ -18,7 +19,6 @@ use opentelemetry_sdk::{
 use serde::Deserialize;
 
 use crate::{
-    context::ConnectionContext,
     error::{DocumentDBError, Result},
     protocol::header::Header,
     requests::{request_tracker::RequestTracker, Request, RequestIntervalKind},
@@ -188,9 +188,55 @@ pub fn create_metrics_provider(
     Ok(Some(meter_provider))
 }
 
-/// Records request-level metrics using low-memory Counters.
+// ============================================================================
+// Gateway Metrics (recorded directly in the request path)
+// ============================================================================
+
+/// Lazily-initialized OTel counters for gateway request metrics.
+///
+/// Uses `global::meter()` which returns a no-op meter if no `MeterProvider` is
+/// registered, making these calls zero-cost when telemetry is disabled.
+struct GatewayMetrics {
+    operation_duration_total: Counter<f64>,
+    operations_count: Counter<u64>,
+    request_size_total: Counter<u64>,
+    response_size_total: Counter<u64>,
+}
+
+static GATEWAY_METRICS: LazyLock<GatewayMetrics> = LazyLock::new(|| {
+    let meter = global::meter("documentdb_gateway");
+
+    GatewayMetrics {
+        operation_duration_total: meter
+            .f64_counter("db.client.operation.duration.total")
+            .with_description("Total duration of database client operations (sum)")
+            .with_unit("s")
+            .build(),
+        operations_count: meter
+            .u64_counter("db.client.operations")
+            .with_description("Count of database client operations")
+            .with_unit("{operation}")
+            .build(),
+        request_size_total: meter
+            .u64_counter("db.client.request.size.total")
+            .with_description("Total size of database client request payloads")
+            .with_unit("By")
+            .build(),
+        response_size_total: meter
+            .u64_counter("db.client.response.size.total")
+            .with_description("Total size of database client response payloads")
+            .with_unit("By")
+            .build(),
+    }
+});
+
+/// Records request-level metrics directly in the request handling path.
 ///
 /// See: https://opentelemetry.io/docs/specs/semconv/database/database-metrics/
+///
+/// This function is called unconditionally for every request. When no global
+/// `MeterProvider` is registered the counters are no-ops with negligible overhead,
+/// mirroring how `#[instrument]` creates no-op spans without a tracing subscriber.
 ///
 /// Emits metrics for each request including:
 /// - `db.client.operation.duration.total` (seconds) - sum of all durations
@@ -199,156 +245,88 @@ pub fn create_metrics_provider(
 /// - `db.client.response.size.total` (bytes) - sum of response sizes
 ///
 /// Aggregation (averages, percentiles) is delegated to the collector.
-#[derive(Clone)]
-pub struct OtelTelemetryProvider {
-    /// Total duration of all operations (seconds). Divide by operations count for average.
-    operation_duration_total: Counter<f64>,
-    /// Count of operations. Use with duration_total to compute average latency.
-    operations_count: Counter<u64>,
-    /// Total request payload bytes.
-    request_size_total: Counter<u64>,
-    /// Total response payload bytes.
-    response_size_total: Counter<u64>,
-}
+pub fn record_gateway_metrics(
+    header: &Header,
+    request: Option<&Request<'_>>,
+    response: Either<&Response, (&CommandError, usize)>,
+    collection: &str,
+    request_tracker: &RequestTracker,
+) {
+    let metrics = &*GATEWAY_METRICS;
 
-impl OtelTelemetryProvider {
-    pub fn new() -> Self {
-        let meter = global::meter("documentdb_gateway");
+    let operation = request
+        .map(|r| r.request_type().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
-        Self {
-            operation_duration_total: meter
-                .f64_counter("db.client.operation.duration.total")
-                .with_description("Total duration of database client operations (sum)")
-                .with_unit("s")
-                .build(),
-            operations_count: meter
-                .u64_counter("db.client.operations")
-                .with_description("Count of database client operations")
-                .with_unit("{operation}")
-                .build(),
-            request_size_total: meter
-                .u64_counter("db.client.request.size.total")
-                .with_description("Total size of database client request payloads")
-                .with_unit("By")
-                .build(),
-            response_size_total: meter
-                .u64_counter("db.client.response.size.total")
-                .with_description("Total size of database client response payloads")
-                .with_unit("By")
-                .build(),
+    let db_name = request.and_then(|r| r.db().ok()).unwrap_or("unknown");
+
+    let duration_to_secs =
+        |ns: i64| -> f64 { Duration::from_nanos(ns.max(0) as u64).as_secs_f64() };
+
+    let duration_ns =
+        request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest);
+
+    // Build attributes based on success/failure
+    let mut base_attrs: Vec<KeyValue> = vec![
+        KeyValue::new("db.system.name", "documentdb"),
+        KeyValue::new("db.operation.name", operation),
+        KeyValue::new("db.collection.name", collection.to_string()),
+        KeyValue::new("db.namespace", db_name.to_string()),
+    ];
+    if let Either::Right((err, _)) = &response {
+        base_attrs.push(KeyValue::new("error.type", err.code.to_string()));
+    }
+
+    // Record operation count and total duration
+    metrics.operations_count.add(1, &base_attrs);
+    metrics
+        .operation_duration_total
+        .add(duration_to_secs(duration_ns), &base_attrs);
+
+    // Record request/response sizes
+    metrics
+        .request_size_total
+        .add(header.length as u64, &base_attrs);
+
+    let response_size_bytes = match &response {
+        Either::Left(resp) => resp
+            .as_raw_document()
+            .map(|doc| doc.as_bytes().len() as u64)
+            .unwrap_or(0),
+        Either::Right((_, size)) => *size as u64,
+    };
+    metrics
+        .response_size_total
+        .add(response_size_bytes, &base_attrs);
+
+    // Record PostgreSQL phase breakdown (duration totals).
+    let mut phase_attrs = Vec::with_capacity(base_attrs.len() + 1);
+
+    let mut record_phase = |phase: &'static str, ns: i64| {
+        if ns > 0 {
+            phase_attrs.clear();
+            phase_attrs.extend_from_slice(&base_attrs);
+            phase_attrs.push(KeyValue::new("db.operation.phase", phase));
+            metrics
+                .operation_duration_total
+                .add(duration_to_secs(ns), &phase_attrs);
         }
-    }
+    };
 
-    fn record_request_metrics(
-        &self,
-        header: &Header,
-        request: Option<&Request<'_>>,
-        response: Either<&Response, (&CommandError, usize)>,
-        collection: &str,
-        request_tracker: &RequestTracker,
-    ) {
-        let operation = request
-            .map(|r| r.request_type().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let db_name = request.and_then(|r| r.db().ok()).unwrap_or("unknown");
-
-        let duration_to_secs =
-            |ns: i64| -> f64 { Duration::from_nanos(ns.max(0) as u64).as_secs_f64() };
-
-        let duration_ns =
-            request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest);
-
-        // Build attributes based on success/failure — no cloning needed
-        let mut base_attrs: Vec<KeyValue> = vec![
-            KeyValue::new("db.system.name", "documentdb"),
-            KeyValue::new("db.operation.name", operation),
-            KeyValue::new("db.collection.name", collection.to_string()),
-            KeyValue::new("db.namespace", db_name.to_string()),
-        ];
-        if let Either::Right((err, _)) = &response {
-            base_attrs.push(KeyValue::new("error.type", err.code.to_string()));
-        }
-
-        // Record operation count and total duration
-        self.operations_count.add(1, &base_attrs);
-        self.operation_duration_total
-            .add(duration_to_secs(duration_ns), &base_attrs);
-
-        // Record request/response sizes
-        self.request_size_total
-            .add(header.length as u64, &base_attrs);
-
-        let response_size_bytes = match &response {
-            Either::Left(resp) => resp
-                .as_raw_document()
-                .map(|doc| doc.as_bytes().len() as u64)
-                .unwrap_or(0),
-            Either::Right((_, size)) => *size as u64,
-        };
-        self.response_size_total
-            .add(response_size_bytes, &base_attrs);
-
-        // Record PostgreSQL phase breakdown (duration totals).
-        // Build phase attrs by appending to a reference of base_attrs to avoid cloning.
-        let mut phase_attrs = Vec::with_capacity(base_attrs.len() + 1);
-
-        let mut record_phase = |phase: &'static str, ns: i64| {
-            if ns > 0 {
-                phase_attrs.clear();
-                phase_attrs.extend_from_slice(&base_attrs);
-                phase_attrs.push(KeyValue::new("db.operation.phase", phase));
-                self.operation_duration_total
-                    .add(duration_to_secs(ns), &phase_attrs);
-            }
-        };
-
-        record_phase(
-            "postgres_begin_transaction",
-            request_tracker
-                .get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
-        );
-        record_phase(
-            "postgres_execution",
-            request_tracker.get_interval_elapsed_time(RequestIntervalKind::ProcessRequest),
-        );
-        record_phase(
-            "postgres_commit",
-            request_tracker
-                .get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
-        );
-    }
-}
-
-impl Default for OtelTelemetryProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::telemetry::TelemetryProvider for OtelTelemetryProvider {
-    async fn emit_request_event(
-        &self,
-        _connection_context: &ConnectionContext,
-        header: &Header,
-        request: Option<&Request<'_>>,
-        response: Either<&Response, (&CommandError, usize)>,
-        collection: String,
-        request_tracker: &RequestTracker,
-        activity_id: &str,
-        user_agent: &str,
-    ) {
-        // Record activity_id and user_agent on the current span for correlation
-        // activity_id: Gateway-internal correlation ID (for Geneva log compatibility)
-        // user_agent: Client driver info (e.g., "PyMongo/4.14.1")
-        let span = tracing::Span::current();
-        span.record("activity_id", activity_id);
-        span.record("user_agent", user_agent);
-
-        // Delegate to the inherent method for metrics recording
-        self.record_request_metrics(header, request, response, &collection, request_tracker);
-    }
+    record_phase(
+        "postgres_begin_transaction",
+        request_tracker
+            .get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
+    );
+    record_phase(
+        "postgres_execution",
+        request_tracker.get_interval_elapsed_time(RequestIntervalKind::ProcessRequest),
+    );
+    record_phase(
+        "postgres_commit",
+        request_tracker
+            .get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
+    );
 }
 
 #[cfg(test)]
@@ -443,11 +421,12 @@ mod tests {
     }
 
     #[test]
-    fn test_request_metrics_creation() {
-        // Verify OtelTelemetryProvider can be created and instruments are initialized
-        let metrics = OtelTelemetryProvider::new();
-
-        // Verify we can clone the metrics
-        let _cloned = metrics.clone();
+    fn test_gateway_metrics_callable_without_provider() {
+        // Verify record_gateway_metrics is callable.
+        // Without a registered MeterProvider, global::meter() returns a no-op meter,
+        // so all counter .add() calls are harmless no-ops.
+        // (We can't easily construct Header/Request/Response here, but we verify
+        // the LazyLock initializes without panic.)
+        let _metrics = &*super::GATEWAY_METRICS;
     }
 }

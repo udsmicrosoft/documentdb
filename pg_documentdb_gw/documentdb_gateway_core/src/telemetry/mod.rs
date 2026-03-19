@@ -17,12 +17,13 @@ pub mod logging;
 pub mod metrics;
 pub mod telemetry_manager;
 pub mod tracing;
+mod verbose_latency;
 
 // Re-export commonly used types
 pub use config::{TelemetryConfig, TelemetryOptions};
 pub use context_propagation::{extract_context_from_comment, format_trace_comment, parse_traceparent};
 pub use logging::{LoggingConfig, LoggingOptions};
-pub use metrics::{MetricsConfig, MetricsOptions, OtelTelemetryProvider};
+pub use metrics::{MetricsConfig, MetricsOptions, record_gateway_metrics};
 pub use telemetry_manager::TelemetryManager;
 pub use tracing::{TracingConfig, TracingOptions};
 
@@ -52,18 +53,17 @@ use crate::{
     responses::{CommandError, Response},
 };
 
-/// Telemetry provider for request metrics and events.
+pub use verbose_latency::try_log_verbose_latency;
+
+/// Extension hook for custom request telemetry.
 ///
-/// Implementations:
-/// - [`OtelTelemetryProvider`] (OSS): OpenTelemetry metrics + span attributes
-/// - `GenevaTelemetryProvider` (Native): Geneva/Fluent logging
+/// OTel metrics and span attributes are recorded directly in the request
+/// handling path. This trait is for downstream consumers that need additional
+/// per-request telemetry beyond what OTel provides.
 #[expect(clippy::too_many_arguments)]
 #[async_trait]
 pub trait TelemetryProvider: Send + Sync + DynClone {
     /// Emit telemetry for a completed request.
-    ///
-    /// * `activity_id` - Gateway correlation ID. OSS: span attribute. Native: log field.
-    /// * `user_agent` - Client driver info from handshake. OSS: span attribute. Native: log + metric.
     async fn emit_request_event(
         &self,
         connection_context: &ConnectionContext,

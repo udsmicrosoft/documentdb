@@ -178,6 +178,18 @@ bool EnableCompositeShardDocumentTerms = DEFAULT_ENABLE_COMPOSITE_SHARD_DOCUMENT
 bool EnableCompositeWildcardSkipEmptyEntries =
 	DEFAULT_ENABLE_COMPOSITE_WILDCARD_SKIP_EMPTY_ENTRIES;
 
+/* Added in v111, enabled in v111, remove after v114 */
+#define DEFAULT_ENABLE_ORDERED_COMPOSITE_OPERATOR_SCAN true
+bool EnableOrderedCompositeOperatorScan = DEFAULT_ENABLE_ORDERED_COMPOSITE_OPERATOR_SCAN;
+
+/* Added in v111, enabled in v111, remove after v114 */
+#define DEFAULT_ENABLE_REGEX_PREFIX_INDEX_BOUNDS true
+bool EnableRegexPrefixIndexBounds = DEFAULT_ENABLE_REGEX_PREFIX_INDEX_BOUNDS;
+
+/* Added in v111, Pending stabilization */
+#define DEFAULT_ENABLE_EXTENDED_INDEXES false
+bool EnableExtendedIndexes = DEFAULT_ENABLE_EXTENDED_INDEXES;
+
 /*
  * SECTION: Planner feature flags
  */
@@ -850,6 +862,31 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"Whether to enable skipping empty entries for composite wildcard indexes."),
 		NULL, &EnableCompositeWildcardSkipEmptyEntries,
 		DEFAULT_ENABLE_COMPOSITE_WILDCARD_SKIP_EMPTY_ENTRIES,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableOrderedCompositeOperatorScan", newGucPrefix),
+		gettext_noop(
+			"Whether to enable using the single ordered scalar array operator scan for ordered indexes"
+			" which has skip-scan support enabled inherently."),
+		NULL, &EnableOrderedCompositeOperatorScan,
+		DEFAULT_ENABLE_ORDERED_COMPOSITE_OPERATOR_SCAN,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableRegexPrefixIndexBounds", newGucPrefix),
+		gettext_noop(
+			"Whether to enable the optimized regex prefix index bounds."),
+		NULL, &EnableRegexPrefixIndexBounds,
+		DEFAULT_ENABLE_REGEX_PREFIX_INDEX_BOUNDS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enableExtendedIndexes", newGucPrefix),
+		gettext_noop(
+			"Whether to enable extended indexes feature."),
+		NULL, &EnableExtendedIndexes,
+		DEFAULT_ENABLE_EXTENDED_INDEXES,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(

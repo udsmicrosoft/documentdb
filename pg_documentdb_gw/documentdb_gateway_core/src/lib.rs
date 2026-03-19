@@ -34,6 +34,7 @@ use tokio::{
 };
 use tokio_openssl::SslStream;
 use tokio_util::sync::CancellationToken;
+use opentelemetry::trace::Status as OtelStatus;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
@@ -45,8 +46,9 @@ use crate::{
     requests::{request_tracker::RequestTracker, Request, RequestIntervalKind},
     responses::{CommandError, Response},
     telemetry::{
-        client_info::parse_client_info, error_code_to_status_code, event_id::EventId,
-        extract_context_from_comment, is_tracing_enabled, parse_traceparent, TelemetryProvider,
+        client_info::parse_client_info,
+        extract_context_from_comment, is_tracing_enabled, parse_traceparent,
+        record_gateway_metrics, TelemetryProvider,
     },
 };
 
@@ -648,8 +650,7 @@ where
 
     let format_request_start = Instant::now();
     let request =
-        protocol::reader::parse_request(&message, &mut connection_context.requires_response)
-            .await?;
+        protocol::reader::parse_request(&message, &mut connection_context.requires_response)?;
     request_tracker.record_duration(RequestIntervalKind::FormatRequest, format_request_start);
 
     let request_info = request.extract_common()?;
@@ -683,21 +684,19 @@ where
         tracker: &request_tracker,
     };
 
-    let mut collection = String::new();
-
     let request_result = handle_request::<T, S>(
         connection_context,
         header,
         &request_context,
         stream,
-        &mut collection,
         handle_message_start,
     )
     .await;
 
     // Errors in request handling are handled explicitly so that telemetry can have access to the request
     // Returns Ok afterwards so that higher level error telemetry is not invoked.
-    let command_error = if let Err(e) = request_result {
+    if let Err(e) = request_result {
+        let collection = request_context.info.collection().unwrap_or("").to_string();
         match log_and_write_error::<S>(
             connection_context,
             header,
@@ -711,21 +710,14 @@ where
         )
         .await
         {
-            Ok(command_error) => Some(command_error),
+            Ok(_) => {}
             Err(write_err) => {
                 tracing::error!(
                     activity_id = activity_id,
                     "Couldn't reply with error {write_err:?}."
                 );
-                None
             }
         }
-    } else {
-        None
-    };
-
-    if should_log_verbose_latency(connection_context, &request_context) {
-        log_verbose_latency(connection_context, &request_context, command_error.as_ref());
     }
 
     Ok(())
@@ -736,15 +728,12 @@ async fn handle_request<T, S>(
     header: &Header,
     request_context: &RequestContext<'_>,
     stream: &mut S,
-    collection: &mut String,
     handle_message_start: tokio::time::Instant,
 ) -> Result<()>
 where
     T: PgDataClient,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    *collection = request_context.info.collection().unwrap_or("").to_string();
-
     // Process the request
     let handle_request_start = Instant::now();
     let response_result = get_response::<T>(request_context, connection_context).await;
@@ -773,6 +762,21 @@ where
             .record_duration(RequestIntervalKind::WriteResponse, write_response_start);
     }
 
+    let user_agent = parse_client_info(connection_context.client_information.as_ref());
+    let span = tracing::Span::current();
+    span.record("activity_id", request_context.activity_id);
+    span.record("user_agent", &*user_agent);
+
+    let collection = request_context.info.collection().unwrap_or("").to_string();
+
+    record_gateway_metrics(
+        header,
+        Some(request_context.payload),
+        Left(&response),
+        &collection,
+        request_context.tracker,
+    );
+
     if let Some(telemetry) = connection_context.telemetry_provider.as_ref() {
         telemetry
             .emit_request_event(
@@ -780,10 +784,10 @@ where
                 header,
                 Some(request_context.payload),
                 Left(&response),
-                collection.to_string(),
+                collection,
                 request_context.tracker,
                 request_context.activity_id,
-                &parse_client_info(connection_context.client_information.as_ref()),
+                &user_agent,
             )
             .await;
     }
@@ -795,18 +799,18 @@ where
 async fn log_and_write_error<S>(
     connection_context: &ConnectionContext,
     header: &Header,
-    e: &DocumentDBError,
+    error: &DocumentDBError,
     request: Option<&Request<'_>>,
     stream: &mut S,
     collection: Option<String>,
     request_tracker: &RequestTracker,
     activity_id: &str,
     handle_message_start: Option<Instant>,
-) -> Result<CommandError>
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let command_error = CommandError::from_error(connection_context, e, activity_id);
+    let command_error = CommandError::from_error(connection_context, error, activity_id);
     let response = command_error.to_raw_document_buf();
 
     if let Some(start) = handle_message_start {
@@ -818,7 +822,26 @@ where
     request_tracker.record_duration(RequestIntervalKind::WriteResponse, write_response_start);
 
     // telemetry can block so do it after write and flush.
-    tracing::error!(activity_id = activity_id, "Request failure: {e}");
+    error.log_request_failure(connection_context, activity_id);
+
+    // Record span attributes directly (always, independent of provider)
+    let user_agent = parse_client_info(connection_context.client_information.as_ref());
+    let span = tracing::Span::current();
+    span.record("activity_id", activity_id);
+    span.record("user_agent", &*user_agent);
+    span.set_status(OtelStatus::Error {
+        description: error.to_string().into(),
+    });
+
+    let collection = collection.unwrap_or_default();
+
+    record_gateway_metrics(
+        header,
+        request,
+        Right((&command_error, response.as_bytes().len())),
+        &collection,
+        request_tracker,
+    );
 
     if let Some(telemetry) = connection_context.telemetry_provider.as_ref() {
         telemetry
@@ -827,77 +850,13 @@ where
                 header,
                 request,
                 Right((&command_error, response.as_bytes().len())),
-                collection.unwrap_or_default(),
+                collection,
                 request_tracker,
                 activity_id,
-                &parse_client_info(connection_context.client_information.as_ref()),
+                &user_agent,
             )
             .await;
     }
 
-    Ok(command_error)
-}
-
-fn should_log_verbose_latency(
-    connection_context: &ConnectionContext,
-    request_context: &RequestContext<'_>,
-) -> bool {
-    if connection_context
-        .dynamic_configuration()
-        .enable_verbose_logging_in_gateway()
-    {
-        return true;
-    }
-
-    let slow_query_threshold_ms = connection_context
-        .dynamic_configuration()
-        .slow_query_log_interval_ms();
-    if slow_query_threshold_ms > 0 {
-        let duration_ms = request_context
-            .tracker
-            .get_interval_elapsed_time_ms(RequestIntervalKind::HandleMessage);
-        return duration_ms >= i64::from(slow_query_threshold_ms);
-    }
-
-    false
-}
-
-fn log_verbose_latency(
-    connection_context: &ConnectionContext,
-    request_context: &RequestContext<'_>,
-    e: Option<&CommandError>,
-) {
-    let database_name = request_context.info.db().unwrap_or_default();
-    let collection_name = request_context.info.collection().unwrap_or_default();
-    let request_type = request_context.payload.request_type().to_string();
-
-    let (status_code, error_code) = if let Some(error) = e {
-        let code = error.code;
-        (error_code_to_status_code(code.into()), code)
-    } else {
-        (200, 0)
-    };
-
-    tracing::info!(
-        activity_id = request_context.activity_id,
-        event_id = EventId::RequestTrace.code(),
-        "Latency for Mongo Request with interval timings (ns): ReadRequest={}, HandleMessage={} FormatRequest={}, HandleRequest={}, ProcessRequest={}, PostgresBeginTransaction={}, PostgresSetStatementTimeout={}, PostgresCommitTransaction={}, WriteResponse={}, Address={}, TransportProtocol={}, DatabaseName={}, CollectionName={}, OperationName={}, StatusCode={}, SubStatusCode={}, ErrorCode={}",
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::ReadRequest),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::HandleMessage),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::FormatRequest),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::ProcessRequest),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresSetStatementTimeout),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
-        request_context.tracker.get_interval_elapsed_time(RequestIntervalKind::WriteResponse),
-        connection_context.ip_address,
-        connection_context.transport_protocol(),
-        database_name,
-        collection_name,
-        request_type,
-        status_code,
-        0, // SubStatusCode is not used currently in Rust
-        error_code
-    );
+    Ok(())
 }
