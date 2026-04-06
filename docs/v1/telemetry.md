@@ -77,6 +77,10 @@ Metrics follow the [OTel Database Client Semantic Conventions](https://opentelem
 | `db.client.operations` | Counter | count | Number of operations |
 | `db.client.request.size.total` | Counter | bytes | Total request payload size |
 | `db.client.response.size.total` | Counter | bytes | Total response payload size |
+| `db.client.documents.returned` | Counter | count | Documents returned by read operations |
+| `db.client.documents.inserted` | Counter | count | Documents inserted |
+| `db.client.documents.updated` | Counter | count | Documents updated |
+| `db.client.documents.deleted` | Counter | count | Documents deleted |
 
 Each metric includes the following attributes:
 

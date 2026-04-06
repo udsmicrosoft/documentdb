@@ -201,6 +201,10 @@ struct GatewayMetrics {
     operations_count: Counter<u64>,
     request_size_total: Counter<u64>,
     response_size_total: Counter<u64>,
+    documents_returned: Counter<u64>,
+    documents_inserted: Counter<u64>,
+    documents_updated: Counter<u64>,
+    documents_deleted: Counter<u64>,
 }
 
 static GATEWAY_METRICS: LazyLock<GatewayMetrics> = LazyLock::new(|| {
@@ -226,6 +230,26 @@ static GATEWAY_METRICS: LazyLock<GatewayMetrics> = LazyLock::new(|| {
             .u64_counter("db.client.response.size.total")
             .with_description("Total size of database client response payloads")
             .with_unit("By")
+            .build(),
+        documents_returned: meter
+            .u64_counter("db.client.documents.returned")
+            .with_description("Documents returned by read operations")
+            .with_unit("{document}")
+            .build(),
+        documents_inserted: meter
+            .u64_counter("db.client.documents.inserted")
+            .with_description("Documents inserted")
+            .with_unit("{document}")
+            .build(),
+        documents_updated: meter
+            .u64_counter("db.client.documents.updated")
+            .with_description("Documents updated")
+            .with_unit("{document}")
+            .build(),
+        documents_deleted: meter
+            .u64_counter("db.client.documents.deleted")
+            .with_description("Documents deleted")
+            .with_unit("{document}")
             .build(),
     }
 });
@@ -299,6 +323,13 @@ pub fn record_gateway_metrics(
         .response_size_total
         .add(response_size_bytes, &base_attrs);
 
+    // Record document throughput counters based on operation type
+    if let Some(req) = request {
+        if let Either::Left(resp) = &response {
+            record_document_counts(metrics, req, resp, &base_attrs);
+        }
+    }
+
     // Record PostgreSQL phase breakdown (duration totals).
     let mut phase_attrs = Vec::with_capacity(base_attrs.len() + 1);
 
@@ -327,6 +358,55 @@ pub fn record_gateway_metrics(
         request_tracker
             .get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
     );
+}
+
+/// Extract document counts from the response based on operation type.
+fn record_document_counts(
+    metrics: &GatewayMetrics,
+    request: &Request<'_>,
+    response: &Response,
+    attrs: &[KeyValue],
+) {
+    let doc = match response.as_raw_document() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    use crate::requests::RequestType;
+    match request.request_type() {
+        RequestType::Find | RequestType::Aggregate | RequestType::GetMore => {
+            // Cursor responses: { cursor: { firstBatch/nextBatch: [...] } }
+            if let Ok(cursor) = doc.get_document("cursor") {
+                let batch_len = cursor
+                    .get_array("firstBatch")
+                    .or_else(|_| cursor.get_array("nextBatch"))
+                    .map(|arr| arr.into_iter().count() as u64)
+                    .unwrap_or(0);
+                if batch_len > 0 {
+                    metrics.documents_returned.add(batch_len, attrs);
+                }
+            }
+        }
+        RequestType::Insert => {
+            // Insert response: { n: <count> }
+            if let Ok(n) = doc.get_i32("n") {
+                metrics.documents_inserted.add(n.max(0) as u64, attrs);
+            }
+        }
+        RequestType::Update | RequestType::FindAndModify => {
+            // Update response: { nModified: <count> }
+            if let Ok(n) = doc.get_i32("nModified") {
+                metrics.documents_updated.add(n.max(0) as u64, attrs);
+            }
+        }
+        RequestType::Delete => {
+            // Delete response: { n: <count> }
+            if let Ok(n) = doc.get_i32("n") {
+                metrics.documents_deleted.add(n.max(0) as u64, attrs);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
