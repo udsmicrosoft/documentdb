@@ -19,6 +19,7 @@ assets = [
 
 [dependencies]
 documentdb_gateway_core.workspace = true
+opentelemetry.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
