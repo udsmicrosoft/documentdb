@@ -35,6 +35,7 @@ pub(crate) fn env_var<T: std::str::FromStr>(var: &str) -> Option<T> {
 }
 
 /// Parse OTEL_RESOURCE_ATTRIBUTES into KeyValue pairs.
+#[allow(dead_code)] // Used by tracing/logging providers in follow-up PRs
 pub(crate) fn parse_resource_attributes() -> Vec<KeyValue> {
     env::var("OTEL_RESOURCE_ATTRIBUTES")
         .unwrap_or_default()
@@ -69,7 +70,7 @@ pub struct TelemetryOptions {
 // Runtime Configuration
 // ============================================================================
 
-/// Unified runtime configuration for all telemetry signals.
+/// Unified runtime configuration for telemetry signals.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
     service_name: Option<String>,

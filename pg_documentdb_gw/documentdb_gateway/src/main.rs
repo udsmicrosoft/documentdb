@@ -77,7 +77,7 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
         match TelemetryManager::init_telemetry(telemetry_config, attributes) {
             Ok(manager) => Some(manager),
             Err(e) => {
-                eprintln!("Failed to initialize OpenTelemetry: {e}");
+                tracing::error!("Failed to initialize OpenTelemetry: {e}");
                 None
             }
         }
@@ -134,7 +134,7 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
 
     if let Some(manager) = telemetry_manager {
         if let Err(err) = manager.shutdown() {
-            eprintln!("Failed to shutdown telemetry manager: {err}");
+            tracing::error!("Failed to shutdown telemetry manager: {err}");
         }
     }
 }

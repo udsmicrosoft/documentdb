@@ -44,9 +44,7 @@ use crate::{
     requests::{request_tracker::RequestTracker, validation, Request, RequestIntervalKind},
     responses::{CommandError, Response},
     service::create_tcp_listeners,
-    telemetry::{
-        client_info::parse_client_info, record_gateway_metrics, TelemetryProvider,
-    },
+    telemetry::{client_info::parse_client_info, record_gateway_metrics, TelemetryProvider},
 };
 // TCP keepalive configuration constants
 const TCP_KEEPALIVE_TIME_SECS: u64 = 180;

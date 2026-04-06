@@ -6,8 +6,7 @@
  *-------------------------------------------------------------------------
  */
 
-use std::sync::LazyLock;
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
 use either::Either;
 use opentelemetry::{global, metrics::Counter, KeyValue};
@@ -21,11 +20,9 @@ use serde::Deserialize;
 use crate::{
     error::{DocumentDBError, Result},
     protocol::header::Header,
-    requests::{request_tracker::RequestTracker, Request, RequestIntervalKind},
+    requests::{request_tracker::RequestTracker, Request, RequestIntervalKind, RequestType},
     responses::{CommandError, Response},
-    telemetry::config::{
-        env_var, parse_resource_attributes, DEFAULT_EXPORT_TIMEOUT_MS, DEFAULT_OTLP_ENDPOINT,
-    },
+    telemetry::config::{env_var, DEFAULT_EXPORT_TIMEOUT_MS, DEFAULT_OTLP_ENDPOINT},
 };
 
 // ============================================================================
@@ -71,8 +68,6 @@ pub struct MetricsConfig {
 
 impl MetricsConfig {
     /// Creates metrics config from optional JSON configuration.
-    ///
-    /// Accessor methods implement fallback: JSON > env vars > defaults.
     pub fn new(json_config: Option<&MetricsOptions>) -> Self {
         let json = json_config.cloned().unwrap_or_default();
 
@@ -100,7 +95,7 @@ impl MetricsConfig {
             .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string())
     }
 
-    /// Export interval in ms. Fallback: JSON > OTEL_METRIC_EXPORT_INTERVAL > 60000.
+    /// Export interval in ms. Fallback: JSON > OTEL_METRIC_EXPORT_INTERVAL > 15000.
     pub fn export_interval_ms(&self) -> u64 {
         self.export_interval_ms
             .or_else(|| env_var("OTEL_METRIC_EXPORT_INTERVAL"))
@@ -113,11 +108,6 @@ impl MetricsConfig {
             .or_else(|| env_var("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"))
             .or_else(|| env_var("OTEL_EXPORTER_OTLP_TIMEOUT"))
             .unwrap_or(DEFAULT_EXPORT_TIMEOUT_MS)
-    }
-
-    /// Resource attributes from OTEL_RESOURCE_ATTRIBUTES env var.
-    pub fn resource_attributes(&self) -> Vec<KeyValue> {
-        parse_resource_attributes()
     }
 
     /// Creates an OTLP export configuration for metrics.
@@ -141,17 +131,6 @@ impl MetricsConfig {
 /// # Errors
 ///
 /// Returns an error if the OTLP metrics exporter fails to build.
-///
-/// # Example
-/// ```rust,ignore
-/// use opentelemetry::KeyValue;
-/// use opentelemetry_sdk::Resource;
-/// use documentdb_gateway::telemetry::config::MetricsConfig;
-/// let config = MetricsConfig::default();
-/// let attrs = vec![KeyValue::new("service.name", "my-gateway")];
-/// let resource = Resource::builder().with_attributes(attrs).build();
-/// let provider = create_metrics_provider(&config, resource)?;
-/// ```
 pub fn create_metrics_provider(
     config: &MetricsConfig,
     resource: Resource,
@@ -160,26 +139,21 @@ pub fn create_metrics_provider(
         return Ok(None);
     }
 
-    // Build the OTLP exporter with:
-    // - Delta temporality: Counters emit delta values (change since last export).
-    //   The OTel Collector should aggregate deltas into cumulative for Prometheus.
-    // - Tonic: Use gRPC via tonic library for transport
-    // - Export config: Endpoint and timeout settings
+    // Delta temporality: counters emit deltas (change since last export).
+    // The OTel Collector aggregates deltas into cumulative for Prometheus.
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_temporality(Temporality::Delta)
         .with_tonic()
         .with_export_config(config.create_export_config())
         .build()
         .map_err(|e| {
-            DocumentDBError::internal_error(format!("failed to build metrics exporter: {e}"))
+            DocumentDBError::internal_error(format!("Failed to build metrics exporter: {e}"))
         })?;
 
-    // Create a periodic reader that exports metrics at regular intervals
     let reader = PeriodicReader::builder(exporter)
         .with_interval(Duration::from_millis(config.export_interval_ms()))
         .build();
 
-    // Build the meter provider with the resource and reader
     let meter_provider = SdkMeterProvider::builder()
         .with_resource(resource)
         .with_reader(reader)
@@ -258,15 +232,8 @@ static GATEWAY_METRICS: LazyLock<GatewayMetrics> = LazyLock::new(|| {
 ///
 /// See: https://opentelemetry.io/docs/specs/semconv/database/database-metrics/
 ///
-/// This function is called unconditionally for every request. When no global
-/// `MeterProvider` is registered the counters are no-ops with negligible overhead,
-/// mirroring how `#[instrument]` creates no-op spans without a tracing subscriber.
-///
-/// Emits metrics for each request including:
-/// - `db.client.operation.duration.total` (seconds) - sum of all durations
-/// - `db.client.operations` (count) - number of operations
-/// - `db.client.request.size.total` (bytes) - sum of request sizes
-/// - `db.client.response.size.total` (bytes) - sum of response sizes
+/// Called unconditionally for every request. When no global `MeterProvider`
+/// is registered, all counters are no-ops with negligible overhead.
 ///
 /// Aggregation (averages, percentiles) is delegated to the collector.
 pub fn record_gateway_metrics(
@@ -287,10 +254,8 @@ pub fn record_gateway_metrics(
     let duration_to_secs =
         |ns: i64| -> f64 { Duration::from_nanos(ns.max(0) as u64).as_secs_f64() };
 
-    let duration_ns =
-        request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest);
+    let duration_ns = request_tracker.get_interval_elapsed_time(RequestIntervalKind::HandleRequest);
 
-    // Build attributes based on success/failure
     let mut base_attrs: Vec<KeyValue> = vec![
         KeyValue::new("db.system.name", "documentdb"),
         KeyValue::new("db.operation.name", operation),
@@ -301,13 +266,11 @@ pub fn record_gateway_metrics(
         base_attrs.push(KeyValue::new("error.type", err.code().to_string()));
     }
 
-    // Record operation count and total duration
     metrics.operations_count.add(1, &base_attrs);
     metrics
         .operation_duration_total
         .add(duration_to_secs(duration_ns), &base_attrs);
 
-    // Record request/response sizes
     metrics
         .request_size_total
         .add(header.length as u64, &base_attrs);
@@ -346,8 +309,7 @@ pub fn record_gateway_metrics(
 
     record_phase(
         "postgres_begin_transaction",
-        request_tracker
-            .get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
+        request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresBeginTransaction),
     );
     record_phase(
         "postgres_execution",
@@ -355,8 +317,7 @@ pub fn record_gateway_metrics(
     );
     record_phase(
         "postgres_commit",
-        request_tracker
-            .get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
+        request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
     );
 }
 
@@ -372,7 +333,6 @@ fn record_document_counts(
         Err(_) => return,
     };
 
-    use crate::requests::RequestType;
     match request.request_type() {
         RequestType::Find | RequestType::Aggregate | RequestType::GetMore => {
             // Cursor responses: { cursor: { firstBatch/nextBatch: [...] } }
@@ -464,8 +424,8 @@ mod tests {
         assert_eq!(config.otlp_endpoint(), "http://env:4317");
     }
 
-    #[tokio::test]
-    async fn test_create_metrics_provider_when_disabled() {
+    #[test]
+    fn test_create_metrics_provider_when_disabled() {
         let json_config = MetricsOptions {
             enabled: Some(false),
             ..Default::default()

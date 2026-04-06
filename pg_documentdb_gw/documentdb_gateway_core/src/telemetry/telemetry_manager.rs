@@ -6,12 +6,13 @@
  *-------------------------------------------------------------------------
  */
 
+use opentelemetry::{global, KeyValue};
+use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
+
 use crate::{
     error::{DocumentDBError, Result},
     telemetry::{config::TelemetryConfig, metrics::create_metrics_provider},
 };
-use opentelemetry::{global, KeyValue};
-use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
 
 /// Manages OpenTelemetry providers for telemetry signals.
 ///
@@ -23,9 +24,7 @@ pub struct TelemetryManager {
 
 impl TelemetryManager {
     pub fn init_telemetry(config: TelemetryConfig, attributes: Vec<KeyValue>) -> Result<Self> {
-        let resource = Resource::builder()
-            .with_attributes(attributes)
-            .build();
+        let resource = Resource::builder().with_attributes(attributes).build();
 
         let meter_provider = create_metrics_provider(config.metrics(), resource)?;
 
@@ -40,7 +39,7 @@ impl TelemetryManager {
         if let Some(meter_provider) = self.meter_provider {
             if let Err(e) = meter_provider.shutdown() {
                 return Err(DocumentDBError::internal_error(format!(
-                    "failed to shutdown meter provider: {e}"
+                    "Failed to shutdown meter provider: {e}"
                 )));
             }
         }
