@@ -1,0 +1,153 @@
+# MVP: Trigger internal ADO pipeline from GitHub PR comments.
+# Production version will add: Microsoft org membership check, private repo
+# ref push, CredScan redaction, and fork PR support.
+name: Internal CI Trigger
+run-name: "Internal CI for PR #${{ github.event.issue.number }}"
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  trigger-internal-ci:
+    # Only run on PR comments (not issue comments) that start with /test
+    if: >-
+      github.event.issue.pull_request
+      && startsWith(github.event.comment.body, '/test')
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      pull-requests: read
+    steps:
+      - name: Check authorization
+        id: auth
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COMMENTER="${{ github.event.comment.user.login }}"
+
+          # Check if the commenter has write access to the repo
+          PERMISSION=$(gh api "repos/${{ github.repository }}/collaborators/${COMMENTER}/permission" \
+            --jq '.permission')
+
+          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "write" ]]; then
+            echo "::error::User ${COMMENTER} does not have write access (permission: ${PERMISSION})"
+            exit 1
+          fi
+
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+          echo "User ${COMMENTER} authorized (permission: ${PERMISSION})"
+
+      - name: React to comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content='eyes' --silent
+
+      - name: Get PR details and pinned SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ github.event.issue.number }}"
+
+          PR_DATA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+            --jq '{sha: .head.sha, branch: .head.ref, head_repo: .head.repo.full_name, base_repo: .base.repo.full_name}')
+
+          COMMIT_SHA=$(echo "$PR_DATA" | jq -r '.sha')
+          SOURCE_BRANCH=$(echo "$PR_DATA" | jq -r '.branch')
+          HEAD_REPO=$(echo "$PR_DATA" | jq -r '.head_repo')
+          BASE_REPO=$(echo "$PR_DATA" | jq -r '.base_repo')
+
+          # MVP: reject fork PRs — they require additional handling
+          if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
+            echo "::error::Fork PRs are not supported yet (head: ${HEAD_REPO}, base: ${BASE_REPO})"
+            exit 1
+          fi
+
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "source_branch=${SOURCE_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+          echo "PR #${PR_NUMBER} at SHA ${COMMIT_SHA} (branch: ${SOURCE_BRANCH})"
+
+      - name: Set pending commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.commit_sha }}" \
+            -f state='pending' \
+            -f description='Internal CI triggered, waiting for results...' \
+            -f context='ms-internal-ci/oss-tests' \
+            --silent
+
+      - name: POST webhook to ADO
+        env:
+          MS_WEBHOOK_SECRET: ${{ secrets.MS_WEBHOOK_SECRET }}
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
+          COMMIT_SHA="${{ steps.pr.outputs.commit_sha }}"
+          SOURCE_BRANCH="${{ steps.pr.outputs.source_branch }}"
+
+          # Build payload matching native GitHub PR event format
+          # (matches what the ADO webhook service connection expects)
+          PAYLOAD=$(jq -n \
+            --arg action "opened" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg sha "$COMMIT_SHA" \
+            --arg branch "$SOURCE_BRANCH" \
+            --arg repo "${{ github.repository }}" \
+            --arg author "${{ github.event.comment.user.login }}" \
+            '{
+              action: $action,
+              number: ($pr_number | tonumber),
+              repository: {
+                full_name: $repo
+              },
+              pull_request: {
+                html_url: "https://github.com/\($repo)/pull/\($pr_number)",
+                head: {
+                  sha: $sha,
+                  ref: $branch,
+                  repo: {
+                    full_name: $repo
+                  }
+                },
+                base: {
+                  ref: "main"
+                },
+                user: {
+                  login: $author
+                }
+              }
+            }')
+
+          # Compute HMAC-SHA256 signature
+          SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$MS_WEBHOOK_SECRET" -binary | xxd -p -c 256)
+
+          # POST to ADO incoming webhook endpoint
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-ADO-Signature: sha256=$SIGNATURE" \
+            -d "$PAYLOAD" \
+            "https://dev.azure.com/msdata/_apis/public/distributedtask/webhooks/WebHook?api-version=6.0-preview")
+
+          echo "ADO webhook response: HTTP ${HTTP_STATUS}"
+
+          if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+            echo "::error::ADO webhook POST failed with HTTP ${HTTP_STATUS}"
+
+            # Set error status so the PR doesn't stay pending forever
+            gh api "repos/${{ github.repository }}/statuses/${COMMIT_SHA}" \
+              -f state='error' \
+              -f description='Failed to trigger internal CI pipeline' \
+              -f context='ms-internal-ci/oss-tests' \
+              --silent
+            exit 1
+          fi
+
+          echo "Webhook triggered successfully"
+        env:
+          GH_TOKEN: ${{ github.token }}
