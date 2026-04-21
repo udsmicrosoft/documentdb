@@ -129,7 +129,7 @@ jobs:
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             -X POST \
             -H "Content-Type: application/json" \
-            -H "X-GitHub-ADO-Signature: sha256=$SIGNATURE" \
+            -H "X-GitHub-ADO-Signature: $SIGNATURE" \
             -d "$PAYLOAD" \
             "https://dev.azure.com/msdata/_apis/public/distributedtask/webhooks/WebHook?api-version=6.0-preview")
 
