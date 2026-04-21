@@ -15,10 +15,7 @@ jobs:
       github.event.issue.pull_request
       && startsWith(github.event.comment.body, '/test')
     runs-on: ubuntu-latest
-    permissions:
-      statuses: write
-      pull-requests: read
-      issues: write
+    permissions: write-all
     steps:
       - name: Check authorization
         id: auth
