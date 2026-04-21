@@ -85,6 +85,7 @@ jobs:
       - name: POST webhook to ADO
         env:
           MS_WEBHOOK_SECRET: ${{ secrets.MS_WEBHOOK_SECRET }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
           COMMIT_SHA="${{ steps.pr.outputs.commit_sha }}"
@@ -149,5 +150,3 @@ jobs:
           fi
 
           echo "Webhook triggered successfully"
-        env:
-          GH_TOKEN: ${{ github.token }}
