@@ -126,14 +126,18 @@ jobs:
           SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$MS_WEBHOOK_SECRET" -binary | xxd -p -c 256)
 
           # POST to ADO incoming webhook endpoint
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
             -X POST \
             -H "Content-Type: application/json" \
             -H "X-GitHub-ADO-Signature: $SIGNATURE" \
             -d "$PAYLOAD" \
             "https://dev.azure.com/msdata/_apis/public/distributedtask/webhooks/WebHook?api-version=6.0-preview")
 
+          HTTP_STATUS=$(echo "$RESPONSE" | grep -oP 'HTTP_STATUS:\K\d+')
+          BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS:/d')
+
           echo "ADO webhook response: HTTP ${HTTP_STATUS}"
+          echo "Response body: ${BODY}"
 
           if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
             echo "::error::ADO webhook POST failed with HTTP ${HTTP_STATUS}"
