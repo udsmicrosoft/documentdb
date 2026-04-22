@@ -97,10 +97,11 @@ jobs:
             --arg sha "$COMMIT_SHA" \
             --arg branch "$SOURCE_BRANCH" \
             --arg repo "${{ github.repository }}" \
-            --arg author "${{ github.event.comment.user.login }}" \
+            --arg triggerer "${{ github.event.comment.user.login }}" \
             '{
               action: $action,
               number: ($pr_number | tonumber),
+              triggerer: $triggerer,
               repository: {
                 full_name: $repo
               },
@@ -117,7 +118,7 @@ jobs:
                   ref: "main"
                 },
                 user: {
-                  login: $author
+                  login: $triggerer
                 }
               }
             }')
