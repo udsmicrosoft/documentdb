@@ -70,7 +70,83 @@ jobs:
 
           echo "PR #${PR_NUMBER} at SHA ${COMMIT_SHA} (branch: ${SOURCE_BRANCH})"
 
+      - name: Path filter — skip if only irrelevant files changed
+        id: pathfilter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
+
+          # Allow override: `/test force` bypasses the path filter
+          if echo "$COMMENT_BODY" | grep -qiE '^/test[[:space:]]+force\b'; then
+            echo "Path filter bypassed via '/test force'"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Files matching any of these patterns are considered irrelevant to internal CI.
+          # If the PR touches *only* these, we skip the expensive run.
+          IGNORE_PATTERNS=(
+            '*.md'
+            '**/*.md'
+            'LICENSE'
+            'NOTICE'
+            'CODEOWNERS'
+            'MAINTAINERS.md'
+            '.gitignore'
+            '.gitattributes'
+            'docs/**'
+            '.github/**'
+            'rfcs/**'
+            'licenses/**'
+          )
+
+          # Get list of changed files (paginated, up to 3000)
+          mapfile -t FILES < <(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/files" \
+            --jq '.[].filename')
+
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "::warning::No files reported changed; running CI anyway"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Changed files (${#FILES[@]}):"
+          printf '  %s\n' "${FILES[@]}"
+
+          shopt -s globstar extglob nullglob
+          RELEVANT=0
+          for f in "${FILES[@]}"; do
+            matched=0
+            for pat in "${IGNORE_PATTERNS[@]}"; do
+              # shellcheck disable=SC2053
+              if [[ "$f" == $pat ]]; then
+                matched=1
+                break
+              fi
+            done
+            if [[ $matched -eq 0 ]]; then
+              echo "Relevant file: $f"
+              RELEVANT=1
+              break
+            fi
+          done
+
+          if [[ $RELEVANT -eq 0 ]]; then
+            echo "All changed files match ignore patterns — skipping internal CI"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+
+            gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+              -f body="⏭️ Internal CI skipped: PR only touches docs/CI/license files. Use \`/test force\` to override." \
+              --silent
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set pending commit status
+        if: steps.pathfilter.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -81,6 +157,7 @@ jobs:
             --silent
 
       - name: POST webhook to ADO
+        if: steps.pathfilter.outputs.skip != 'true'
         env:
           MS_WEBHOOK_SECRET: ${{ secrets.MS_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ github.token }}
