@@ -153,7 +153,7 @@ jobs:
           gh api "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.commit_sha }}" \
             -f state='pending' \
             -f description='Internal CI triggered, waiting for results...' \
-            -f context='ms-internal-ci/oss-tests' \
+            -f context='ms-internal-ci/oss-jstests' \
             --silent
 
       - name: POST webhook to ADO
@@ -224,7 +224,7 @@ jobs:
             gh api "repos/${{ github.repository }}/statuses/${COMMIT_SHA}" \
               -f state='error' \
               -f description='Failed to trigger internal CI pipeline' \
-              -f context='ms-internal-ci/oss-tests' \
+              -f context='ms-internal-ci/oss-jstests' \
               --silent
             exit 1
           fi
