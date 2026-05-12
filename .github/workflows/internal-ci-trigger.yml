@@ -209,7 +209,7 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-GitHub-ADO-Signature: $SIGNATURE" \
             -d "$PAYLOAD" \
-            "https://dev.azure.com/msdata/_apis/public/distributedtask/webhooks/documentdb-oss-external-ci-webhook?api-version=6.0-preview")
+            "https://dev.azure.com/msdata/_apis/public/distributedtask/webhooks/WebHook?api-version=6.0-preview")
 
           HTTP_STATUS=$(echo "$RESPONSE" | grep -oP 'HTTP_STATUS:\K\d+')
           BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS:/d')
