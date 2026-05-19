@@ -263,7 +263,6 @@ jobs:
             -H "X-GitHub-ADO-Signature: $SIGNATURE" \
             -d "$PAYLOAD" \
             "https://dev.azure.com/msdata/_apis/public/distributedtask/webhooks/documentdb-oss-external-ci-webhook?api-version=6.0-preview")
-
           echo "ADO webhook response: HTTP ${HTTP_STATUS}"
 
           if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
