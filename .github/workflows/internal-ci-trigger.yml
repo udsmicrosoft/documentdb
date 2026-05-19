@@ -65,6 +65,7 @@ jobs:
           echo "User ${COMMENTER} authorized (permission: ${PERMISSION}, org: ${MICROSOFT_GITHUB_ORG})"
 
       - name: React to comment
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
