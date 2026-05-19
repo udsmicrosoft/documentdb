@@ -1,6 +1,6 @@
 # MVP: Trigger internal ADO pipeline from GitHub PR comments.
-# Production version will add: Microsoft org membership check, private repo
-# ref push, CredScan redaction, and fork PR support.
+# Production version will add: private repo ref push, CredScan redaction,
+# and fork PR support.
 name: Internal CI Trigger
 run-name: "Internal CI for PR #${{ github.event.issue.number }}"
 
@@ -10,17 +10,35 @@ on:
 
 jobs:
   trigger-internal-ci:
-    # Only run on PR comments (not issue comments) that start with /test
+    # Only run on PR comments (not issue comments) that are /test commands.
     if: >-
       github.event.issue.pull_request
-      && startsWith(github.event.comment.body, '/test')
+      && (
+        github.event.comment.body == '/test'
+        || startsWith(github.event.comment.body, '/test ')
+      )
     runs-on: ubuntu-latest
-    permissions: write-all
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: write
     steps:
+      - name: Validate test command
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if [[ ! "$COMMENT_BODY" =~ ^/test([[:space:]]+force)?[[:space:]]*$ ]]; then
+            echo "::error::Unsupported internal CI command. Use /test or /test force."
+            exit 1
+          fi
+
       - name: Check authorization
         id: auth
         env:
           GH_TOKEN: ${{ github.token }}
+          MICROSOFT_GITHUB_ORG: microsoft
+          MS_ORG_READ_TOKEN: ${{ secrets.MS_ORG_READ_TOKEN }}
         run: |
           COMMENTER="${{ github.event.comment.user.login }}"
 
@@ -33,8 +51,18 @@ jobs:
             exit 1
           fi
 
+          if [[ -z "${MS_ORG_READ_TOKEN:-}" ]]; then
+            echo "::error::MS_ORG_READ_TOKEN secret is required to verify Microsoft org membership"
+            exit 1
+          fi
+
+          if ! GH_TOKEN="$MS_ORG_READ_TOKEN" gh api "orgs/${MICROSOFT_GITHUB_ORG}/members/${COMMENTER}" --silent; then
+            echo "::error::User ${COMMENTER} is not a member of ${MICROSOFT_GITHUB_ORG}, or membership could not be verified"
+            exit 1
+          fi
+
           echo "authorized=true" >> "$GITHUB_OUTPUT"
-          echo "User ${COMMENTER} authorized (permission: ${PERMISSION})"
+          echo "User ${COMMENTER} authorized (permission: ${PERMISSION}, org: ${MICROSOFT_GITHUB_ORG})"
 
       - name: React to comment
         env:
@@ -166,6 +194,11 @@ jobs:
           COMMIT_SHA="${{ steps.pr.outputs.commit_sha }}"
           SOURCE_BRANCH="${{ steps.pr.outputs.source_branch }}"
 
+          if [[ -z "${MS_WEBHOOK_SECRET:-}" ]]; then
+            echo "::error::MS_WEBHOOK_SECRET secret is required to trigger ADO"
+            exit 1
+          fi
+
           # Build payload matching native GitHub PR event format
           # (matches what the ADO webhook service connection expects)
           PAYLOAD=$(jq -n \
@@ -200,22 +233,20 @@ jobs:
               }
             }')
 
-          # Compute HMAC-SHA1 signature (ADO incoming webhook verifies with SHA1)
+          # Compute the raw HMAC-SHA1 hex signature expected by the ADO
+          # documentdb-oss-external-ci-webhook service connection. Unsigned
+          # and bad-signature requests must fail before queuing ADO pipeline 56298.
           SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha1 -hmac "$MS_WEBHOOK_SECRET" -binary | xxd -p -c 256)
 
           # POST to ADO incoming webhook endpoint
-          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+          HTTP_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
             -X POST \
             -H "Content-Type: application/json" \
             -H "X-GitHub-ADO-Signature: $SIGNATURE" \
             -d "$PAYLOAD" \
             "https://dev.azure.com/msdata/_apis/public/distributedtask/webhooks/documentdb-oss-external-ci-webhook?api-version=6.0-preview")
 
-          HTTP_STATUS=$(echo "$RESPONSE" | grep -oP 'HTTP_STATUS:\K\d+')
-          BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS:/d')
-
           echo "ADO webhook response: HTTP ${HTTP_STATUS}"
-          echo "Response body: ${BODY}"
 
           if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
             echo "::error::ADO webhook POST failed with HTTP ${HTTP_STATUS}"
