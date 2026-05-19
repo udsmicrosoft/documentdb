@@ -200,19 +200,36 @@ jobs:
             exit 1
           fi
 
-          # Build payload matching native GitHub PR event format
-          # (matches what the ADO webhook service connection expects)
+          # Build a comment-shaped payload so each /test comment is a distinct
+          # webhook event while still carrying the pinned PR SHA for ADO.
           PAYLOAD=$(jq -n \
-            --arg action "opened" \
+            --arg action "created" \
             --arg pr_number "$PR_NUMBER" \
             --arg sha "$COMMIT_SHA" \
             --arg branch "$SOURCE_BRANCH" \
             --arg repo "${{ github.repository }}" \
             --arg triggerer "${{ github.event.comment.user.login }}" \
+            --arg comment_id "${{ github.event.comment.id }}" \
+            --arg comment_url "${{ github.event.comment.html_url }}" \
+            --arg comment_created_at "${{ github.event.comment.created_at }}" \
             '{
               action: $action,
               number: ($pr_number | tonumber),
               triggerer: $triggerer,
+              comment: {
+                id: ($comment_id | tonumber),
+                html_url: $comment_url,
+                created_at: $comment_created_at,
+                user: {
+                  login: $triggerer
+                }
+              },
+              issue: {
+                number: ($pr_number | tonumber),
+                pull_request: {
+                  url: "https://api.github.com/repos/\($repo)/pulls/\($pr_number)"
+                }
+              },
               repository: {
                 full_name: $repo
               },
