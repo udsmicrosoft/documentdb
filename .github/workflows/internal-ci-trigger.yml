@@ -80,12 +80,13 @@ jobs:
           PR_NUMBER="${{ github.event.issue.number }}"
 
           PR_DATA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
-            --jq '{sha: .head.sha, branch: .head.ref, head_repo: .head.repo.full_name, base_repo: .base.repo.full_name}')
+            --jq '{sha: .head.sha, branch: .head.ref, head_repo: .head.repo.full_name, base_repo: .base.repo.full_name, base_ref: .base.ref}')
 
           COMMIT_SHA=$(echo "$PR_DATA" | jq -r '.sha')
           SOURCE_BRANCH=$(echo "$PR_DATA" | jq -r '.branch')
           HEAD_REPO=$(echo "$PR_DATA" | jq -r '.head_repo')
           BASE_REPO=$(echo "$PR_DATA" | jq -r '.base_repo')
+          BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.base_ref')
 
           # MVP: reject fork PRs — they require additional handling
           if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
@@ -95,9 +96,10 @@ jobs:
 
           echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
           echo "source_branch=${SOURCE_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "base_branch=${BASE_BRANCH}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
-          echo "PR #${PR_NUMBER} at SHA ${COMMIT_SHA} (branch: ${SOURCE_BRANCH})"
+          echo "PR #${PR_NUMBER} at SHA ${COMMIT_SHA} (head: ${SOURCE_BRANCH} -> base: ${BASE_BRANCH})"
 
       - name: Path filter — skip if only irrelevant files changed
         id: pathfilter
@@ -194,6 +196,7 @@ jobs:
           PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
           COMMIT_SHA="${{ steps.pr.outputs.commit_sha }}"
           SOURCE_BRANCH="${{ steps.pr.outputs.source_branch }}"
+          BASE_BRANCH="${{ steps.pr.outputs.base_branch }}"
 
           if [[ -z "${MS_WEBHOOK_SECRET:-}" ]]; then
             echo "::error::MS_WEBHOOK_SECRET secret is required to trigger ADO"
@@ -207,6 +210,7 @@ jobs:
             --arg pr_number "$PR_NUMBER" \
             --arg sha "$COMMIT_SHA" \
             --arg branch "$SOURCE_BRANCH" \
+            --arg base_branch "$BASE_BRANCH" \
             --arg repo "${{ github.repository }}" \
             --arg triggerer "${{ github.event.comment.user.login }}" \
             --arg comment_id "${{ github.event.comment.id }}" \
@@ -243,7 +247,7 @@ jobs:
                   }
                 },
                 base: {
-                  ref: "main"
+                  ref: $base_branch
                 },
                 user: {
                   login: $triggerer
