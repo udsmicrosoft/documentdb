@@ -162,6 +162,13 @@ for eachDocument in results:
 
 ```
 
+## Ecosystem compatibility
+
+The [ecosystem compatibility pilot](compatibility/README.md) currently tests real
+Python and Node.js driver APIs against a version-pinned released DocumentDB image.
+Its manual GitHub Actions workflow can run all enabled integrations and combines
+their per-scenario results into a summary and dashboard preview.
+
 ### Helpful Links
 
 - Check out our [website](https://documentdb.io) to stay up to date with the latest on the project.
