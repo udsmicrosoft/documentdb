@@ -1,0 +1,61 @@
+name: PyMongo compatibility
+run-name: PyMongo compatibility (PR 775)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PR_HEAD: b7adae85af18e64b42049d8199bd197bcf6f63fc
+
+jobs:
+  pymongo:
+    name: PyMongo compatibility
+    if: github.repository == 'udsmicrosoft/documentdb'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out PR 775 source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: udsmicrosoft/documentdb
+          ref: ${{ env.PR_HEAD }}
+          persist-credentials: false
+      - name: Verify source revision
+        run: |
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$PR_HEAD"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Install controller dependencies
+        run: python -m pip install -r compatibility/requirements.txt
+      - name: Run PyMongo against DocumentDB
+        id: suite
+        run: |
+          python -m compatibility.runner --integration pymongo \
+            --output results/pymongo/result.json \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+      - name: Show scenario results
+        if: always() && steps.suite.outcome != 'skipped'
+        run: |
+          cat results/pymongo/result.log
+          {
+            printf '## PyMongo compatibility\n\n'
+            printf 'Source: PR #775 at %s.\n\n' "$PR_HEAD"
+            printf 'Execution uses the PR runner directly, without reporting, persistence, or deployment.\n\n'
+            printf '```text\n'
+            cat results/pymongo/result.log
+            printf '\n```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain results and sanitized diagnostics
+        if: always() && steps.suite.outcome != 'skipped'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pymongo-compatibility-results-${{ github.run_attempt }}
+          path: results/pymongo/
+          if-no-files-found: error
+          retention-days: 30
