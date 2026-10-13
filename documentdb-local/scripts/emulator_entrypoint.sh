@@ -8,6 +8,7 @@
 # Takes an optional exit code (default 0) so the self-exit path can propagate
 # the gateway's status.
 configFile=""
+hostConfigFile=""
 
 # Every operator setting (flag, env var, default, type) is declared once in
 # the sibling settings table; this script parses, defaults and validates from
@@ -15,6 +16,10 @@ configFile=""
 # shellcheck source=documentdb_local_settings.sh
 . "$(dirname "${BASH_SOURCE[0]}")/documentdb_local_settings.sh" || {
     echo "Error: cannot load documentdb_local_settings.sh beside this script." >&2
+    exit 1
+}
+. "$(dirname "${BASH_SOURCE[0]}")/documentdb_claim_data_directory.sh" || {
+    echo "Error: cannot load documentdb_claim_data_directory.sh beside this script." >&2
     exit 1
 }
 
@@ -25,6 +30,7 @@ PG_LOG_TAIL_PID=""
 SYSTEM_PG_LOG_TAIL_PID=""
 OSS_LOG_TAIL_PID=""
 GATEWAY_LOG_TAIL_PID=""
+USAGE_TELEMETRY_PID=""
 POSTGRES_STOPPED=false
 
 cleanup() {
@@ -43,6 +49,13 @@ cleanup() {
         fi
     done
     
+    # Kill the usage-telemetry emitter if it is running. It is a plain sleep
+    # loop with no state to flush, so a kill is a clean stop.
+    if [ -n "${USAGE_TELEMETRY_PID:-}" ]; then
+        echo "Stopping usage telemetry emitter (PID: $USAGE_TELEMETRY_PID)"
+        kill $USAGE_TELEMETRY_PID 2>/dev/null || true
+    fi
+
     # Kill gateway process if it exists
     if [ -n "${gateway_pid:-}" ]; then
         echo "Stopping gateway process (PID: $gateway_pid)"
@@ -78,6 +91,9 @@ cleanup_temp_config() {
     # DOCUMENTDB_CONFIG_FILE, the caller owns the lifecycle.
     if [ -z "${DOCUMENTDB_CONFIG_FILE:-}" ] && [ -n "${configFile:-}" ] && [ -f "$configFile" ]; then
         rm -f "$configFile"
+    fi
+    if [ -n "${hostConfigFile:-}" ]; then
+        rm -f "$hostConfigFile" "$hostConfigFile.tmp"
     fi
 }
 
@@ -149,12 +165,46 @@ Optional arguments:
                         previously interrupted start left behind, set
                         DOCUMENTDB_FORCE_OWNERSHIP_REPAIR=true to force a
                         full recursive ownership repair on the next start.
+                        A leftover postmaster.pid from an unclean stop
+                        (docker kill, OOM, host crash) is removed on the next
+                        start when this image's directory lock shows its
+                        postmaster wrote it. That trusts the volume's flock,
+                        so a volume shared by several hosts is unsupported.
+                        Any other postmaster.pid refuses
+                        to start, because a container without the lock (an
+                        older image) may still be serving the volume. Once no
+                        other container uses it, create or recreate the
+                        container with
+                        DOCUMENTDB_FORCE_REMOVE_STALE_POSTMASTER_PID=true
+                        (docker start cannot add it) to remove the file; it
+                        stays in force on every later start until removed.
   --documentdb-port     The port of the DocumentDB endpoint on the container. 
                         You still need to publish this port (e.g. -p ${d_gw}:${d_gw}).
                         Defaults to ${d_gw}
                         Overrides DOCUMENTDB_PORT environment variable.
   --enable-telemetry    Enable telemetry data sent to the usage colletor (Azure Application Insights). 
+                        This is the gateway's OPERATIONAL telemetry and is a separate setting from
+                        the anonymous usage telemetry below: ENABLE_TELEMETRY=false does not turn
+                        that off. Use --usage-telemetry false for it.
                         Overrides ENABLE_TELEMETRY environment variable.
+  --usage-telemetry <true|false>
+                        Anonymous usage telemetry that reports only this image's version, platform
+                        and CPU architecture at startup and periodically, so the project can count
+                        running deployments. No database, collection or user names, queries, document
+                        contents or credentials are ever sent. Separate from --enable-telemetry,
+                        which controls the gateway's operational metrics.
+                        Defaults to $(documentdb_local_setting_default DOCUMENTDB_USAGE_TELEMETRY) (on). Skipped when CI, GITHUB_ACTIONS or
+                        TF_BUILD is set in this container; docker run does not forward those
+                        from the host, so in a pipeline set this to false explicitly.
+                        Overrides DOCUMENTDB_USAGE_TELEMETRY environment variable.
+                        DOCUMENTDB_USAGE_TELEMETRY_ENDPOINT and DOCUMENTDB_USAGE_TELEMETRY_INTERVAL_S
+                        tune where and how often it reports. Details in
+                        /home/documentdb/PRIVACY.md in this container, or
+                        https://github.com/documentdb/documentdb/blob/main/documentdb-local/PRIVACY.md
+  --disable-usage-telemetry
+                        Turn off the usage telemetry above. Equivalent to --usage-telemetry false.
+                        Setting NO_ANALYTICS=1 or DO_NOT_TRACK=1 also turns it off and wins
+                        over any enable.
   --log-level           The verbosity of logs that will be emitted.
                         Overrides LOG_LEVEL environment variable.
                           $(documentdb_local_setting_allowed LOG_LEVEL)
@@ -167,18 +217,14 @@ Optional arguments:
                         Overrides PASSWORD environment variable.
   --create-user         Specify whether to create a user. 
                         Defaults to $(documentdb_local_setting_default CREATE_USER).
-  --start-pg            Specify whether to start the PostgreSQL server.
-                        Defaults to $(documentdb_local_setting_default START_POSTGRESQL). Advanced/test use only: false
-                        expects an external PostgreSQL, which you run and
-                        configure yourself, to be listening already on
-                        localhost at --pg-port, and this entrypoint then
-                        performs only the gateway-side setup against it. In
-                        that mode it writes no server configuration (so
-                        --toast-compression does not apply) and installs no
-                        compatibility stubs into a database it does not own,
-                        so getParameter reports a raw PostgreSQL
-                        undefined-function error rather than the documented
-                        unsupported-command response.
+  --start-pg            Start PostgreSQL (default: $(documentdb_local_setting_default START_POSTGRESQL)).
+                        On process loss, enable shutdown responses after a short
+                        grace period; exit 1 if still down after
+                        DOCUMENTDB_POSTMASTER_EXIT_TIMEOUT seconds (default 20).
+                        Advanced/test use only: false requires PostgreSQL listening
+                        on localhost at --pg-port. Skips server setup and
+                        --toast-compression; getParameter returns undefined-function
+                        rather than unsupported-command.
   --pg-port             Specify the port for the PostgreSQL server.
                         Defaults to ${d_pg}.
                         Overrides POSTGRESQL_PORT environment variable.
@@ -295,6 +341,12 @@ while [ $# -gt 0 ]; do
             export DISABLE_EXTENDED_RUM=true
             shift
             continue ;;
+        --disable-usage-telemetry)
+            # Negative spelling of --usage-telemetry false, matching the
+            # standard opt-out wording users expect.
+            export DOCUMENTDB_USAGE_TELEMETRY=false
+            shift
+            continue ;;
     esac
     if ! _setting_row="$(documentdb_local_setting_row_by_flag "$1")"; then
         echo "Unknown option $1" >&2
@@ -382,6 +434,15 @@ for _setting_row in "${DOCUMENTDB_LOCAL_SETTINGS[@]}"; do
                 echo "Invalid ${_setting_label} value ${_setting_value}, must be true or false" >&2
                 exit 1
             fi ;;
+        boolish)
+            # Accept any reasonable spelling and normalize it, rather than
+            # aborting: every boolish setting is an off switch, so rejecting
+            # an unusual spelling would make turning the feature off break
+            # the container instead.
+            if ! _setting_normalized="$(documentdb_local_parse_boolish "${_setting_value}")"; then
+                echo "Warning: unrecognized ${_setting_label} value '${_setting_value}'; treating it as false. Use true or false." >&2
+            fi
+            export "${_setting_var}=${_setting_normalized}" ;;
         enum:*)
             case ",${_setting_type#enum:}," in
                 *",${_setting_value},"*) ;;
@@ -391,7 +452,7 @@ for _setting_row in "${DOCUMENTDB_LOCAL_SETTINGS[@]}"; do
             esac ;;
     esac
 done
-unset _setting_row _f _setting_var _setting_default _setting_type _setting_label _setting_value
+unset _setting_row _f _setting_var _setting_default _setting_type _setting_label _setting_value _setting_normalized
 
 # Cross-setting rules the table cannot express.
 if { [ -n "${CERT_PATH:-}" ] && [ -z "${KEY_FILE:-}" ]; } || \
@@ -568,7 +629,7 @@ fi
 
 if [ "$START_POSTGRESQL" = "true" ]; then
     echo "Starting PostgreSQL server on port $POSTGRESQL_PORT..."
-    exec > >(tee -a "$ENTRYPOINT_LOG") 2> >(tee -a "$ENTRYPOINT_LOG" >&2)
+    exec 6>&2
     
     # Fix permissions on data directory to prevent "Permission denied" errors
     echo "Ensuring proper permissions on data directory: $DATA_PATH"
@@ -576,6 +637,9 @@ if [ "$START_POSTGRESQL" = "true" ]; then
         echo "Creating data directory: $DATA_PATH"
         sudo mkdir -p "$DATA_PATH"
     fi
+
+    claim_data_directory "$DATA_PATH" 2>&6
+    exec > >(tee -a "$ENTRYPOINT_LOG") 2> >(tee -a "$ENTRYPOINT_LOG" >&2)
 
     # Repair ownership only when the data directory (or the PG_VERSION file
     # inside it, which catches e.g. a root-restored backup under a correctly
@@ -606,9 +670,10 @@ if [ "$START_POSTGRESQL" = "true" ]; then
         echo "Setting permissions on $DATA_PATH"
         sudo chmod -R 750 "$DATA_PATH"
     else
-        # PostgreSQL refuses to start when the data directory itself is more
-        # permissive than 0750; keep that guarantee without a recursive walk.
-        chmod 750 "$DATA_PATH" 2>/dev/null || sudo chmod 750 "$DATA_PATH"
+        chmod 750 "$DATA_PATH" 2>/dev/null || sudo chmod 750 "$DATA_PATH" || {
+            echo "Error: cannot set permissions on data directory $DATA_PATH." | tee -a "$ENTRYPOINT_LOG" >&6
+            exit 1
+        }
     fi
 
     # Adopt the image-baked, pre-initialized data directory when one is present
@@ -912,8 +977,22 @@ if [ "$START_POSTGRESQL" = "true" ]; then
     # below creates the user before the gateway starts instead.
     start_oss_server_args+=(-u "" -d "$DATA_PATH" -p "$POSTGRESQL_PORT")
 
+    # start_oss_server.sh returns only after crash recovery and setup, so record
+    # the postmaster as soon as it holds the lock, or a kill before then would
+    # leave an unrecorded pidfile that needs the override.
+    (
+        i=0
+        while [ $i -lt 600 ] && ! vouched_postmaster "$DATA_PATH" >/dev/null; do
+            sleep 0.5
+            i=$((i + 1))
+        done
+        [ $i -lt 600 ] && record_postmaster_owner "$DATA_PATH"
+    ) &
+    record_watch_pid=$!
     "$SCRIPT_DIR/start_oss_server.sh" "${start_oss_server_args[@]}" | tee -a "$OSS_SERVER_LOG"
     start_oss_server_rc=${PIPESTATUS[0]}
+    kill "$record_watch_pid" 2>/dev/null
+    wait "$record_watch_pid" 2>/dev/null
     if [ "$start_oss_server_rc" -ne 0 ]; then
         # $? here is tee's, so the script's own status has to be read
         # explicitly. A setup step that fails *after* the postmaster
@@ -982,6 +1061,7 @@ if [ "$START_POSTGRESQL" = "true" ]; then
         i=$((i + 1))
     done
     echo "PostgreSQL is running."
+    record_postmaster_owner "$DATA_PATH"
 
     # postmaster.pid appears BEFORE crash recovery finishes, but every post-start
     # step below (lz4 probe, getParameter stub, config reload) needs a server
@@ -1241,6 +1321,26 @@ if ! jq --argjson enforceTls "$enforceTls" '.EnforceTls = $enforceTls' "$configF
 fi
 mv "$configFile.tmp" "$configFile"
 
+write_host_config() {
+    printf '{"SendShutdownResponses": "%s"}\n' "$1" > "$hostConfigFile.tmp" \
+        && chmod 644 "$hostConfigFile.tmp" \
+        && mv -f "$hostConfigFile.tmp" "$hostConfigFile"
+}
+
+if [ "${START_POSTGRESQL:-}" = "true" ]; then
+    if hostConfigFile="$(mktemp /tmp/documentdb_host_config_XXXXXX.json)" \
+            && write_host_config false \
+            && jq --arg hostConfig "$hostConfigFile" '.DynamicConfigurationFile = $hostConfig' \
+                "$configFile" > "$configFile.tmp" \
+            && mv "$configFile.tmp" "$configFile"; then
+        :
+    else
+        echo "Warning: could not set up the gateway host configuration file; requests will not fail fast while PostgreSQL is down." >&2
+        rm -f "${hostConfigFile:-}" "$configFile.tmp"
+        hostConfigFile=""
+    fi
+fi
+
 echo "Starting gateway in the background..."
 if [ "$CREATE_USER" = "false" ]; then
     echo "Skipping user creation and starting the gateway..."
@@ -1472,7 +1572,7 @@ elif [ -d "$INIT_DATA_PATH" ] && [ "$(ls -A "$INIT_DATA_PATH"/*.js 2>/dev/null)"
         else
             echo "Error: Custom data initialization failed; it will not be retried on restart if it had begun applying data."
             echo "Fix your initialization scripts and start with a fresh data volume to re-run."
-            exit 1
+            cleanup 1
         fi
     else
         echo "Warning: Initialization script not found at $init_script"
@@ -1499,16 +1599,14 @@ elif [ "$INIT_DATA" = "true" ]; then
             write_init_marker "$sample_init_marker"
         else
             echo "Error: Sample data initialization failed"
-            exit 1
+            cleanup 1
         fi
         echo ""
-        echo "Sample data has been loaded into the 'sampledb' database with the following collections:"
-        echo "  - users (5 sample users)"
-        echo "  - products (5 sample products)"  
-        echo "  - orders (4 sample orders)"
-        echo "  - analytics (sample metrics and activity data)"
+        echo "Sample data has been loaded into the 'StoreData' database with the following collections:"
+        echo "  - stores (41,505 sample stores)"
+        echo "  - ratings (2 sample ratings)"
         echo ""
-        echo "Connect to your DocumentDB instance and use: use('sampledb')"
+        echo "Connect to your DocumentDB instance and use: use('StoreData')"
     else
         echo "Warning: Sample data or initialization script not found"
         if [ ! -f "$init_script" ]; then
@@ -1553,6 +1651,20 @@ else
     echo "Warning: could not write $DOCUMENTDB_RUNTIME_STATE_FILE; the container health check will keep reporting unhealthy." >&2
 fi
 
+# Start the anonymous usage-telemetry emitter. Started only after the gateway
+# is serving so a launch event means a deployment that actually came up, and
+# backgrounded with its PID in the cleanup trap so it stops with everything
+# else. The script exits immediately when telemetry is disabled or opted out,
+# and every request it makes is fire-and-forget, so nothing here can delay or
+# fail the container.
+telemetry_script="$SCRIPT_DIR/usage_telemetry.sh"
+if [ -f "$telemetry_script" ]; then
+    bash "$telemetry_script" &
+    USAGE_TELEMETRY_PID=$!
+else
+    echo "Warning: usage telemetry emitter not found at $telemetry_script; skipping." >&2
+fi
+
 echo ""
 echo "=== DocumentDB is ready ==="
 echo ""
@@ -1587,21 +1699,49 @@ echo "Example: docker logs <container_name> | grep '[POSTGRES]'"
 echo "=========================="
 echo ""
 
-# Wait for the gateway process to keep the container alive
-# The wait will be interrupted by signals, allowing cleanup to run.
-# The `|| gateway_rc=$?` capture matters: sourcing utils.sh above (the
-# CREATE_USER=true path) turns on `set -e` plus an ERR trap, so a bare
-# `wait` on a gateway that crashed with a nonzero status would abort the
-# script right here — skipping the clean PostgreSQL stop below, which is
-# the exact crash path it exists for.
+# Watch the owned postmaster: enable shutdown responses after 3 missed polls,
+# exit after the timeout, and clear shutdown mode once connections resume.
+# Keep waits interruptible and capture gateway failures so set -e cannot skip cleanup.
 gateway_rc=0
+if [ "${START_POSTGRESQL:-}" = "true" ]; then
+    postmaster_running() {
+        local pid executable
+        pid="$(sed -n 1p "$DATA_PATH/postmaster.pid" 2>/dev/null | tr -dc 0-9)"
+        [ -n "$pid" ] || return 1
+        executable="$(readlink "/proc/$pid/exe" 2>/dev/null)" || return 1
+        [ "${executable##*/}" = "postgres" ] && [ "$DATA_PATH" -ef "/proc/$pid/cwd" ]
+    }
+
+    postmaster_exit_timeout="$(sanitize_uint "${DOCUMENTDB_POSTMASTER_EXIT_TIMEOUT:-20}" 20 DOCUMENTDB_POSTMASTER_EXIT_TIMEOUT)"
+    postmaster_exit_timeout=$((10#$postmaster_exit_timeout))
+    postmaster_down_for=0
+    backend_marked_down=false
+    while kill -0 "$gateway_pid" 2>/dev/null; do
+        if postmaster_running; then
+            postmaster_down_for=0
+            if [ "$backend_marked_down" = "true" ] \
+                    && pg_isready -q -h localhost -p "$POSTGRESQL_PORT" -t 1 >/dev/null 2>&1 \
+                    && write_host_config false; then
+                backend_marked_down=false
+                echo "PostgreSQL is accepting connections again; the gateway serves requests normally."
+            fi
+        else
+            postmaster_down_for=$((postmaster_down_for + 1))
+            if [ "$postmaster_down_for" -gt "$postmaster_exit_timeout" ]; then
+                echo "Error: PostgreSQL has not been running for ${postmaster_exit_timeout} seconds; stopping the container. See the PostgreSQL server log at $DATA_PATH/pglog.log." >&2
+                cleanup 1
+            elif [ "$postmaster_down_for" -ge 3 ] && [ "$backend_marked_down" = "false" ] \
+                    && [ -n "$hostConfigFile" ] && write_host_config true; then
+                backend_marked_down=true
+                echo "Warning: PostgreSQL is not running; the gateway answers requests with ShutdownInProgress (91) until it is back." >&2
+            fi
+        fi
+        sleep 1 &
+        wait $! || true
+    done
+fi
 wait $gateway_pid || gateway_rc=$?
 
-# Gateway self-exit path (crash/OOM/normal exit): no signal was delivered, so
-# the SIGTERM/SIGINT trap never ran. Run the same cleanup the trap uses —
-# including the pg_ctl fast stop — otherwise this script would simply exit as
-# PID 1 and the daemonized postmaster would be SIGKILLed, forcing the WAL
-# recovery on next boot that the clean stop exists to prevent. cleanup exits
-# with the gateway's status so the container reports the real failure.
+# Stop PostgreSQL even when the gateway exits without a signal.
 echo "Gateway process exited with status ${gateway_rc}."
 cleanup "$gateway_rc"

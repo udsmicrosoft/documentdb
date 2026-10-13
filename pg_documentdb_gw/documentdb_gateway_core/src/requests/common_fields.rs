@@ -16,7 +16,7 @@ use crate::{
     protocol::bson_scanner::{self, RawField},
     requests::{
         info::{RequestInfo, RequestInfoBuilder},
-        read_concern::ReadConcern,
+        read_concern::{self, ReadConcern},
         read_preference::ReadPreference,
         request_type::RequestType,
     },
@@ -72,7 +72,7 @@ pub fn extract_info_from_document(
         extract_common_field(&mut request_info, key, &field, collection_field)
     })?;
 
-    Ok(request_info.build())
+    request_info.build()
 }
 
 /// Extracts the command type and common metadata from a command document in one scan.
@@ -111,7 +111,7 @@ pub fn extract_request_type_and_info_from_document(
     let request_type =
         request_type.ok_or_else(|| DocumentDBError::bad_value("Empty BSON document".to_owned()))?;
 
-    Ok((request_type, request_info.build()))
+    Ok((request_type, request_info.build()?))
 }
 
 #[expect(clippy::too_many_lines, reason = "complex field extraction logic")]
@@ -208,27 +208,24 @@ fn extract_common_field<'a>(
             request_info.start_transaction(start_transaction);
         }
         "readConcern" => {
-            // Nested document — use scanner recursively for level extraction
-            let doc_bytes = field.as_embedded_document_bytes().ok_or_else(|| {
-                DocumentDBError::bad_value(format!(
-                    "Expected readConcern to be a document but got element type 0x{:02X}",
-                    field.element_type()
-                ))
-            })?;
+            // A null readConcern is accepted and treated as unspecified (default).
+            const BSON_NULL: u8 = 0x0A;
+            if field.element_type() == BSON_NULL {
+                request_info.read_concern(ReadConcern::Unspecified);
+            } else {
+                let doc_bytes = field.as_embedded_document_bytes().ok_or_else(|| {
+                    DocumentDBError::type_mismatch(format!(
+                        "Expected readConcern to be a document but got element type 0x{:02X}",
+                        field.element_type()
+                    ))
+                })?;
 
-            let mut level_str = "";
-            bson_scanner::scan_document(doc_bytes, |inner_field| {
-                if inner_field.name() == b"level" {
-                    level_str = inner_field.as_str().unwrap_or("");
+                let parsed = read_concern::validate_and_extract_level(doc_bytes)?;
+                if parsed == ReadConcern::Snapshot {
+                    request_info.isolation_level(IsolationLevel::RepeatableRead);
                 }
-                Ok(())
-            })?;
-
-            let read_concern = ReadConcern::from_str(level_str).unwrap_or_default();
-            if read_concern == ReadConcern::Snapshot {
-                request_info.isolation_level(IsolationLevel::RepeatableRead);
+                request_info.read_concern(parsed);
             }
-            request_info.read_concern(read_concern);
         }
         "$readPreference" => {
             ReadPreference::parse(field.as_embedded_document_bytes())?;
@@ -328,6 +325,29 @@ mod tests {
         request
             .extract_common()
             .expect_err("first lsid.id field controls type validation");
+    }
+
+    #[test]
+    fn extract_common_rejects_transaction_number_without_session_id() {
+        let request = Request::RawBuf(
+            RequestType::Find,
+            rawdoc! {
+                "find": "orders",
+                "$db": "testdb",
+                "txnNumber": 1_i64,
+                "autocommit": false,
+            },
+        );
+
+        let error = request
+            .extract_common()
+            .expect_err("txnNumber without lsid should be rejected");
+
+        assert_eq!(error.error_code(), ErrorCode::InvalidOptions);
+        assert_eq!(
+            error.error_message_user(),
+            "Transaction number requires a session ID to also be specified."
+        );
     }
 
     fn build_raw(doc: &bson::Document) -> RawDocumentBuf {

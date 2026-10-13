@@ -3,6 +3,25 @@ SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog,documen
 SET documentdb.next_collection_id TO 27120000;
 SET documentdb.next_collection_index_id TO 27120000;
 
+SELECT bson_dollar_project('{"a": null}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": {"$numberDecimal": "1"}}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": 1}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": {"$numberLong": "1"}}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": 1.5}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": true}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": []}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": {}}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": {"$binary": {"base64": "YWJj", "subType": "00"}}}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": {"$date": {"$numberLong": "0"}}}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "$$ROOT"}}');
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "$$REMOVE"}}');
+SELECT bson_dollar_project('{"a": {"$numberDecimal": "1"}}', '{"r": {"$let": {"vars": {"kind": "$a"}, "in": {"$meta": "$$kind"}}}}');
+SELECT bson_dollar_project('{"a": "CONTROL_STRING"}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{"a": "textScore"}', '{"r": {"$meta": "$a"}}');
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "indexKey"}}');
+SELECT bson_dollar_project('{}', '{"r": {"$meta": 1}}');
+
 SELECT documentdb_api.create_collection('text_meta_state_db', 'docs');
 
 SELECT documentdb_api_internal.create_indexes_non_concurrently(

@@ -49,3 +49,15 @@ SELECT COUNT(*) FROM bsonsequence_get_bson(('{ "": [ ' || rtrim(REPEAT('{ "a": 1
    100
 (1 row)
 
+-- sequences whose documents end exactly 5 bytes before a power-of-two buffer boundary must not write past their allocation.
+SELECT length(s::bytea), (SELECT COUNT(*) FROM bsonsequence_get_bson(s))
+FROM (SELECT ('{ "": [ { "a": "' || repeat('x', n) || '" }' || repeat(', { }', k) || ' ] }')::bsonsequence AS s
+      FROM (VALUES (46, 1), (46, 2), (41, 2), (110, 1)) AS t(n, k)) q;
+ length | count 
+---------------------------------------------------------------------
+     64 |     2
+     69 |     3
+     64 |     3
+    128 |     2
+(4 rows)
+

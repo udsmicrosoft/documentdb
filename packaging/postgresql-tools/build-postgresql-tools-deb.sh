@@ -150,6 +150,11 @@ set -e
 
 case "$1" in
     configure)
+        # $2 is the previously configured version; the command list is for a first install.
+        if [ -n "${2:-}" ]; then
+            echo "DocumentDB PostgreSQL administrator tools upgraded."
+            exit 0
+        fi
         echo "DocumentDB PostgreSQL administrator tools installed."
         echo ""
         echo "Available commands:"

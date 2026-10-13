@@ -38,6 +38,18 @@ COPY . /build
 
 WORKDIR /build/pg_documentdb_gw
 
+# `documentdb-gateway --version` prints the Cargo version, so stamp it like the
+# package builds do (packaging/documentdb-version.sh). Unstamped local
+# builds keep 0.1.0. The ARG is declared here, not at the top of the stage, so
+# a version change does not invalidate the toolchain layers above.
+ARG DOCUMENTDB_VERSION=unknown
+RUN if [ -n "${DOCUMENTDB_VERSION}" ] && [ "${DOCUMENTDB_VERSION}" != "unknown" ]; then \
+        cargo_version="$(. ../packaging/documentdb-version.sh && documentdb_cargo_version "${DOCUMENTDB_VERSION}")" && \
+        echo "${cargo_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$' || { echo "ERROR: DOCUMENTDB_VERSION '${DOCUMENTDB_VERSION}' is not a release version Cargo can carry" >&2; exit 1; } && \
+        sed -i -E "s/^version = \".*\"/version = \"${cargo_version}\"/" Cargo.toml && \
+        grep -Eq "^version = \"${cargo_version}\"$" Cargo.toml; \
+    fi
+
 RUN CARGO_MANIFEST_DIR=/build/pg_documentdb_gw cargo build --profile=release-with-symbols -p documentdb_gateway
 
 # Install mongosh in a throwaway stage so the final image only copies the runtime files.
@@ -64,7 +76,7 @@ COPY ${DEB_PACKAGE_REL_PATH} /tmp/install_setup/
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates locales sudo wget gnupg2 lsb-release jq openssl lsof netcat-openbsd && \
+    ca-certificates locales sudo wget gnupg2 lsb-release jq openssl lsof netcat-openbsd curl && \
     echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && \
     locale-gen && \
     install -d -m 0755 /etc/apt/keyrings && \
@@ -89,6 +101,11 @@ RUN apt-get update && \
     echo "%sudo ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/no-pass-ask && \
     apt-get purge -y wget gnupg2 lsb-release && \
     apt-get autoremove -y && \
+    # Date operators accept EST, MST, ...; Debian 13 / Ubuntu 26.04 moved them to tzdata-legacy.
+    if [ ! -e /usr/share/zoneinfo/EST ]; then \
+        apt-get install -y --no-install-recommends tzdata-legacy; \
+    fi && \
+    test -e /usr/share/zoneinfo/EST && \
     rm -rf \
     /etc/apt/keyrings/pgdg.asc \
     /etc/apt/sources.list.d/pgdg.list \
@@ -132,6 +149,7 @@ ENV CERT_PATH="" \
     DATA_PATH="/data" \
     DOCUMENTDB_PORT="10260" \
     ENABLE_TELEMETRY="false" \
+    DOCUMENTDB_USAGE_TELEMETRY="true" \
     LOG_LEVEL="info" \
     USERNAME="default_user" \
     CREATE_USER="true" \
@@ -161,12 +179,20 @@ COPY pg_documentdb_gw/SetupConfiguration.json /home/documentdb/gateway/pg_docume
 COPY scripts/start_oss_server.sh /home/documentdb/gateway/scripts/start_oss_server.sh
 COPY scripts/build_and_start_gateway.sh /home/documentdb/gateway/scripts/build_and_start_gateway.sh
 COPY documentdb-local/scripts/emulator_entrypoint.sh /home/documentdb/gateway/scripts/emulator_entrypoint.sh
+COPY documentdb-local/scripts/documentdb_claim_data_directory.sh /home/documentdb/gateway/scripts/documentdb_claim_data_directory.sh
 COPY documentdb-local/scripts/documentdb_local_settings.sh /home/documentdb/gateway/scripts/documentdb_local_settings.sh
 COPY documentdb-local/scripts/documentdb_validate_username.sh /home/documentdb/gateway/scripts/documentdb_validate_username.sh
 COPY documentdb-local/scripts/documentdb_install_getparameter_stub.sh /home/documentdb/gateway/scripts/documentdb_install_getparameter_stub.sh
 COPY documentdb-local/scripts/documentdb_prepare_data_directory.sh /home/documentdb/gateway/scripts/documentdb_prepare_data_directory.sh
 COPY documentdb-local/scripts/documentdb_report_extended_rum.sh /home/documentdb/gateway/scripts/documentdb_report_extended_rum.sh
+COPY documentdb-local/scripts/usage_telemetry.sh /home/documentdb/gateway/scripts/usage_telemetry.sh
 COPY documentdb-local/scripts/healthcheck.sh /home/documentdb/gateway/scripts/healthcheck.sh
+# The usage-telemetry disclosure ships inside the image. Telemetry is on by
+# default, so the document describing it has to be readable from the container
+# itself rather than only from a URL: an air-gapped or offline deployment
+# cannot fetch the GitHub copy, and that is exactly where an operator is most
+# likely to want to read it before deciding whether to opt out.
+COPY documentdb-local/PRIVACY.md /home/documentdb/PRIVACY.md
 COPY scripts/utils.sh /home/documentdb/gateway/scripts/utils.sh
 COPY scripts/preload_libraries.sh /home/documentdb/gateway/scripts/preload_libraries.sh
 COPY scripts/setup_psqlrc.sh /home/documentdb/gateway/scripts/setup_psqlrc.sh
@@ -242,11 +268,12 @@ RUN v="$(dpkg-query -W -f='${Version}' "postgresql-${POSTGRES_VERSION}-documentd
         && [ -n "$v" ] \
         || { echo "ERROR: cannot resolve the installed postgresql-${POSTGRES_VERSION}-documentdb version; /version.txt would misreport this build" >&2; exit 1; }; \
     if [ "${DOCUMENTDB_VERSION}" != "unknown" ] \
-        && [ "$(printf '%s' "${DOCUMENTDB_VERSION}" | tr - .)" != "$(printf '%s' "$v" | tr - .)" ]; then \
+        && [ "$(printf '%s' "${DOCUMENTDB_VERSION}" | tr '~-' '..')" != "$(printf '%s' "$v" | tr '~-' '..')" ]; then \
         echo "ERROR: DOCUMENTDB_VERSION build arg '${DOCUMENTDB_VERSION}' does not match the installed package version '$v'" >&2; exit 1; \
     fi; \
+    # A release candidate's package is 1.0~rc2; users see 1.0-rc2.
     printf '%s (commit %s, built %s, postgresql %s)\n' \
-        "$v" "${GIT_COMMIT}" "${BUILD_DATE:-unknown}" "${POSTGRES_VERSION}" \
+        "$(printf '%s' "$v" | tr '~' '-')" "${GIT_COMMIT}" "${BUILD_DATE:-unknown}" "${POSTGRES_VERSION}" \
     | sudo tee /version.txt >/dev/null
 
 # Built-in health probe: healthy once the entrypoint finished initialization,

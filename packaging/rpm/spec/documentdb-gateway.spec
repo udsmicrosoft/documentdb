@@ -121,6 +121,11 @@ chmod 0644 %{buildroot}/etc/documentdb/gateway/SetupConfiguration.json
 # already leads with the recommended documentdb-setup, so the extra
 # Workflow-B block is verbose, not contradictory. See packaging-design.md
 # 11.4 item (t).
+# $1 is the number of installed copies: 2 or more on an upgrade.
+if [ "$1" -gt 1 ]; then
+    echo "DocumentDB Gateway upgraded."
+    exit 0
+fi
 echo "DocumentDB Gateway installed."
 echo ""
 echo "Configuration is taken from the environment first; the systemd unit"
@@ -131,16 +136,38 @@ echo "                       /usr/share/doc/documentdb-gateway/examples/gateway.
 echo "                       /etc/documentdb/gateway/gateway.env"
 echo "  sudoedit /etc/documentdb/gateway/gateway.env"
 echo ""
+# No --cluster here: that is Debian pg_wrapper only, and the right RHEL
+# coordinates depend on the port each major was given. A bare psql is correct
+# for the single-major case; the multi-major caveat is a separate advisory line
+# below, not an inline comment, because a '#' inside a backslash-continued
+# command comments out the continuation and truncates the pasted recipe.
+#
+# Both statements are required: documentdb-tune pins
+# alternate_index_handler_name='extended_rum' whenever the extended-RUM
+# extension is installed (the default here) and CASCADE does not pull it in, so
+# without it no new index can be built. Static copy of the recipe
+# documentdb-tools-lib.sh single-sources — this scriptlet cannot source that
+# library. Its flags match documentdb_create_extension_command's;
+# verify_install_banner_extension_hint in packaging/test_packages/test-gateway-
+# install-entrypoint-rpm.sh checks the statements, their order and the
+# BEGIN/COMMIT wrap, which is less than full equivalence with that renderer. Mirrors the DEB banner in
+# documentdb-local/maintainer-scripts/gateway/postinst.
 echo "Next: choose one workflow."
 echo "  * Workflow C (recommended): sudo dnf install documentdb && sudo documentdb-setup --admin-user admin"
 echo "  * Workflow B (gateway on top of an existing PG, replace <N> with the PG major such as 18):"
 echo "      sudo dnf install postgresql<N>-documentdb documentdb-postgresql-tools && \\"
 echo "        sudo documentdb-tune --pg-version <N> --pgdata /var/lib/pgsql/<N>/data --yes && \\"
 echo "        sudo systemctl restart postgresql-<N> && \\"
-echo "        sudo -u postgres psql -c 'CREATE EXTENSION documentdb CASCADE;' && \\"
+echo "        sudo -u postgres psql -d postgres -X -v ON_ERROR_STOP=1 \\"
+echo "          -c 'BEGIN;' \\"
+echo "          -c 'CREATE EXTENSION IF NOT EXISTS documentdb CASCADE;' \\"
+echo "          -c 'CREATE EXTENSION IF NOT EXISTS documentdb_extended_rum CASCADE;' \\"
+echo "          -c 'COMMIT;' && \\"
 echo "        sudo documentdb-register-gateway --target-postgres-instance <N>/main --admin-user admin --yes && \\"
 echo "        sudo systemctl reload postgresql-<N> && \\"
 echo "        sudo systemctl enable --now documentdb-gateway"
+echo "    If more than one PostgreSQL major runs on this host, add -p <port> to the"
+echo "    psql line so the extensions land in the instance you just tuned."
 echo "  See /usr/share/doc/documentdb-gateway/ and the packaging-design.md \"User workflows\" section."
 
 %preun
@@ -159,6 +186,41 @@ if [ "$1" -eq 0 ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/nu
             | awk '{print $1}'); do
         systemctl stop "${unit}" 2>/dev/null || true
     done
+elif [ "$1" -eq 0 ]; then
+    # No systemd: stop the gateways documentdb-setup recorded under nohup
+    # (start time and binary name must still match), or they keep serving from
+    # the erased binary. Like the systemd branch, never block the erase. Mirrors
+    # the DEB prerm; inline because the tools library may already be gone.
+    gw_alive() {
+        kill -0 "$1" 2>/dev/null || return 1
+        [ "$(awk '{n=split($0,a,")"); split(a[n],f," "); print f[1]}' "/proc/$1/stat" 2>/dev/null)" != "Z" ]
+    }
+    gw_left=""
+    for rec in /run/documentdb-gateway/gateway-*.pid; do
+        [ -r "${rec}" ] || continue
+        # Non-blocking bounded read: the gateway user can fill this directory with FIFOs or /dev/zero links.
+        line="$(dd if="${rec}" bs=256 count=1 iflag=nonblock 2>/dev/null | head -n 1)"
+        pid="$(printf '%s\n' "${line}" | awk '{print $1}')"
+        start="$(printf '%s\n' "${line}" | awk '{print $2}')"
+        case "${pid}" in ''|*[!0-9]*) pid=0 ;; esac
+        if [ "${pid}" -gt 1 ] && gw_alive "${pid}"; then
+            cur="$(awk '{n=split($0,a,")"); split(a[n],f," "); print f[20]}' "/proc/${pid}/stat" 2>/dev/null)"
+            argv0="$(tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | head -n 1)"
+            case "${argv0##*/}" in documentdb-gateway*|documentdb_gateway*) ;; *) argv0="" ;; esac
+            if [ -n "${argv0}" ] && { [ -z "${start}" ] || [ "${start}" = "${cur}" ]; }; then
+                echo "documentdb-gateway: stopping the gateway started without systemd (pid ${pid})."
+                kill "${pid}" 2>/dev/null || true
+                i=0
+                while [ "${i}" -lt 50 ] && gw_alive "${pid}"; do sleep 0.2; i=$((i + 1)); done
+                if gw_alive "${pid}"; then kill -KILL "${pid}" 2>/dev/null || true; sleep 1; fi
+                if gw_alive "${pid}"; then gw_left="${gw_left} ${pid}"; continue; fi
+            fi
+        fi
+        rm -f "${rec}" 2>/dev/null || true
+    done
+    if [ -n "${gw_left}" ]; then
+        echo "documentdb-gateway: warning: gateway pid(s)${gw_left} still run from the erased files; kill them." >&2
+    fi
 fi
 
 %postun

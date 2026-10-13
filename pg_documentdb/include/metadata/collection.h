@@ -16,6 +16,7 @@
 #include <utils/uuid.h>
 #include <utils/array.h>
 
+#include "collation/collation.h"
 #include "io/bson_core.h"
 
 
@@ -93,6 +94,9 @@ typedef struct MongoCollectionOptions
 
 	/* Whether planner statistics are enabled for this collection */
 	bool statsEnabled;
+
+	/* Canonical collation used during execution */
+	char collationString[MAX_ICU_COLLATION_LENGTH];
 } MongoCollectionOptions;
 
 
@@ -243,8 +247,14 @@ bool TryGetCollectionIdByRelationOid(Oid relationId, uint64 *collectionId,
 /* get OID of data table (documents_*) table by collection id */
 Oid GetRelationIdForCollectionId(uint64 collectionId, LOCKMODE lockMode);
 
-/* c-wrapper for create_collection() */
-bool CreateCollection(Datum dbNameDatum, Datum collectionNameDatum);
+/*
+ * c-wrapper for create_collection().
+ *
+ * canUseLibPq tells the privilege check layer whether the creation may be
+ * carried on a connection of its own, committing before the caller continues.
+ * Only a caller that can tolerate that may pass true.
+ */
+bool CreateCollection(Datum dbNameDatum, Datum collectionNameDatum, bool canUseLibPq);
 
 /* c-wrapper for rename_collection() */
 void RenameCollection(Datum dbNameDatum, Datum srcCollectionNameDatum, Datum

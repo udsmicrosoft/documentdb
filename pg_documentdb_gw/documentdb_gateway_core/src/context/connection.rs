@@ -17,7 +17,7 @@ use tokio::time::{Duration, Instant};
 use uuid::{Builder, Uuid};
 
 use crate::{
-    auth::AuthState,
+    auth::UserAuthState,
     configuration::DynamicConfiguration,
     context::{
         session::SessionKey, Cursor, CursorId, CursorKey, CursorRef, CursorStoreEntry,
@@ -26,6 +26,7 @@ use crate::{
     error::Result,
     postgres::conn_mgmt::{Connection, PgPoolSettings},
     security::principal::Principal,
+    service::TlsProvider,
     telemetry::TelemetryProvider,
 };
 
@@ -34,7 +35,6 @@ pub struct ConnectionContext {
     pub start_time: Instant,
     pub connection_id: Uuid,
     pub service_context: Arc<ServiceContext>,
-    pub auth_state: AuthState,
     pub requires_response: bool,
     pub client_information: Option<RawDocumentBuf>,
     pub transaction: Option<(LogicalSessionId, TransactionNumber)>,
@@ -44,6 +44,13 @@ pub struct ConnectionContext {
     pub ssl_protocol: String,
     transport_protocol: String,
     connection_id_hash: i32,
+    user: UserAuthState,
+    /// Thumbprint of the certificate captured on the TLS handshake; `None` for plaintext.
+    server_certificate_thumbprint: Option<String>,
+    /// Time of the last rotation check, used to rate-limit checks.
+    last_cert_rotation_check: Option<Instant>,
+    /// Set once a graceful closure has been sent so the loop closes after the response.
+    close_after_response: bool,
 }
 
 impl ConnectionContext {
@@ -68,11 +75,16 @@ impl ConnectionContext {
             .map(|tls| tls.version_str().to_owned())
             .unwrap_or_default();
 
+        // Capture the handshake certificate (TLS only) so rotation detection
+        // compares against the cert this connection actually negotiated.
+        let server_certificate_thumbprint = tls_config
+            .and_then(SslRef::certificate)
+            .and_then(TlsProvider::certificate_thumbprint);
+
         Self {
             start_time: Instant::now(),
             connection_id,
             service_context: Arc::new(service_context),
-            auth_state: AuthState::new(),
             requires_response: true,
             client_information: None,
             transaction: None,
@@ -82,6 +94,10 @@ impl ConnectionContext {
             ssl_protocol,
             transport_protocol,
             connection_id_hash: Self::get_uuid_hash(connection_id),
+            user: UserAuthState::default(),
+            server_certificate_thumbprint,
+            last_cert_rotation_check: None,
+            close_after_response: false,
         }
     }
 
@@ -242,8 +258,13 @@ impl ConnectionContext {
     /// # Errors
     ///
     /// Returns an error if the operation fails.
-    pub fn allocate_data_pool(&mut self, password: &str) -> Result<()> {
-        let username = self.auth_state.username()?;
+    pub fn set_authenticated_user(
+        &mut self,
+        mut user: UserAuthState,
+        password: &str,
+    ) -> Result<()> {
+        let username = user.principal()?.name();
+
         let settings = PgPoolSettings::from_configuration(
             self.service_context.dynamic_configuration().as_ref(),
         );
@@ -251,13 +272,77 @@ impl ConnectionContext {
         self.service_context
             .connection_pool_manager()
             .allocate_data_pool_with_settings(username, password, settings)?;
-        self.auth_state.set_data_pool_settings(settings);
+
+        user.set_data_pool_settings(settings);
+        self.user = user;
+
         Ok(())
     }
 
     #[must_use]
     pub fn dynamic_configuration(&self) -> Arc<dyn DynamicConfiguration> {
         self.service_context.dynamic_configuration()
+    }
+
+    /// Returns `true` when the server certificate has rotated since this
+    /// connection was established, flagging it to close after its response. The
+    /// check is rate-limited to once per `connectionGracefulClosureIntervalSec`.
+    #[must_use]
+    pub fn cert_rotation_requires_graceful_closure(&mut self) -> bool {
+        let configuration = self.dynamic_configuration();
+        if !configuration.enable_graceful_closure_on_cert_rotation() {
+            return false;
+        }
+
+        let Some(established_thumbprint) = self.server_certificate_thumbprint.clone() else {
+            return false;
+        };
+
+        let interval =
+            Duration::from_secs(configuration.connection_graceful_closure_interval_sec());
+        let now = Instant::now();
+        if let Some(last_check) = self.last_cert_rotation_check {
+            if now.duration_since(last_check) < interval {
+                return false;
+            }
+        }
+        self.last_cert_rotation_check = Some(now);
+
+        let current_thumbprint = self
+            .service_context
+            .tls_provider()
+            .current_certificate_thumbprint();
+
+        match current_thumbprint {
+            Some(current) if current != established_thumbprint => {
+                tracing::warn!(
+                    connection_id = %self.connection_id,
+                    "Graceful closure needed because of certificate rotation."
+                );
+                self.close_after_response = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns `true` when the connection loop should close after this response.
+    #[must_use]
+    pub const fn close_after_response(&self) -> bool {
+        self.close_after_response
+    }
+
+    /// Records the certificate thumbprint captured on this connection's TLS
+    /// handshake. Used by the v2 runtime, which builds the context after the
+    /// handshake completes.
+    pub fn set_server_certificate_thumbprint(&mut self, thumbprint: Option<String>) {
+        self.server_certificate_thumbprint = thumbprint;
+    }
+
+    #[cfg(test)]
+    pub fn set_server_certificate_thumbprint_for_test(&mut self, thumbprint: Option<String>) {
+        self.server_certificate_thumbprint = thumbprint;
+        self.last_cert_rotation_check = None;
     }
 
     /// Generates a per-request activity ID by embedding the given `request_id`
@@ -308,5 +393,35 @@ impl ConnectionContext {
         connection_id.hash(&mut hasher);
         let finished_hash = hasher.finish();
         ((finished_hash ^ (finished_hash >> 32)) & 0x7fff_ffff) as i32
+    }
+
+    #[must_use]
+    pub const fn user(&self) -> &UserAuthState {
+        &self.user
+    }
+
+    pub fn update_user_expiration_status(&mut self) {
+        self.user.update_expiration_status();
+    }
+
+    pub const fn user_mut(&mut self) -> &mut UserAuthState {
+        &mut self.user
+    }
+
+    pub fn set_user(&mut self, user: UserAuthState) {
+        self.user = user;
+    }
+
+    pub fn begin_authentication(&mut self, scheme: &str) {
+        let reauthentication_principal = self.user.reauthentication_principal().cloned();
+        self.set_user(UserAuthState::begin(scheme, reauthentication_principal));
+    }
+
+    pub fn clear_user(&mut self) {
+        self.user = UserAuthState::default();
+    }
+
+    pub fn clear_failed_authentication(&mut self) {
+        self.user.clear_failed_attempt();
     }
 }

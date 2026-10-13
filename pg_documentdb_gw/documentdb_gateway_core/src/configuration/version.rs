@@ -73,3 +73,38 @@ impl Version {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_versions_have_consistent_representations() {
+        let cases = [
+            ("4.2", "4.2.0", [4, 2, 0, 0], 8),
+            ("5.0", "5.0.0", [5, 0, 0, 0], 13),
+            ("6.0", "6.0.0", [6, 0, 0, 0], 17),
+            ("7.0", "7.0.0", [7, 0, 0, 0], 21),
+            ("8.0", "8.0.0", [8, 0, 0, 0], 25),
+        ];
+
+        for (input, display, array, max_wire_protocol) in cases {
+            let version = Version::parse(input).expect("supported version should parse");
+
+            assert_eq!(version.as_str(), display);
+            assert_eq!(version.as_array(), array);
+            assert_eq!(version.max_wire_protocol(), max_wire_protocol);
+            assert_eq!(
+                version.as_bson_array().as_bytes(),
+                RawArrayBuf::from_iter(array).as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_versions_do_not_parse() {
+        for version in ["", "4", "4.0", "4.2.0", "9.0"] {
+            assert!(Version::parse(version).is_none());
+        }
+    }
+}

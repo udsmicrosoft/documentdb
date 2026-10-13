@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_otel/src/lib.rs
  *
@@ -16,10 +17,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[cfg(feature = "postgres-sql-commenter")]
-use documentdb_gateway_core::telemetry::sql_commenter::{
-    install_sql_commenter_hook, SqlCommenterHook,
-};
 use documentdb_gateway_core::{
     error::{DocumentDBError, Result},
     telemetry::{
@@ -64,8 +61,8 @@ impl TelemetryManager {
     ///
     /// # Errors
     ///
-    /// Returns an error for reserved resource attributes, exporter construction
-    /// failures, or failure to install the global metrics recorder.
+    /// Returns an error for invalid configuration, reserved resource attributes,
+    /// exporter construction, or failure to install the global metrics recorder.
     pub fn init_telemetry(
         options: Option<&serde_json::Value>,
         attributes: Option<HashMap<String, String>>,
@@ -101,10 +98,6 @@ impl TelemetryManager {
             global::set_tracer_provider(provider.clone());
             global::set_text_map_propagator(TraceContextPropagator::new());
             let _ = install_trace_context_bridge(&OTEL_TRACE_CONTEXT_BRIDGE);
-            #[cfg(feature = "postgres-sql-commenter")]
-            if config.tracing().sql_commenter_enabled() {
-                let _ = install_sql_commenter_hook(&OTEL_SQL_COMMENTER_HOOK);
-            }
         }
 
         Ok(Self {
@@ -289,37 +282,6 @@ fn create_tracer_provider(
 struct OpenTelemetryTraceContextBridge;
 
 static OTEL_TRACE_CONTEXT_BRIDGE: OpenTelemetryTraceContextBridge = OpenTelemetryTraceContextBridge;
-
-#[cfg(feature = "postgres-sql-commenter")]
-#[derive(Debug)]
-struct OpenTelemetrySqlCommenterHook;
-
-#[cfg(feature = "postgres-sql-commenter")]
-static OTEL_SQL_COMMENTER_HOOK: OpenTelemetrySqlCommenterHook = OpenTelemetrySqlCommenterHook;
-
-#[cfg(feature = "postgres-sql-commenter")]
-impl SqlCommenterHook for OpenTelemetrySqlCommenterHook {
-    fn current_comment(&self) -> Option<String> {
-        let context = tracing::Span::current().context();
-        let span = context.span();
-        let span_context = span.span_context();
-        if !span_context.is_valid() || !span_context.is_sampled() {
-            return None;
-        }
-
-        Some(format_traceparent_comment(span_context))
-    }
-}
-
-#[cfg(feature = "postgres-sql-commenter")]
-fn format_traceparent_comment(span_context: &SpanContext) -> String {
-    format!(
-        "/*traceparent='00-{}-{}-{:02x}'*/",
-        span_context.trace_id(),
-        span_context.span_id(),
-        span_context.trace_flags().to_u8()
-    )
-}
 
 impl TraceContextBridge for OpenTelemetryTraceContextBridge {
     fn set_parent(
@@ -685,28 +647,6 @@ mod tests {
         );
         assert_eq!(span_context.span_id().to_string(), "00f067aa0ba902b7");
         assert_eq!(span_context.trace_state(), &TraceState::default());
-    }
-
-    #[cfg(feature = "postgres-sql-commenter")]
-    #[test]
-    fn formats_sampled_traceparent_sql_comment() {
-        let span_context = SpanContext::new(
-            TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").expect("valid trace ID"),
-            SpanId::from_hex("b7ad6b7169203331").expect("valid span ID"),
-            TraceFlags::SAMPLED,
-            false,
-            TraceState::default(),
-        );
-        let comment = format_traceparent_comment(&span_context);
-
-        assert_eq!(
-            comment,
-            "/*traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01'*/"
-        );
-        assert!(!comment
-            .trim_start_matches("/*")
-            .trim_end_matches("*/")
-            .contains("*/"));
     }
 
     #[test]

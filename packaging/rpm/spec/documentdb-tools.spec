@@ -67,6 +67,11 @@ install -Dpm 0644 %{_sourcedir}/preload_libraries.sh %{buildroot}/usr/share/docu
 install -Dpm 0644 %{_sourcedir}/documentdb.conf.sample %{buildroot}/usr/share/doc/%{name}/examples/documentdb.conf.sample
 
 %post
+# $1 is the number of installed copies: 2 or more on an upgrade.
+if [ "$1" -gt 1 ]; then
+    echo "DocumentDB PostgreSQL administrator tools upgraded."
+    exit 0
+fi
 echo "DocumentDB PostgreSQL administrator tools installed."
 echo "Available commands:"
 echo "  documentdb-tune --pg-version N --cluster C --yes"

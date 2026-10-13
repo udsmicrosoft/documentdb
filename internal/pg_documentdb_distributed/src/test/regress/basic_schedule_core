@@ -45,7 +45,7 @@ test: bson_dollar_operators_negation_tests_runtime
 test: bson_dollar_operators_negation_tests_index
 test: bson_dollar_operators_negation_tests_explain_index
 test: bson_dollar_operators_negation_tests_explain_runtime
-test: bson_collation_query_tests_dist_runtime bson_collation_operators_tests_dist_runtime
+test: bson_collation_collection_find_distinct_count_tests_dist bson_collation_collection_cursor_tests_dist bson_collation_query_tests_dist_runtime bson_collation_operators_tests_dist_runtime
 test: bson_collation_query_tests_dist_index bson_collation_operators_tests_dist_index
 test: bson_collation_query_tests_dist_explain_index bson_collation_operators_tests_dist_explain_index bson_collation_query_tests_dist_explain_runtime bson_collation_operators_tests_dist_explain_runtime
 # we want to test BsonAggValue type I/O functions (which uses _send/_receive with pg18+citus14)
@@ -54,6 +54,7 @@ test: bson_aggregate_group_transition_combine_sharded
 test: bson_aggregate_group_firstlast_sharded!PG18_OR_HIGHER!
 test: bson_aggregation_pipeline_tests_sumavg_sharded
 test: bson_collation_aggregation_group_tests_dist
+test: bson_collation_collection_aggregate_tests_dist!PG16_OR_HIGHER!
 # This test is only run with pg17+ as EXPLAIN is broken for distributed scenario on older citus versions (known citus bug handling the cstring version)
 test: bson_aggregate_group_firstlast_explain_sharded!PG18_OR_HIGHER!
 
@@ -161,7 +162,7 @@ test: command_shard_commands
 test: bson_query_operator_pfe_index_pushdown bson_regex_object_id_pushdown_tests
 
 # Adhoc Query optimization tests
-test: bson_query_operator_in_opt
+test: bson_query_operator_in_opt dynamic_cursor_sharded_skip_limit_tests
 
 # Test is not great with concurrency with the way connections are managed and shard queries
 test: cursors_seqscan_sharded
@@ -186,3 +187,5 @@ test: bson_distributed_mem_vtable_palloc_test
 
 test: command_bulk_write
 test: retryable_writes_local_table
+# Creates a test function and changes execution settings for the session.
+test: bson_document_size_tests_dist

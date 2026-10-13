@@ -15,6 +15,7 @@
 #include <nodes/extensible.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
+#include <nodes/supportnodes.h>
 #include <nodes/tidbitmap.h>
 #include <access/htup_details.h>
 #include <access/heapam.h>
@@ -210,7 +211,7 @@ static Path * GeneratePathFromContinuation(ParsedContinuationState *tempState,
 										   RangeTblEntry *rte,
 										   PathTarget *baseRelPathTarget,
 										   ReplaceExtensionFunctionContext *indexContext);
-static void WriteContinuationBasedOnScanTypeAndState(ScanState *ps, pgbson_writer *writer,
+static bool WriteContinuationBasedOnScanTypeAndState(ScanState *ps, pgbson_writer *writer,
 													 QueryScanType scanType);
 static void AddOrderByRequiredClausesIfNecessary(IndexPath *indexPath, PlannerInfo *root,
 												 RelOptInfo *rel);
@@ -223,12 +224,12 @@ static bool PathProvidesRequiredStreamingOrder(PlannerInfo *root, Path *path);
 static bool IsFindProjectionWrapper(PlannerInfo *root);
 
 PG_FUNCTION_INFO_V1(command_cursor_tracker);
+PG_FUNCTION_INFO_V1(command_cursor_tracker_support);
 
 extern bool EnableRumCursorDynamicIndexScans;
 extern bool EnableRumDynamicIndexScansSkipToTid;
 extern bool EnableOrderByIdOnCostFunction;
 extern bool EnableMergeSortForInPrefix;
-extern bool EnableDynamicPersistentCursorsWithStats;
 extern bool EnableGroupByDynamicStreaming;
 extern bool EnableDynamicCursorMultiKeyBitmap;
 
@@ -273,6 +274,37 @@ command_cursor_tracker(PG_FUNCTION_ARGS)
 }
 
 
+Datum
+command_cursor_tracker_support(PG_FUNCTION_ARGS)
+{
+	Node *supportRequest = (Node *) PG_GETARG_POINTER(0);
+
+	/*
+	 * The planner removes this marker, so it must not affect cardinality or cost.
+	 */
+	if (IsA(supportRequest, SupportRequestSelectivity))
+	{
+		SupportRequestSelectivity *request =
+			(SupportRequestSelectivity *) supportRequest;
+
+		request->selectivity = 1.0;
+		PG_RETURN_POINTER(request);
+	}
+
+	if (IsA(supportRequest, SupportRequestCost))
+	{
+		SupportRequestCost *request =
+			(SupportRequestCost *) supportRequest;
+
+		request->per_tuple = 1e-9;
+		request->startup = 0;
+		PG_RETURN_POINTER(request);
+	}
+
+	PG_RETURN_POINTER(NULL);
+}
+
+
 /*
  * Registers any custom nodes that the Extension Scan produces.
  * This is for any items present in the custom_private field.
@@ -311,6 +343,20 @@ IsStreamableGroupingPlan(Plan *plan)
 
 
 bool
+IsDynamicCursorCustomPath(CustomPath *path)
+{
+	if (strcmp(path->methods->CustomName,
+			   DynamicExtensionCursorScanMethods.CustomName) == 0 &&
+		path->methods == &DynamicExtensionCursorScanMethods)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+
+bool
 IsDynamicCustomScanPath(Plan *plan, bool allowOffsetLimitNode)
 {
 	CHECK_FOR_INTERRUPTS();
@@ -318,9 +364,22 @@ IsDynamicCustomScanPath(Plan *plan, bool allowOffsetLimitNode)
 	if (IsA(plan, CustomScan))
 	{
 		CustomScan *scan = (CustomScan *) plan;
-		return strcmp(scan->methods->CustomName,
-					  DynamicExtensionCursorScanMethods.CustomName) == 0 &&
-			   scan->methods == &ExtensionCursorScanMethods;
+		if (strcmp(scan->methods->CustomName,
+				   DynamicExtensionCursorScanMethods.CustomName) == 0 &&
+			scan->methods == &ExtensionCursorScanMethods)
+		{
+			return true;
+		}
+
+		/* We support custom distinct scan as a parent */
+		if (IsCustomDistinctScanPath(scan))
+		{
+			Plan *childPlan = GetCustomDistinctScanChildPlan(scan);
+			return childPlan != NULL &&
+				   IsDynamicCustomScanPath(childPlan, allowOffsetLimitNode);
+		}
+
+		return false;
 	}
 
 	if (IsA(plan, SubqueryScan))
@@ -391,6 +450,18 @@ GetDynamicStreamingCustomScanState(PlanState *planState, bool *isGroupReadAhead)
 				   DynamicExtensionCursorScanMethods.CustomName) == 0)
 		{
 			return scanState;
+		}
+
+		/*
+		 * Descend through a distinct custom scan (see IsDynamicCustomScanPath).
+		 * Its child is registered in custom_ps rather than as an outer plan
+		 * state.
+		 */
+		PlanState *distinctChild = GetCustomDistinctScanChildState(scanState);
+		if (distinctChild != NULL)
+		{
+			return GetDynamicStreamingCustomScanState(distinctChild,
+													  isGroupReadAhead);
 		}
 
 		return NULL;
@@ -470,7 +541,14 @@ GetContinuationFromCustomScan(CustomScanState *scan)
 	const char *tableName = get_rel_name(cursorScanState->tableOid);
 	PgbsonWriterAppendUtf8(&writer, "tbl", 3, tableName);
 
-	WriteContinuationBasedOnScanTypeAndState(ps, &writer, cursorScanState->scanType);
+	bool hasValidContinuation =
+		WriteContinuationBasedOnScanTypeAndState(ps, &writer, cursorScanState->scanType);
+	if (!hasValidContinuation)
+	{
+		PgbsonWriterFree(&writer);
+		return NULL;
+	}
+
 	return PgbsonWriterGetPgbson(&writer);
 }
 
@@ -948,7 +1026,7 @@ WalkRelPathsAndCreateCustomPathsForFirstPage(PlannerInfo *root, RelOptInfo *rel,
 		customPlanPaths = lappend(customPlanPaths, customPath);
 	}
 
-	if (list_length(customPlanPaths) > 0 && EnableDynamicPersistentCursorsWithStats)
+	if (list_length(customPlanPaths) > 0)
 	{
 		/* If we created at least 1 streaming path and we have alternative paths to consider
 		 * add them to the global paths (see comment above about operator selectivity).
@@ -2121,7 +2199,7 @@ RecurseAndWriteBitmapContinuation(pgbson_array_writer *arrayWriter,
 }
 
 
-static void
+static bool
 WriteContinuationBasedOnScanTypeAndState(ScanState *ps, pgbson_writer *writer,
 										 QueryScanType scanType)
 {
@@ -2212,6 +2290,11 @@ WriteContinuationBasedOnScanTypeAndState(ScanState *ps, pgbson_writer *writer,
 
 			bytea *dedupState = NULL;
 			Datum currentKey = DocumentDBRumGetCurrentIndexKey(scanDesc, &dedupState);
+			if (currentKey == (Datum) 0)
+			{
+				return false;
+			}
+
 			bytea *buffer = DatumGetByteaP(currentKey);
 			bson_value_t bufferBinary = { 0 };
 			bufferBinary.value_type = BSON_TYPE_BINARY;
@@ -2260,6 +2343,8 @@ WriteContinuationBasedOnScanTypeAndState(ScanState *ps, pgbson_writer *writer,
 			break;
 		}
 	}
+
+	return true;
 }
 
 

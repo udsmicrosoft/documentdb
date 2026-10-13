@@ -19,3 +19,8 @@ SELECT bsonsequence_get_bson('{ "a": 1 }'::bson::bsonsequence);
 
 -- generate a long string and ensure we have the docs.
 SELECT COUNT(*) FROM bsonsequence_get_bson(('{ "": [ ' || rtrim(REPEAT('{ "a": 1, "b": 2 },', 100), ',') || ' ] }')::bsonsequence);
+
+-- sequences whose documents end exactly 5 bytes before a power-of-two buffer boundary must not write past their allocation.
+SELECT length(s::bytea), (SELECT COUNT(*) FROM bsonsequence_get_bson(s))
+FROM (SELECT ('{ "": [ { "a": "' || repeat('x', n) || '" }' || repeat(', { }', k) || ' ] }')::bsonsequence AS s
+      FROM (VALUES (46, 1), (46, 2), (41, 2), (110, 1)) AS t(n, k)) q;

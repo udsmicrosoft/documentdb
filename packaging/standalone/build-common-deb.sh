@@ -109,6 +109,8 @@ install -m 0755 "${REPO_ROOT}/documentdb-local/scripts/documentdb_postgresql_ser
     "${PKG_DIR}/usr/share/documentdb/scripts/documentdb_postgresql_service.sh"
 install -m 0755 "${REPO_ROOT}/documentdb-local/scripts/init_documentdb_data.sh" \
     "${PKG_DIR}/usr/share/documentdb/scripts/init_documentdb_data.sh"
+install -m 0755 "${REPO_ROOT}/documentdb-local/scripts/documentdb_install_getparameter_stub.sh" \
+    "${PKG_DIR}/usr/share/documentdb/scripts/documentdb_install_getparameter_stub.sh"
 # init_documentdb_data.sh reads its defaults from this table beside it.
 install -m 0644 "${REPO_ROOT}/documentdb-local/scripts/documentdb_local_settings.sh" \
     "${PKG_DIR}/usr/share/documentdb/scripts/documentdb_local_settings.sh"
@@ -155,7 +157,7 @@ Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: ${DEB_MAINTAINER}
 Installed-Size: @INSTALLED_SIZE@
-Depends: documentdb-postgresql-tools (>= ${VERSION}), documentdb-gateway (>= ${VERSION}), jq
+Depends: documentdb-postgresql-tools (>= ${VERSION}), documentdb-gateway (>= ${VERSION}), jq, procps
 Replaces: documentdb-16, documentdb-17, documentdb-18
 Section: database
 Priority: optional

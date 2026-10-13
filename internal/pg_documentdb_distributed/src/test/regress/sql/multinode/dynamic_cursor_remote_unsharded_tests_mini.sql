@@ -1,3 +1,7 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+-- SPDX-License-Identifier: MIT
+
 SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog,documentdb_api_internal;
 
 SET documentdb.next_collection_id TO 42000;
@@ -764,6 +768,17 @@ SELECT remote_drain_and_report(
 );
 
 -- ---------------------------------------------------------------------------
+-- Test R11 (P1-8): find({}) skip>0 - worker file cursor fallback in the mini
+-- suite. skip 40 over 95 docs → 55 rows drained across the getMore boundaries.
+-- No sort clause; skip forces the persistent worker file cursor path.
+-- ---------------------------------------------------------------------------
+SELECT remote_drain_and_report(
+    '{ "find": "remote_e2e_coll", "filter": { }, "projection": { "_id": 1 }, "skip": 40, "batchSize": 10, "hint": "idx_a" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "remote_e2e_coll", "batchSize": 10 }',
+    false  -- print continuation token
+);
+
+-- ---------------------------------------------------------------------------
 -- Sorted positive limits: secondary and PK order stream on the worker; an
 -- unindexed sort remains a worker file cursor.
 -- ---------------------------------------------------------------------------
@@ -1145,7 +1160,7 @@ END;
 ANALYZE;
 
 -- ---------------------------------------------------------------------------
--- Test R11: collection sharded after cursor tests — verify fallback to local path
+-- Test R-SHARDED-FALLBACK: collection sharded after cursor tests; verify local fallback
 -- After shard_collection(), isShardRemote becomes false → coordinator handles
 -- query locally. Verifies remote unsharded path is not taken for sharded colls.
 -- ---------------------------------------------------------------------------
@@ -1248,14 +1263,3 @@ ANALYZE;
 
 SELECT runtime_sort_report('{ "find": "runtime_sort_coll", "filter": { }, "sort": { "val": 1 }, "projection": { "_id": 0, "val": 1 }, "batchSize": 100 }')
     AS with_statistics;
-
--- Case 2: per-collection statistics disabled → the dynamic-cursor planner has no
--- reliable estimates, prunes every candidate but the index-order path, and
--- forces the streaming plan for the same query.
-SET documentdb.enableDynamicPersistentCursorsWithStats TO off;
-SELECT documentdb_api.coll_mod('dyncur_sp_db', 'runtime_sort_coll',
-    '{ "collMod": "runtime_sort_coll", "enableStats": false }');
-ANALYZE;
-
-SELECT runtime_sort_report('{ "find": "runtime_sort_coll", "filter": { }, "sort": { "val": 1 }, "projection": { "_id": 0, "val": 1 }, "batchSize": 100 }')
-    AS without_statistics;

@@ -1,10 +1,25 @@
+### documentdb v1.2-0 (Unreleased) ###
+* Reject passwords that fail SASLprep in `createUser` and `updateUser` before creating or changing native users. *[Bugfix]* ([#765](https://github.com/documentdb/documentdb/issues/765))
+* Estimate the inner side of a `$lookup` join from collected statistics instead of a fixed fallback selectivity, so an index on the `foreignField` is costed correctly. Controlled by the default-on `documentdb.enable_lookup_join_selectivity_from_stats` setting. *[Perf]*
+* Support `timestamptz` values in `bson_build_document`, writing them as BSON dates with millisecond precision. *[Feature]*
+* Allow scalar leading-key distinct pushdown on multikey reduced-correlated indexes when `documentdb.enable_distinct_multi_key_sort_pushdown` is enabled. *[Perf]*
+* Support explicit command collation for `findAndModify`. *[Feature]*
+* Allow `_id` support-function predicates to prove eligible partial RUM index filters when `documentdb.enable_support_function_id_pushdown` is enabled, with the default-on `documentdb.enable_support_object_id_function_pfe_pushdown` setting independently controlling partial-index implication. *[Bugfix/Perf]*
+* Apply find, count, and distinct command stages after a view's terminal aggregation stage, preventing grouped views from producing invalid aggregate plans. *[Bugfix]*
+
 ### documentdb v1.1-0 (Unreleased) ###
+* Remove gateway SQLCommenter injection and its build feature while preserving gateway spans and incoming trace context. *[Refactor]*
+* Add a default-on `documentdb.enable_full_scan_cost_and_selectivity` setting to control full-scan planner estimates and synthetic execution cost. *[Perf]*
+* Allow `collMod` to rename an index when its key pattern and current name both match the catalog entry. *[Feature]*
 * Preserve `admin.system.users` system-catalog permission checks while filtering memberships to catalog-backed custom roles. *[Bugfix]*
 * Return custom-role metadata from `admin.system.roles` in `rolesInfo` and from `admin.system.users` in `usersInfo` and `connectionStatus`. Admin- and root-role users can list or inspect every catalog role, while other users can list or inspect roles they inherit directly or transitively; built-in roles remain excluded. *[Bugfix]*
 * Derive `$merge` target permissions from its configured actions instead of unconditionally requiring read, insert, and update, and avoid requiring update permission for `$out`'s insert-only query. *[Bugfix]*
 * Preserve UTF-8 string boundaries in trim expressions and string-to-binData conversions. *[Bugfix]*
+* Limit result string size for `$concat`. *[Bugfix]*
+* Reject non-string values resolved by `$meta` before accessing string data. *[Bugfix]*
 * Allow unfiltered `$sample` queries to be pushed down to a `Sample Scan` when a dynamic cursor marker is present. Guarded by the `enable_sample_scan_pushdown_for_dynamic_cursor` feature flag. *[Bugfix/Perf]*
 * Treat an explicit `simple` collation as no collation, emitting no collation tag so it uses binary comparison on every query and index path. *[Bugfix]*
+* Preserve sorting and grouping results when a null equality lies between compound-index sort keys. *[Bugfix]*
 * Prevent low-fill-factor rightmost RUM leaf splits from overflowing the right page when large index terms leave too little space under the requested split target. *[Bugfix]*
 * Retire the `enableSkipDottedFieldIndexTerms` feature flag and always skip index terms for non-array fields with dotted names. *[Refactor]*
 * Reclassify `isNativeAuthEnabled` as a long-term system configuration without changing its behavior or runtime name. *[Refactor]*
@@ -14,9 +29,10 @@
 * Enable the field-pruning `$project` injection before `$unwind` (the `enableProjectPushUpBeforeUnwindWithGroup` feature flag) by default now that it has stabilized. *[Perf]*
 * Fall back to a logical posting-tree sweep when inline RUM vacuum observes a concurrent root split, ensuring dead TIDs are removed from leaves allocated behind the disk-order cursor. *[Bugfix]*
 * Support collation with `distinct` command *[Feature]*
-* Apply per-update collation when selecting documents to update, including sharded routing and update-worker execution, while retaining binary comparison semantics inside update expressions. *[Feature]*
+* Apply per-update collation when selecting documents and evaluating comparison-sensitive update effects, including single-document, multi-document, and upsert paths. *[Feature]*
 * Prevent a backend crash by rejecting `$documents` directly inside a `$facet` sub-pipeline. *[Bugfix]*
 * Enforce `$facet` restrictions on `$collStats`, `$facet`, `$geoNear`, `$indexStats`, and `$planCacheStats` in nested `$lookup` and `$unionWith` pipelines while preserving parent-stage validation and valid collectionless pipelines. *[Bugfix]*
+* Reclaim orphaned empty RUM posting-tree leaves during vacuum cleanup when bulk deletion is skipped because the heap has no new dead tuples, and keep planner statistics consistent with entry-page and posting-page pruning. Guarded by the default-off `documentdb_rum.enable_vacuum_cleanup_posting_tree_pruning` setting. *[Bugfix/Perf]*
 * Reduce lock-manager pressure for dynamic cursor queries on heavily indexed collections by releasing planner-acquired `AccessShareLock`s for indexes not referenced by the final streamable plan immediately after planning. Guarded by the default-off `documentdb.enable_dynamic_cursor_early_index_lock_release` setting. *[Perf]*
 
 ### documentdb v1.0-0 (Unreleased) ###
@@ -40,7 +56,7 @@
 * Persist and manage custom roles through the data plane: `createRole`/`dropRole`/`rolesInfo` are backed by the roles catalog (keyed by role name). Guarded by `documentdb.enableRoleCrud` feature flag, disabled by default. *[Feature]*
 * Report `compact`'s `bytesFreed` as the measured reduction in on-disk size across the VACUUM instead of a statistics-based bloat estimate, and stop running the expensive bloat estimate query when no `freeSpaceTargetMB` was requested. *[Bugfix/Perf]*
 
-### documentdb v0.117-0 (Unreleased) ###
+### documentdb v0.117-0 (September 10, 2026) ###
 * Keep let-only single-document update selection stable when a cached candidate plan switches to generic execution. *[Bugfix]*
 * Reject embedded null characters in command namespaces when `documentdb.enable_null_collection_validation` is enabled. *[Bugfix]*
 * Reject NaN `$bucketAuto` group values when `granularity` is specified instead of reporting an internal preferred-number-series error. *[Bugfix]*

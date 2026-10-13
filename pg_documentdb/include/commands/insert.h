@@ -12,6 +12,7 @@
 
 #include <io/bson_core.h>
 #include "commands/commands_common.h"
+#include <executor/spi.h>
 
 MongoCollection * CreateCollectionForInsert(Datum databaseNameDatum,
 											Datum collectionNameDatum);
@@ -22,4 +23,10 @@ bool InsertOrReplaceDocument(MongoCollection *collection, const char *shardTable
 							 int64 shardKeyValue,
 							 pgbson *objectId, pgbson *document,
 							 const bson_value_t *updateSpecValue);
+Datum CompressBsonIfNeeded(Datum inputDatum);
+bool IsDocumentCompressionEligible(const char *shardTableName);
+int ExecuteSPIPlanWithCompressedDocument(SPIPlanPtr plan, Datum *argValues,
+										 Oid *argTypes, int argCount,
+										 int documentArgIndex, bool readOnly,
+										 long maxTupleCount);
 #endif

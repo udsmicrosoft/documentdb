@@ -33,6 +33,7 @@ typedef struct DistributedOidCacheData
 {
 	Oid CitusWorkerPartialAggOid;
 	Oid CitusWorkerBinaryPartialAggOid;
+	Oid CitusShardIdForDistributionColumnOid;
 } DistributedOidCacheData;
 
 
@@ -73,6 +74,29 @@ CitusWorkerBinaryPartialAggregateFunctionOid(void)
 	}
 
 	return OidCache.CitusWorkerBinaryPartialAggOid;
+}
+
+
+Oid
+CitusShardIdForDistributionColumnFunctionOid(void)
+{
+	InitializeDistributedOidCache();
+
+	if (OidCache.CitusShardIdForDistributionColumnOid == InvalidOid)
+	{
+		List *functionName = list_make2(
+			makeString("pg_catalog"),
+			makeString("get_shard_id_for_distribution_column"));
+
+		Oid argumentTypes[2] = { REGCLASSOID, ANYOID };
+		bool missingOk = false;
+
+		OidCache.CitusShardIdForDistributionColumnOid = LookupFuncName(functionName, 2,
+																	   argumentTypes,
+																	   missingOk);
+	}
+
+	return OidCache.CitusShardIdForDistributionColumnOid;
 }
 
 

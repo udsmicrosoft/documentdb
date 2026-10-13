@@ -55,6 +55,7 @@ typedef struct
 {
 	pgbson *keyPattern;
 	char *name;
+	char *newName;
 	bool hidden;
 	bool prepareUnique;
 	bool unique;
@@ -141,6 +142,9 @@ typedef enum CollModSpecFlags
 	/* reindex sub-option: regenerate index options/opclass settings on rebuild */
 	HAS_INDEX_OPTION_UPDATE_OPTIONS = 1 << 14,
 
+	/* Rename an index selected by both its name and key pattern */
+	HAS_INDEX_OPTION_NEW_NAME = 1 << 15,
+
 	/* TODO: More OPTIONS to follow */
 } CollModSpecFlags;
 
@@ -174,8 +178,7 @@ static pgbson * UpdateOperationKeyInIndexOptions(pgbson *indexOptions,
 static void UpdatePostgresIndex(uint64_t collectionId, int indexId, int operation, bool
 								value);
 static void UpdatePostgresIndexOverride(uint64_t collectionId, int indexId, int operation,
-										bool
-										value);
+										bool value, const char *indexNameSuffix);
 static void UpdatePostgresIndexesForHide(List *indexOids, bool hidden);
 static void UpdatePostgresIndexesForUnique(List *indexOids, bool unique);
 static void RegisterExclusionInPgIndexCatalog(Oid indexoid);
@@ -544,11 +547,36 @@ ParseSpecSetCollModOptions(const pgbson *collModSpec,
 									~HAS_INDEX_OPTION &
 									~HAS_INDEX_OPTION_NAME &
 									~HAS_INDEX_OPTION_KEYPATTERN;
+
+		if ((tmpFlags & HAS_INDEX_OPTION_NEW_NAME) != 0)
+		{
+			if ((specFlags & HAS_INDEX_OPTION_NAME) == 0 ||
+				(specFlags & HAS_INDEX_OPTION_KEYPATTERN) == 0)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
+								errmsg(
+									"collMod.index.newName requires both name and keyPattern")));
+			}
+
+			if (tmpFlags != HAS_INDEX_OPTION_NEW_NAME)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
+								errmsg(
+									"collMod.index.newName cannot be combined with other index options")));
+			}
+		}
+		else if ((specFlags & HAS_INDEX_OPTION_NAME) != 0 &&
+				 (specFlags & HAS_INDEX_OPTION_KEYPATTERN) != 0)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
+							errmsg("Both name and key pattern cannot be present")));
+		}
+
 		if (tmpFlags == 0)
 		{
 			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
 							errmsg(
-								"no expireAfterSeconds, hidden, prepareUnique or unique field")));
+								"no expireAfterSeconds, hidden, prepareUnique, unique, reindex or newName field")));
 		}
 
 		if ((tmpFlags & HAS_INDEX_OPTION_PREPARE_UNIQUE) != 0 &&
@@ -610,27 +638,24 @@ ParseIndexSpecSetCollModOptions(bson_iter_t *indexSpecIter,
 		{
 			EnsureTopLevelFieldType("collMod.index.keyPattern", indexSpecIter,
 									BSON_TYPE_DOCUMENT);
-			if (*specFlags & HAS_INDEX_OPTION_NAME)
-			{
-				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
-								errmsg(
-									"Both name and key pattern cannot be present")));
-			}
 			collModIndexOptions->keyPattern = PgbsonInitFromDocumentBsonValue(value);
 			*specFlags |= HAS_INDEX_OPTION_KEYPATTERN;
 		}
 		else if (strcmp(key, "name") == 0)
 		{
 			EnsureTopLevelFieldType("collMod.index.name", indexSpecIter, BSON_TYPE_UTF8);
-			if (*specFlags & HAS_INDEX_OPTION_KEYPATTERN)
-			{
-				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
-								errmsg(
-									"Both name and key pattern cannot be present")));
-			}
-			collModIndexOptions->name = palloc(value->value.v_utf8.len + 1);
-			strcpy(collModIndexOptions->name, value->value.v_utf8.str);
+			collModIndexOptions->name = pnstrdup(value->value.v_utf8.str,
+												 value->value.v_utf8.len);
 			*specFlags |= HAS_INDEX_OPTION_NAME;
+		}
+		else if (strcmp(key, "newName") == 0)
+		{
+			EnsureTopLevelFieldType("collMod.index.newName", indexSpecIter,
+									BSON_TYPE_UTF8);
+			ValidateIndexName(value);
+			collModIndexOptions->newName = pnstrdup(value->value.v_utf8.str,
+													value->value.v_utf8.len);
+			*specFlags |= HAS_INDEX_OPTION_NEW_NAME;
 		}
 		else if (strcmp(key, "hidden") == 0)
 		{
@@ -726,27 +751,47 @@ ModifyIndexSpecsInCollection(const MongoCollection *collection,
 {
 	StringInfo cmdStr = makeStringInfo();
 	bool searchWithName = *specFlags & HAS_INDEX_OPTION_NAME;
+	bool renameIndex = *specFlags & HAS_INDEX_OPTION_NEW_NAME;
 	appendStringInfo(cmdStr,
 					 "SELECT index_id, index_spec, index_is_valid "
 					 "FROM %s.collection_indexes "
-					 "WHERE collection_id = $2 AND ",
+					 "WHERE ",
 					 ApiCatalogSchemaName);
-	if (searchWithName)
+	if (renameIndex)
 	{
-		appendStringInfoString(cmdStr, "(index_spec).index_name = $1;");
+		appendStringInfo(cmdStr,
+						 "collection_id = $3 AND "
+						 "(index_spec).index_name = $1 AND "
+						 "(index_spec).index_key::%s OPERATOR(%s.=) $2::%s;",
+						 FullBsonTypeName, CoreSchemaName, FullBsonTypeName);
+	}
+	else if (searchWithName)
+	{
+		appendStringInfoString(cmdStr,
+							   "collection_id = $2 AND (index_spec).index_name = $1;");
 	}
 	else
 	{
 		appendStringInfo(cmdStr,
+						 "collection_id = $2 AND "
 						 "(index_spec).index_key::%s OPERATOR(%s.=) $1::%s;",
 						 FullBsonTypeName, CoreSchemaName, FullBsonTypeName);
 	}
 
-	int argCount = 2;
-	Oid argTypes[2];
-	Datum argValues[2];
+	int argCount = renameIndex ? 3 : 2;
+	Oid argTypes[3];
+	Datum argValues[3];
 
-	if (searchWithName)
+	if (renameIndex)
+	{
+		argTypes[0] = TEXTOID;
+		argValues[0] = CStringGetTextDatum(indexOption->name);
+		argTypes[1] = BsonTypeId();
+		argValues[1] = PointerGetDatum(indexOption->keyPattern);
+		argTypes[2] = INT8OID;
+		argValues[2] = UInt64GetDatum(collection->collectionId);
+	}
+	else if (searchWithName)
 	{
 		argTypes[0] = TEXTOID;
 		argValues[0] = CStringGetTextDatum(indexOption->name);
@@ -757,8 +802,11 @@ ModifyIndexSpecsInCollection(const MongoCollection *collection,
 		argValues[0] = PointerGetDatum(indexOption->keyPattern);
 	}
 
-	argTypes[1] = INT8OID;
-	argValues[1] = UInt64GetDatum(collection->collectionId);
+	if (!renameIndex)
+	{
+		argTypes[1] = INT8OID;
+		argValues[1] = UInt64GetDatum(collection->collectionId);
+	}
 
 	/* all args are non-null */
 	char *argNulls = NULL;
@@ -775,9 +823,11 @@ ModifyIndexSpecsInCollection(const MongoCollection *collection,
 		/* No matching index found with the criteria */
 		ereport(ERROR,
 				(errcode(ERRCODE_DOCUMENTDB_INDEXNOTFOUND),
-				 errmsg("cannot find index %s for ns %s.%s",
-						searchWithName ? indexOption->name : PgbsonToJsonForLogging(
-							indexOption->keyPattern),
+				 errmsg("cannot find index %s%s%s for ns %s.%s",
+						searchWithName ? indexOption->name : "",
+						renameIndex ? " with key " : "",
+						searchWithName && !renameIndex ? "" :
+						PgbsonToJsonForLogging(indexOption->keyPattern),
 						collection->name.databaseName, collection->name.collectionName)));
 	}
 
@@ -798,6 +848,39 @@ ModifyIndexSpecsInCollection(const MongoCollection *collection,
 	bool hadOldTTL = false;
 
 	bool updateNeeded = false;
+
+	if (renameIndex)
+	{
+		if (!isIndexValid)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
+							errmsg("cannot rename an invalid index")));
+		}
+
+		if (strcmp(indexDetails.indexSpec.indexName, "_id_") == 0)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
+							errmsg("cannot rename the _id_ index")));
+		}
+
+		IndexSpec renamedIndexSpec = indexDetails.indexSpec;
+		renamedIndexSpec.indexName = indexOption->newName;
+		int inBuildIndexId = INVALID_INDEX_ID;
+		if (CheckIndexSpecConflictWithExistingIndexes(
+				collection->collectionId, &renamedIndexSpec, &inBuildIndexId,
+				indexDetails.indexId))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INDEXALREADYEXISTS),
+							errmsg("Identical index already exists: %s",
+								   indexOption->newName)));
+		}
+
+		if (strcmp(indexDetails.indexSpec.indexName, indexOption->newName) != 0)
+		{
+			indexDetails.indexSpec.indexName = indexOption->newName;
+			updateNeeded = true;
+		}
+	}
 
 	if ((*specFlags & HAS_INDEX_OPTION_EXPIRE_AFTER_SECONDS) ==
 		HAS_INDEX_OPTION_EXPIRE_AFTER_SECONDS)
@@ -1370,17 +1453,21 @@ UpdatePostgresIndex(uint64_t collectionId, int indexId, int operation, bool valu
 	}
 	else
 	{
+		const char *indexNameSuffix = NULL;
 		UpdatePostgresIndexWithOverride(collectionId, indexId, operation, value,
+										indexNameSuffix,
 										UpdatePostgresIndexOverride);
 	}
 }
 
 
 static void
-UpdatePostgresIndexOverride(uint64_t collectionId, int indexId, int operation, bool value)
+UpdatePostgresIndexOverride(uint64_t collectionId, int indexId, int operation, bool value,
+							const char *indexNameSuffix)
 {
 	bool ignoreMissingShards = false;
-	UpdatePostgresIndexCore(collectionId, indexId, operation, value, ignoreMissingShards);
+	UpdatePostgresIndexCoreWithSuffix(collectionId, indexId, operation, value,
+									  indexNameSuffix, ignoreMissingShards);
 }
 
 
@@ -1388,9 +1475,23 @@ void
 UpdatePostgresIndexCore(uint64_t collectionId, int indexId, IndexMetadataUpdateOperation
 						operation, bool value, bool ignoreMissingShards)
 {
+	const char *indexNameSuffix = NULL;
+	UpdatePostgresIndexCoreWithSuffix(collectionId, indexId, operation, value,
+									  indexNameSuffix,
+									  ignoreMissingShards);
+}
+
+
+void
+UpdatePostgresIndexCoreWithSuffix(uint64_t collectionId, int indexId,
+								  IndexMetadataUpdateOperation operation, bool value,
+								  const char *indexNameSuffix, bool ignoreMissingShards)
+{
 	/* First get the OID of the index */
 	char postgresIndexName[NAMEDATALEN] = { 0 };
-	pg_sprintf(postgresIndexName, DOCUMENT_DATA_TABLE_INDEX_NAME_FORMAT, indexId);
+	pg_snprintf(postgresIndexName, sizeof(postgresIndexName),
+				DOCUMENT_DATA_TABLE_INDEX_NAME_FORMAT "%s", indexId,
+				indexNameSuffix == NULL ? "" : indexNameSuffix);
 	Oid indexOid = get_relname_relid(postgresIndexName, ApiDataNamespaceOid());
 
 	List *indexOidList = NIL;

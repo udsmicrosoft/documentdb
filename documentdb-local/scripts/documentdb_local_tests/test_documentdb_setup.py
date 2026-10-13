@@ -1,9 +1,13 @@
 import re
+import secrets
 import shutil
 import shlex
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
+import urllib.parse
 import os
 from pathlib import Path
 
@@ -14,6 +18,7 @@ TUNE_SCRIPT = OSS_ROOT / "documentdb-local" / "scripts" / "documentdb-tune.sh"
 GATEWAY_SETUP_SCRIPT = OSS_ROOT / "documentdb-local" / "scripts" / "documentdb-register-gateway.sh"
 GATEWAY_ADMIN_SCRIPT = OSS_ROOT / "documentdb-local" / "scripts" / "documentdb-gateway-admin.sh"
 TOOLS_LIB = OSS_ROOT / "documentdb-local" / "scripts" / "documentdb-tools-lib.sh"
+PASSWORD_RULE = b"one non-empty line of printable ASCII"
 PRELOAD_LIB = OSS_ROOT / "scripts" / "preload_libraries.sh"
 
 
@@ -95,35 +100,27 @@ class DocumentDBSetupTests(unittest.TestCase):
         # install whose only admin failed every login with "Username is
         # invalid" — the gateway blocks the documentdb/citus/pg/
         # internal_role prefixes. Both the flag path and the interactive
-        # prompt must consult the gateway's own policy, in argument
-        # validation, before anything is mutated.
-        lib = (OSS_ROOT / "documentdb-local" / "scripts"
-               / "documentdb-tools-lib.sh").read_text(encoding="utf-8")
-        self.assertIn(
-            "documentdb_validate_gateway_username()",
-            lib,
-            "the shared library must provide the gateway username validator",
-        )
+        # prompt now go through one shared policy, before the dry-run
+        # preview and before anything is mutated.
+        lib = TOOLS_LIB.read_text(encoding="utf-8")
+        self.assertIn("documentdb_validate_gateway_username()", lib)
         self.assertIn("BlockedRolePrefixes", lib)
+        policy = re.search(
+            r"^documentdb_validate_username\(\)\s*\{(?P<body>.*?)^\}",
+            lib,
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(policy, "the shared username policy is missing")
+        self.assertIn("documentdb_validate_gateway_username", policy.group("body"),
+                      "the shared policy must keep the gateway's prefix check")
 
         script = SETUP_SCRIPT.read_text(encoding="utf-8")
-        self.assertGreaterEqual(
-            script.count("documentdb_validate_gateway_username"), 2,
-            "both the --admin-user flag path and the interactive prompt "
-            "must validate the username",
-        )
-        match = re.search(
-            r"validate_required_arguments\(\)\s*\{(?P<body>.*?)\n\}",
-            script,
-            flags=re.DOTALL,
-        )
-        self.assertIsNotNone(match)
-        self.assertIn(
-            "documentdb_validate_gateway_username",
-            match.group("body"),
-            "validation must happen in validate_required_arguments, before "
-            "any host mutation",
-        )
+        main = re.search(r"^main\(\)\s*\{(?P<body>.*?)^\}", script,
+                         flags=re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(main)
+        body = main.group("body")
+        self.assertEqual(body.count('documentdb_validate_username "${USERNAME}"'), 1,
+                         "one call covers both the flag and the prompt")
 
         admin = GATEWAY_ADMIN_SCRIPT.read_text(encoding="utf-8")
         create = re.search(
@@ -133,11 +130,11 @@ class DocumentDBSetupTests(unittest.TestCase):
         )
         self.assertIsNotNone(create)
         body = create.group("body")
-        self.assertIn("documentdb_validate_gateway_username", body)
+        self.assertIn("documentdb_validate_username", body)
         # The check must precede the dry-run early return so a preview
         # reports the same refusal an apply would.
         self.assertLess(
-            body.index("documentdb_validate_gateway_username"),
+            body.index("documentdb_validate_username"),
             body.index('"${DRY_RUN}" == "true"'),
             "create-user must validate before the dry-run branch",
         )
@@ -542,6 +539,290 @@ class DocumentDBSetupTests(unittest.TestCase):
             "preflight must reject brownfield adoption when the delegated "
             "tools are missing",
         )
+
+
+class InputValidationContractTests(unittest.TestCase):
+    """One username policy and one password-file contract for every entry
+    point (documentdb/documentdb#731): a name PostgreSQL truncates or
+    reserves, or a password a SCRAM client cannot SASLprep, used to install
+    successfully and leave an admin no client could log in as."""
+
+    REJECTED_USERNAMES = [
+        ("", "is empty or looks like an option"),
+        ("-rf", "is empty or looks like an option"),
+        ("--yes", "is empty or looks like an option"),
+        ("a,b", "contains ',' or '='"),
+        ("a=b", "contains ',' or '='"),
+        ("a" * 64, "is 64 bytes"),
+        ("public", "is reserved by PostgreSQL or DocumentDB"),
+        ("none", "is reserved by PostgreSQL or DocumentDB"),
+        ("root", "is reserved by PostgreSQL or DocumentDB"),
+        ("readWrite", "is reserved by PostgreSQL or DocumentDB"),
+        ("__system", "is reserved by PostgreSQL or DocumentDB"),
+        ("pgadmin", "reserved prefix 'pg'"),
+        ("DocumentDB_x", "reserved prefix 'documentdb'"),
+    ]
+    ACCEPTED_USERNAMES = ["admin", "_admin", "a-b", "Admin_2", "a" * 63,
+                          "public_admin", "nonesuch", "current_user", "Root",
+                          "PUBLIC", "None", "rooter"]
+    # Only setup's interactive prompt refuses these; the backend quotes names.
+    PROMPT_ONLY_REJECTED = ["1admin", "foo.bar", "alice@corp.com", "weird name",
+                            "ad'min", "caf\u00e9"]
+
+    ACCEPTED_PASSWORDS = [
+        (b"ValidPass123!", "ValidPass123!"),
+        (b"ValidPass123!\n", "ValidPass123!"),
+        (b"ValidPass123!\r\n", "ValidPass123!"),
+        (b" sp ace ", " sp ace "),
+        (b"aB3$ :x/'\"\\|@%&*;!Z\n", "aB3$ :x/'\"\\|@%&*;!Z"),
+    ]
+    REJECTED_PASSWORDS = [
+        b"",
+        b"\n",
+        b"\r\n",
+        b"ValidPass123!\nsecond",
+        b"ValidPass123!\n\n",
+        b"ValidPass123!\r",
+        b"ValidPass123!\r\r\n",
+        b"Valid\tPass",
+        b"Valid\x1bPass",
+        b"Valid\x7fPass",
+        b"Valid\x00Pass",
+        "Valid\U0001f9eaPass123!".encode(),
+        "p\u00e4sswort".encode(),
+    ]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config = self.root / "SetupConfiguration.json"
+        self.config.write_text(
+            '{"BlockedRolePrefixes": ["documentdb", "citus", "pg", "internal_role"]}',
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _bash(self, script, stdin=b"", env=None):
+        return subprocess.run(["bash", "-c", script], input=stdin,
+                              capture_output=True, timeout=30, env=env)
+
+    def _function(self, path, name):
+        match = re.search(rf"^{name}\(\)\s*\{{.*?^\}}", path.read_text(encoding="utf-8"),
+                          flags=re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(match, f"{name} not found in {path.name}")
+        return match.group(0)
+
+    def test_shared_username_policy(self):
+        def validate(function, username):
+            return subprocess.run(
+                ["bash", "-c", f"source {shlex.quote(str(TOOLS_LIB))}; "
+                 f'{function} "$1" "$2"',
+                 "_", username, str(self.config)],
+                capture_output=True, text=True, timeout=30)
+
+        for username, expected in self.REJECTED_USERNAMES:
+            if "prefix" in expected and not shutil.which("jq"):
+                continue
+            with self.subTest(username=username):
+                r = validate("documentdb_validate_username", username)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn(expected, r.stderr)
+        for username in self.ACCEPTED_USERNAMES + self.PROMPT_ONLY_REJECTED:
+            with self.subTest(username=username):
+                r = validate("documentdb_validate_username", username)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_entry_points_use_the_username_policy(self):
+        # The full matrix runs once in test_shared_username_policy; this proves
+        # each entry point calls it before its dry-run preview.
+        entry_points = {
+            "setup": ([str(SETUP_SCRIPT), "--admin-user"], "is not allowed"),
+            "create-user": ([str(GATEWAY_ADMIN_SCRIPT), "create-user", "--username"],
+                            "Refusing to create user"),
+        }
+        for name, (argv, refusal) in entry_points.items():
+            def run(username):
+                return subprocess.run(["bash", *argv, username, "--dry-run"],
+                                      stdin=subprocess.DEVNULL, capture_output=True,
+                                      text=True, timeout=30)
+
+            with self.subTest(entry_point=name):
+                r = run("public")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("is reserved by PostgreSQL or DocumentDB", r.stderr)
+                self.assertIn(refusal, r.stderr)
+                self.assertNotIn("[dry-run]", r.stdout + r.stderr)
+                # Only setup's prompt limits the character set.
+                self.assertNotIn(refusal, run("first.last").stderr)
+
+    def test_printed_commands_quote_the_admin_name(self):
+        # --admin-user takes names like first.last, so any shell or URI
+        # character must stay inert in the commands setup prints.
+        name = "x'; touch pwned; echo 'a@b,c"
+        script = (
+            f"{self._function(SETUP_SCRIPT, 'build_rerun_suffix')}\n"
+            'USERNAME="$1"; PASSWORD_FILE=""; PASSWORD_FROM_STDIN=false\n'
+            'eval "set -- $(build_rerun_suffix)"; printf "%s" "$2"\n'
+        )
+        r = subprocess.run(["bash", "-c", script, "_", name], cwd=self.root,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout, name, r.stderr)
+        self.assertFalse((self.root / "pwned").exists())
+
+        body = self._function(SETUP_SCRIPT, "print_completion_message")
+        encode = re.search(r'encoded_user="\$\((?P<cmd>jq [^\n]*)\)"', body)
+        self.assertIsNotNone(encode, "the connect URI must encode the user name")
+        r = subprocess.run(["bash", "-c", f'USERNAME="$1"; {encode.group("cmd")}', "_", name],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout.strip(), urllib.parse.quote(name, safe="-_.~"))
+
+    def test_setup_option_values_are_checked_at_parse_time(self):
+        cases = [
+            (["--admin-user", "--yes"], "--admin-user requires a value, but got the option '--yes'"),
+            (["--username", "-x"], "--admin-user requires a value, but got the option '-x'"),
+            (["--pg-version", "abc"], "--pg-version requires a single numeric PostgreSQL major"),
+            (["--pg-version", "17.2"], "--pg-version requires a single numeric PostgreSQL major"),
+            (["--pg-version", "018"], "--pg-version requires a single numeric PostgreSQL major"),
+            (["--pg-version", "--yes"], "--pg-version requires a single numeric PostgreSQL major"),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                r = subprocess.run(["bash", str(SETUP_SCRIPT), *args, "--dry-run"],
+                                   stdin=subprocess.DEVNULL, capture_output=True,
+                                   text=True, timeout=30)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(expected, r.stderr)
+
+    def _setup_password(self, source, data):
+        """Run documentdb-setup's resolve_password against one source."""
+        pw_file = self.root / "pw"
+        pw_file.write_bytes(data)
+        pw_file.chmod(0o600)
+        env = {k: v for k, v in os.environ.items() if k != "DOCUMENTDB_PASSWORD"}
+        file_arg, from_stdin = "", "false"
+        if source == "file":
+            file_arg = str(pw_file)
+        elif source == "stdin":
+            from_stdin = "true"
+        else:
+            env["DOCUMENTDB_PASSWORD"] = data.decode("utf-8", "surrogateescape")
+        script = (
+            f"source {shlex.quote(str(TOOLS_LIB))}\n"
+            'die() { echo "DIE: $*" >&2; exit 1; }\n'
+            "log_warn() { :; }\n"
+            f"{self._function(SETUP_SCRIPT, 'resolve_password')}\n"
+            f"PASSWORD_FILE={shlex.quote(file_arg)}; PASSWORD_FROM_STDIN={from_stdin}\n"
+            'YES=true; PASSWORD=""\n'
+            "resolve_password\n"
+            "printf '%s' \"$PASSWORD\"\n"
+        )
+        return self._bash(script, stdin=data if source == "stdin" else b"", env=env)
+
+    def test_password_contract(self):
+        def read(data):
+            return self._bash(f"source {shlex.quote(str(TOOLS_LIB))}\n"
+                              'documentdb_read_password PW "The password" || exit 1\n'
+                              "printf '%s' \"$PW\"\n", stdin=data)
+
+        for data, expected in self.ACCEPTED_PASSWORDS:
+            with self.subTest(data=data):
+                r = read(data)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.decode(), expected)
+        for data in self.REJECTED_PASSWORDS:
+            with self.subTest(data=data):
+                r = read(data)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(PASSWORD_RULE, r.stderr)
+
+    def _check_wiring(self, run, sources):
+        # The full matrix runs once in test_password_contract; this proves
+        # each source goes through it.
+        for source in sources:
+            with self.subTest(source=source):
+                r = run(source, b"ValidPass123!\r\n" if source != "env" else b"ValidPass123!")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, b"ValidPass123!")
+                r = run(source, "p\u00e4sswort".encode())
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(PASSWORD_RULE, r.stderr)
+
+    def test_setup_password_sources_use_the_contract(self):
+        self._check_wiring(self._setup_password, ("file", "stdin", "env"))
+
+    def test_setup_refuses_password_before_tls_repair(self):
+        # validate_required_arguments repairs TLS file ownership; a refused
+        # password must stop setup before that touches the operator's files.
+        for name in ("cert", "key"):
+            (self.root / name).write_text("x", encoding="utf-8")
+        (self.root / "pw").write_bytes(b"Valid\tPass\n")
+        script = (
+            f"source {shlex.quote(str(TOOLS_LIB))}\n"
+            'die() { echo "DIE: $*" >&2; exit 1; }\n'
+            "log_warn() { :; }; log_info() { :; }\n"
+            'id() { [[ "$*" == "-u documentdb-gateway" ]] || echo 0; }\n'
+            "sudo() { return 1; }; run_as_user() { return 1; }\n"
+            "chown() { touch repaired; }; chmod() { touch repaired; }\n"
+            f"{self._function(SETUP_SCRIPT, 'resolve_password')}\n"
+            f"{self._function(SETUP_SCRIPT, 'validate_required_arguments')}\n"
+            "USERNAME=admin TLS_CERT_FILE=cert TLS_KEY_FILE=key TLS_AUTO_GENERATE=\n"
+            "PASSWORD_FILE=pw PASSWORD_FROM_STDIN=false YES=true PASSWORD=\n"
+            "validate_required_arguments\n"
+        )
+        r = subprocess.run(["bash", "-c", script], cwd=self.root, capture_output=True,
+                           timeout=30, env={k: v for k, v in os.environ.items()
+                                            if k != "DOCUMENTDB_PASSWORD"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(PASSWORD_RULE, r.stderr)
+        self.assertFalse((self.root / "repaired").exists(), r.stderr)
+
+    def _admin_password(self, source, data):
+        """Run documentdb-gateway-admin's resolve_password_to_file."""
+        pw_file = self.root / "pw"
+        pw_file.write_bytes(data)
+        pw_file.chmod(0o600)
+        file_arg = str(pw_file) if source == "file" else ""
+        from_stdin = "true" if source == "stdin" else "false"
+        script = (
+            f"source {shlex.quote(str(TOOLS_LIB))}\n"
+            'die() { echo "DIE: $*" >&2; exit 1; }\n'
+            "log() { :; }\n"
+            f"{self._function(GATEWAY_ADMIN_SCRIPT, 'resolve_password_to_file')}\n"
+            f"PASSWORD_FILE={shlex.quote(file_arg)}; PASSWORD_FROM_STDIN={from_stdin}\n"
+            '_TEMP_FILES=(); PG_OWNER=""\n'
+            "resolve_password_to_file\n"
+            'cat "$RESOLVED_PASSWORD_FILE"; rm -f "$RESOLVED_PASSWORD_FILE"\n'
+        )
+        return self._bash(script, stdin=data if source == "stdin" else b"")
+
+    def test_gateway_admin_password_sources_use_the_contract(self):
+        self._check_wiring(self._admin_password, ("file", "stdin"))
+
+    def test_reserved_role_names_match_across_entry_points(self):
+        # install.sh runs before the tools package exists, so it carries a copy.
+        def names(path, var):
+            m = re.search(rf'^\s*{var}="(?P<v>[^"]*)"', path.read_text(encoding="utf-8"),
+                          flags=re.MULTILINE)
+            self.assertIsNotNone(m, f"{var} not found in {path.name}")
+            return m.group("v").split()
+
+        lib = names(TOOLS_LIB, "DOCUMENTDB_RESERVED_USER_NAMES")
+        self.assertEqual(lib, names(OSS_ROOT / "packaging" / "install.sh",
+                                    "RESERVED_ADMIN_NAMES"))
+
+        # PostgreSQL's two plus the backend's built-in roles, from the header.
+        header = (OSS_ROOT / "pg_documentdb" / "include" / "utils"
+                  / "role_utils.h").read_text(encoding="utf-8")
+        macro = re.search(r"#define IS_NATIVE_BUILTIN_ROLE\(roleName\)(?P<body>.*?)\n\n",
+                          header, flags=re.DOTALL)
+        self.assertIsNotNone(macro, "IS_NATIVE_BUILTIN_ROLE not found")
+        backend = sorted(re.findall(r'strcmp\(\(roleName\), "([^"]+)"\)',
+                                    macro.group("body")))
+        self.assertIn("root", backend)
+        self.assertEqual(lib[:2], ["public", "none"])
+        self.assertEqual(sorted(lib[2:]), backend)
 
 
 class DocumentDBTuneTests(unittest.TestCase):
@@ -2512,6 +2793,39 @@ class PackagingPgMajorBoundaryTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, "build_extra_packages.sh must reject --default-pg-major 15")
         self.assertIn("16", r.stdout + r.stderr)
 
+    def test_build_extra_packages_normalizes_rc_version(self):
+        # documentdb-N depends on documentdb-gateway (>= version); the gateway
+        # builds as 1.0~rc2, and 1.0-rc2 would sort above it.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pkg = root / "packaging"
+            (pkg / "postgresql-tools").mkdir(parents=True)
+            (pkg / "standalone").mkdir()
+            shutil.copy2(BUILD_EXTRA_PACKAGES, pkg / "build_extra_packages.sh")
+            shutil.copy2(OSS_ROOT / "packaging" / "documentdb-version.sh", pkg)
+            log = root / "calls.log"
+            stub = f'#!/bin/bash\necho "$(basename "$0") $*" >> "{log}"\n'
+            for rel in ("postgresql-tools/build-postgresql-tools-deb.sh",
+                        "standalone/build-standalone-deb.sh",
+                        "standalone/build-common-deb.sh",
+                        "standalone/build-meta-deb.sh"):
+                (pkg / rel).write_text(stub, encoding="utf-8")
+                (pkg / rel).chmod(0o755)
+            bindir = root / "bin"
+            bindir.mkdir()
+            (bindir / "dpkg-deb").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (bindir / "dpkg-deb").chmod(0o755)
+            env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}")
+            r = subprocess.run(
+                ["bash", str(pkg / "build_extra_packages.sh"), "--type", "deb", "--pg", "18",
+                 "--version", "1.0-rc2", "--output-dir", str(root / "out")],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, env=env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            calls = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 4, calls)
+        for call in calls:
+            self.assertIn("--version 1.0~rc2 ", call + " ")
+
     def test_public_alias_major_agrees_with_meta_build_defaults(self):
         # documentdb-setup.sh hardcodes the paved-road default major
         # (PUBLIC_ALIAS_PG_MAJOR) that gates enabling the public
@@ -2655,6 +2969,17 @@ class ExtraPackagesBuildDepsPreflightTests(unittest.TestCase):
             for ln in producers:
                 with self.subTest(script=name, line=ln.strip()[:60]):
                     self.assertIn("--env SOURCE_DATE_EPOCH ", ln)
+
+    def test_package_builders_use_distinct_image_tags(self):
+        # A shared tag lets one builder's image overwrite the other's for the
+        # same OS/PG. Source text only.
+        tags = []
+        for name in ("build_packages.sh", "gateway/build_gateway_packages.sh"):
+            text = (OSS_ROOT / "packaging" / name).read_text(encoding="utf-8")
+            found = re.findall(r"^TAG=(\S+)$", text, flags=re.M)
+            self.assertEqual(len(found), 1, f"{name}: expected one TAG=")
+            tags.append(found[0])
+        self.assertNotEqual(tags[0], tags[1])
 
     def test_check_build_deps_only_deb_succeeds_when_dpkg_deb_present(self):
         # Behavioral happy-path for the new deb preflight; skipped where dpkg-deb
@@ -3037,6 +3362,7 @@ class DocumentDBSetupwizardFlagsTests(unittest.TestCase):
             "Write postgresql.conf managed block via documentdb-tune",
             "Run documentdb-register-gateway --yes",
             "Run CREATE EXTENSION documentdb CASCADE",
+            "Install temporary getParameter rejection stub",
             "Bootstrap first admin user",
         ):
             self.assertRegex(
@@ -3061,6 +3387,7 @@ class DocumentDBSetupwizardFlagsTests(unittest.TestCase):
             "documentdb-tune --yes",
             "documentdb-register-gateway --yes",
             "CREATE EXTENSION documentdb CASCADE",
+            "getParameter rejection stub",
             "bootstrap admin user",
             "documentdb-postgresql@18.service",
             "documentdb-gateway-local@18.service",
@@ -4229,6 +4556,65 @@ class GatewayRpmPosttransRestartsLocalInstancesTests(unittest.TestCase):
         )
 
 
+class UpgradeBannerTests(unittest.TestCase):
+    """The tools and gateway packages say "installed" and print first-run
+    guidance only on a first install, not on every upgrade."""
+
+    def _stub_path(self, td):
+        bindir = Path(td) / "bin"
+        bindir.mkdir()
+        for name in ("systemd-sysusers", "systemd-tmpfiles", "install", "dpkg-query"):
+            (bindir / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (bindir / name).chmod(0o755)
+        (bindir / "systemctl").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        (bindir / "systemctl").chmod(0o755)
+        return dict(os.environ, PATH=f"{bindir}:/usr/bin:/bin")
+
+    def _assert_banners(self, run, product):
+        first = run(True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn(f"{product} installed.", first.stdout)
+        upgrade = run(False)
+        self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
+        self.assertIn(f"{product} upgraded.", upgrade.stdout)
+        self.assertNotIn("installed", upgrade.stdout)
+
+    def _rpm_post(self, spec_name):
+        text = (OSS_ROOT / "packaging" / "rpm" / "spec" / spec_name).read_text(encoding="utf-8")
+        body = re.search(r"^%post\n(.*?)^%(?:pre|preun|postun|pretrans|posttrans|files|changelog)\b", text, flags=re.M | re.S).group(1)
+        return "\n".join(ln for ln in body.splitlines() if not ln.startswith("%"))
+
+    def test_gateway_deb_postinst(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = self._stub_path(td)
+            self._assert_banners(
+                lambda first: subprocess.run(
+                    ["bash", str(GATEWAY_POSTINST), "configure", "" if first else "0.110.0"],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, env=env),
+                "DocumentDB Gateway")
+
+    def test_tools_deb_postinst(self):
+        builder = (OSS_ROOT / "packaging" / "postgresql-tools"
+                   / "build-postgresql-tools-deb.sh").read_text(encoding="utf-8")
+        postinst = re.search(r"<<'POSTINST'\n(.*?)^POSTINST$", builder, flags=re.M | re.S).group(1)
+        self._assert_banners(
+            lambda first: subprocess.run(
+                ["bash", "-c", postinst, "postinst", "configure", "" if first else "0.110.0"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30),
+            "DocumentDB PostgreSQL administrator tools")
+
+    def test_rpm_post_scriptlets(self):
+        for spec, product in (("documentdb-tools.spec", "DocumentDB PostgreSQL administrator tools"),
+                              ("documentdb-gateway.spec", "DocumentDB Gateway")):
+            with self.subTest(spec=spec):
+                post = self._rpm_post(spec)
+                self._assert_banners(
+                    lambda first: subprocess.run(
+                        ["sh", "-c", post, "post", "1" if first else "2"],
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30),
+                    product)
+
+
 class DebianMaintainerBootstrapPathTests(unittest.TestCase):
     """The DEB maintainer scripts rely on shipped sysusers/tmpfiles.d
     files. They must point the systemd helpers at the installed paths and
@@ -4734,6 +5120,35 @@ class GatewayAdminBrownfieldStateAutoDetectTests(unittest.TestCase):
 class GatewayAdminUsageSurfaceTests(unittest.TestCase):
     """The packaged admin helper is a standalone CLI; the help output
     should teach that name and advertise the target-db override."""
+
+    def test_gateway_admin_check_exit_status(self):
+        script = GATEWAY_ADMIN_SCRIPT.read_text(encoding="utf-8")
+        check = re.search(r"^cmd_check\(\) \{.*?^\}", script, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(check)
+        harness = (
+            "set -euo pipefail\n"
+            "PG_OWNER=postgres; SOCKET_DIR=/tmp; PG_PORT=5432; TARGET_DB=postgres\n"
+            "find_psql() { echo psql; }\n"
+            'run_as_user() { printf "%s" "${EXTENSION_PRESENT}"; }\n'
+            'log() { echo "$*"; }\n'
+            'die() { echo "$*" >&2; exit 1; }\n'
+            # The index-handler resolution has its own tests; stub it out.
+            "documentdb_read_pg_major() { echo 18; }\n"
+            "documentdb_required_index_extension() { :; }\n"
+            "documentdb_index_handler_for_extension() { :; }\n"
+            "print_extension_remedy() { :; }\n"
+            + check.group(0) + "\ncmd_check\n"
+        )
+        for present, expected in (("1", 0), ("", 1)):
+            with self.subTest(present=present):
+                result = subprocess.run(
+                    ["bash", "-c", harness],
+                    env=dict(os.environ, EXTENSION_PRESENT=present),
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertIn("DocumentDB extension: " + ("loaded" if present else "NOT loaded"),
+                              result.stdout)
 
     def test_gateway_admin_help_uses_packaged_cli_name(self):
         result = subprocess.run(
@@ -5960,7 +6375,7 @@ class GatewayEnvFragmentCarriesListenAddrTests(unittest.TestCase):
         )
         self.assertIsNotNone(match)
         body = match.group("body")
-        self.assertIn('--listen-addr ":${GATEWAY_PORT}"', body,
+        self.assertIn('--listen-addr "${GATEWAY_LISTEN_HOST}:${GATEWAY_PORT}"', body,
                       "setup must thread --listen-port through register-gateway --listen-addr")
         self.assertIn('--tls-auto-generate true', body,
                       "setup must enable TLS auto-gen on standalone (design §4.3 default)")
@@ -6845,6 +7260,151 @@ class StatusOnlyHealthExitCodeTests(unittest.TestCase):
             r'\[\[\s*"\$\{mode\}"\s*!=\s*"<not configured>"\s*\]\]\s*&&\s*return\s*0',
             "status_only must not exit 0 based on state file presence alone",
         )
+
+
+class SetupReportsTrueStateTests(unittest.TestCase):
+    """documentdb-setup must not accept, change or report things silently
+    that leave the operator with a broken or surprising install (#772)."""
+
+    @staticmethod
+    def _shell_function(name):
+        text = SETUP_SCRIPT.read_text(encoding="utf-8")
+        match = re.search(rf"^{name}\(\)\s*\{{.*?^\}}", text, re.DOTALL | re.MULTILINE)
+        assert match, f"could not locate shell function {name}"
+        return match.group(0)
+
+    def _refuse(self, path, systemd=True):
+        script = (
+            f'has_working_systemd() {{ {"true" if systemd else "false"}; }}\n'
+            'die() { printf "DIE: %s\\n" "$*"; exit 1; }\n'
+            + self._shell_function("refuse_home_tls_path")
+            + '\nrefuse_home_tls_path "$1" "HINT"\necho OK\n'
+        )
+        return subprocess.run(["bash", "-c", script, "bash", path],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_tls_files_under_protected_home_are_refused(self):
+        # The gateway units run with ProtectHome=yes: setup used to chown the
+        # operator's /root files and then time out waiting for a gateway that
+        # still could not see them.
+        for path in ("/root/c.pem", "/home/alice/tls/k.pem", "/run/user/1000/c.pem", "/root"):
+            r = self._refuse(path)
+            self.assertEqual(r.returncode, 1, (path, r.stdout, r.stderr))
+            self.assertIn("ProtectHome=yes", r.stdout)
+            self.assertIn("HINT", r.stdout)
+        for path in ("/etc/documentdb/tls/c.pem", "/etc/ssl/private/k.pem", "/homework/c.pem"):
+            r = self._refuse(path)
+            self.assertEqual(r.returncode, 0, (path, r.stdout, r.stderr))
+            self.assertIn("OK", r.stdout)
+
+    def test_tls_files_under_home_are_allowed_without_systemd(self):
+        # The nohup gateway has no ProtectHome sandbox.
+        r = self._refuse("/home/alice/tls/k.pem", systemd=False)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertIn("OK", r.stdout)
+
+    def test_tls_symlink_into_home_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            link = Path(td) / "c.pem"
+            link.symlink_to("/root/c.pem")
+            r = self._refuse(str(link))
+            self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+
+    def test_tls_symlink_from_home_is_refused(self):
+        # /root/c.pem -> /etc/documentdb/tls/c.pem: the gateway still opens /root/c.pem.
+        script = (
+            'has_working_systemd() { true; }\n'
+            'realpath() { [ "$1" = -ms ] && printf "%s" "$3" || printf /etc/documentdb/tls/c.pem; }\n'
+            'die() { printf "DIE: %s\\n" "$*"; exit 1; }\n'
+            + self._shell_function("refuse_home_tls_path")
+            + '\nrefuse_home_tls_path /root/c.pem HINT\necho OK\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn("ProtectHome=yes", r.stdout)
+
+    def test_tls_home_refusal_runs_before_chown_and_on_reuse(self):
+        body = self._shell_function("validate_required_arguments")
+        refuse = body.index('refuse_home_tls_path "${TLS_KEY_FILE}"')
+        self.assertLess(refuse, body.index("chown "),
+                        "the refusal must come before setup touches the operator's files")
+        persisted = self._shell_function("default_gateway_settings_from_persisted_state")
+        self.assertIn('refuse_home_tls_path "${_p_cert}"', persisted)
+        self.assertIn('refuse_home_tls_path "${_p_key}"', persisted)
+        self.assertIn("--tls-auto-generate true", persisted)
+
+    def _create_admin(self, exists, others):
+        # Stub psql: answer the existence probe and the other-admins query.
+        script = (
+            'set -euo pipefail\n'
+            'log_info() { echo "INFO: $*"; }\nlog_warn() { echo "WARN: $*"; }\n'
+            'confirm_or_apply() { echo "APPLY: $1"; }\n'
+            'run_as_user() { local sql; sql="$(cat)";\n'
+            '  case "${sql}" in *"SELECT 1 FROM pg_roles"*) [[ "${EXISTS}" == 1 ]] && echo 1; true ;;\n'
+            '  *documentdb_admin_role*) [[ -z "${OTHERS}" ]] || printf "%s\\n" ${OTHERS} ;; esac; }\n'
+            'USERNAME=alice PG_OWNER=documentdb PSQL=psql PG_SOCKET_DIR=/tmp PG_PORT=9718 HAS_EXTENDED_RUM=false\n'
+            + self._shell_function("create_required_extensions_and_users")
+            + '\ncreate_required_extensions_and_users\n'
+        )
+        env = dict(os.environ, EXISTS="1" if exists else "0", OTHERS=others,
+                   PASSWORD=secrets.token_urlsafe(16))
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                           timeout=30, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout
+
+    def test_rerun_warns_before_replacing_the_admin_password(self):
+        out = self._create_admin(exists=True, others="")
+        self.assertRegex(out, r"WARN: .*'alice'.*old password stops working")
+        self.assertIn("APPLY: Reset password for existing admin user 'alice'", out)
+
+    def test_new_admin_name_warns_about_existing_admins(self):
+        out = self._create_admin(exists=False, others="admin ops")
+        self.assertRegex(out, r"WARN: Adding admin user 'alice' alongside .*: admin ops\.")
+        self.assertIn("documentdb-gateway-admin drop-user", out)
+        self.assertIn("APPLY: Bootstrap first admin user 'alice'", out)
+
+    def _database_check(self, mode, uid="0", url=True):
+        with tempfile.TemporaryDirectory() as td:
+            fake_psql = Path(td) / "psql"
+            fake_psql.write_text(
+                '#!/bin/bash\ncase "${FAKE_MODE}" in\n'
+                '  down) exit 2 ;;\n  none) echo ;;\n  ok) echo "admin ops" ;;\nesac\n',
+                encoding="utf-8")
+            fake_psql.chmod(0o755)
+            url_file = Path(td) / "pg-url"
+            if url:
+                url_file.write_text("postgresql://documentdb@/postgres?host=/run&port=9718\n")
+            script = (
+                f'id() {{ echo {uid}; }}\n'
+                f'documentdb_pg_bindir_candidates() {{ echo {shlex.quote(td)}; }}\n'
+                'run_as_user() { shift; "$@"; }\n'
+                + self._shell_function("status_database_check")
+                + f'\nstatus_database_check 18 {shlex.quote(str(url_file))}\n'
+            )
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                               timeout=30, env=dict(os.environ, FAKE_MODE=mode))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+
+    def test_status_database_check_reports_what_clients_would_hit(self):
+        # --status said healthy with the admin user dropped or PostgreSQL
+        # down, because it only asked systemd whether the units were active.
+        self.assertEqual(self._database_check("ok"), "ok (admin users: admin ops)")
+        self.assertTrue(self._database_check("none").startswith("no DocumentDB admin user"))
+        self.assertTrue(self._database_check("down").startswith("not answering"))
+        self.assertTrue(self._database_check("ok", uid="1000").startswith("unknown"))
+        self.assertTrue(self._database_check("ok", url=False).startswith("cannot connect"))
+
+    def test_status_fails_unless_the_database_check_passes(self):
+        body = self._shell_function("status_only")
+        self.assertIn('status_database_check "${v}" "${connection_file}"', body)
+        self.assertIn('[[ "${db_check}" == ok* || "${db_check}" == unknown* ]] || return 1', body)
+
+    def test_first_admin_creates_without_warning(self):
+        out = self._create_admin(exists=False, others="")
+        self.assertNotIn("WARN:", out)
+        self.assertIn("APPLY: Bootstrap first admin user 'alice'", out)
 
 
 class WriteRecoveryMarkerPersistsEnvFileTests(unittest.TestCase):
@@ -8816,6 +9376,7 @@ class UxReviewFixTests(unittest.TestCase):
         # so a re-run applies the shipped documentdb--X--Y.sql migrations.
         script = SETUP_SCRIPT.read_text(encoding="utf-8")
         for fn, ext in (
+            ("_create_documentdb_extension_inline", "documentdb_core"),
             ("_create_documentdb_extension_inline", "documentdb"),
             ("_create_extended_rum_extension_inline", "documentdb_extended_rum"),
         ):
@@ -8831,6 +9392,20 @@ class UxReviewFixTests(unittest.TestCase):
                 body,
                 f"{fn} must idempotently upgrade the in-database extension",
             )
+            # ALTER EXTENSION does not cascade to dependencies; core goes first
+            # because documentdb is built against it.
+            if ext == "documentdb_core":
+                self.assertLess(
+                    body.index("ALTER EXTENSION documentdb_core UPDATE;"),
+                    body.index("ALTER EXTENSION documentdb UPDATE;"),
+                    "core must be upgraded before its dependent extension",
+                )
+                self.assertLess(body.index("BEGIN;"), body.index("CREATE EXTENSION"))
+                self.assertLess(
+                    body.index("ALTER EXTENSION documentdb UPDATE;"),
+                    body.index("COMMIT;"),
+                    "core and documentdb upgrades must commit together",
+                )
 
     def test_resolve_password_fails_fast_under_yes_without_source(self):
         # --yes with no password source must die with an actionable message
@@ -9425,3 +10000,1510 @@ class ToastCompressionTests(unittest.TestCase):
             "tune must derive the Debian fragment path from the shared "
             "helper, not construct it inline",
         )
+
+
+class ExtendedRumPackagedInstallTests(unittest.TestCase):
+    """documentdb-tune pins documentdb.alternate_index_handler_name from a
+    control-file probe, but the access method it names lives in a per-database
+    extension that `CREATE EXTENSION documentdb CASCADE` does not pull in. The
+    tools therefore have to print one shared, correctly targeted recipe, say
+    what they actually know about the requirement, and — for
+    documentdb-createcluster --start — run it after the server is up."""
+
+    CREATECLUSTER_SCRIPT = (OSS_ROOT / "documentdb-local" / "scripts" /
+                            "documentdb-createcluster.sh")
+    BASE_SQL = "CREATE EXTENSION IF NOT EXISTS documentdb CASCADE;"
+    EXTRA_SQL = "CREATE EXTENSION IF NOT EXISTS documentdb_extended_rum CASCADE;"
+    BEGIN_SQL = "BEGIN;"
+    COMMIT_SQL = "COMMIT;"
+    BINDIR_LINE = ("    printf '/usr/lib/postgresql/%s/bin\\n/usr/pgsql-%s/bin\\n' "
+                   '"${major}" "${major}"')
+
+    # ---- fixtures ---------------------------------------------------------
+
+    def _bash(self, script, env=None, timeout=30):
+        # Absolute interpreter: several cases hand the script a PATH with
+        # nothing on it but their own stubs.
+        bash = shutil.which("bash") or "/bin/bash"
+        return subprocess.run(
+            [bash, "-c", script], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+
+    def _stub(self, directory, name, body):
+        """A shim on PATH. Inert by design: these tests never run psql, a
+        privilege helper, or pg_createcluster for real."""
+        path = Path(directory) / name
+        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def _tools_lib_with_fake_bindir(self):
+        """The library, with its hardcoded PostgreSQL bin-directory candidates
+        replaced by $DDB_TEST_BINDIR, so documentdb_pg_sharedir and the
+        extended-RUM control-file probe run their real logic against a
+        fixture."""
+        text = TOOLS_LIB.read_text(encoding="utf-8")
+        self.assertIn(self.BINDIR_LINE, text,
+                      "documentdb_pg_bindir_candidates changed shape; update this fixture")
+        return text.replace(
+            self.BINDIR_LINE,
+            '    printf \'%s\\n\' "${DDB_TEST_BINDIR:-/nonexistent}"',
+        )
+
+    def _render(self, call, td, path_dirs=None):
+        """Render one recipe and read back the ARGUMENTS a shell would pass,
+        by eval-ing the rendered line into an inert sink rather than splitting
+        it on whitespace. Returns (render_rc, line, [args])."""
+        stage_tools_lib(td)
+        lib = shlex.quote(str(Path(td) / "documentdb-tools-lib.sh"))
+        script = (
+            "set -uo pipefail\n"
+            f"source {lib}\n"
+            'sink() { printf "ARG[%s]\\n" "$@"; }\n'
+            f'line="$({call})" || {{ printf "RC[%s]\\n" "$?"; exit 0; }}\n'
+            'printf "LINE[%s]\\n" "${line}"\n'
+            'eval "sink ${line}"\n'
+        )
+        env = dict(os.environ)
+        if path_dirs is None:
+            # Which runner the recipe names depends on what the host has, and
+            # a minimal container has no sudo: pin it unless a case is
+            # specifically about the fallbacks.
+            runners = Path(td) / "runners"
+            runners.mkdir(exist_ok=True)
+            self._stub(runners, "sudo", "exit 0\n")
+            path_dirs = [runners, env["PATH"]]
+        env["PATH"] = os.pathsep.join(str(d) for d in path_dirs)
+        r = self._bash(script, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rc, line, args = 0, "", []
+        for out_line in r.stdout.splitlines():
+            if out_line.startswith("RC["):
+                rc = int(out_line[3:-1])
+            elif out_line.startswith("LINE["):
+                line = out_line[5:-1]
+            elif out_line.startswith("ARG["):
+                args.append(out_line[4:-1])
+        return rc, line, args
+
+    # ---- T1/T2: the shared recipe -----------------------------------------
+
+    def test_recipe_targets_a_debian_cluster_with_both_statements_in_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, line, args = self._render(
+                'documentdb_create_extension_command postgres postgres '
+                'documentdb_extended_rum --cluster 18/main', td)
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(
+                args,
+                ["sudo", "-u", "postgres", "psql", "--cluster", "18/main",
+                 "-d", "postgres", "-X", "-v", "ON_ERROR_STOP=1",
+                 "-c", self.BEGIN_SQL, "-c", self.BASE_SQL,
+                 "-c", self.EXTRA_SQL, "-c", self.COMMIT_SQL],
+                f"rendered: {line}",
+            )
+
+    def test_recipe_carries_the_socket_port_owner_and_database_it_was_given(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, line, args = self._render(
+                'documentdb_create_extension_command documentdb-local appdb '
+                'documentdb_extended_rum -h /run/documentdb-local/18/postgresql -p 9718',
+                td)
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(
+                args,
+                ["sudo", "-u", "documentdb-local", "psql",
+                 "-h", "/run/documentdb-local/18/postgresql", "-p", "9718",
+                 "-d", "appdb", "-X", "-v", "ON_ERROR_STOP=1",
+                 "-c", self.BEGIN_SQL, "-c", self.BASE_SQL,
+                 "-c", self.EXTRA_SQL, "-c", self.COMMIT_SQL],
+                f"rendered: {line}",
+            )
+
+    def test_recipe_omits_the_second_statement_when_no_handler_is_required(self):
+        # The empty third argument is the whole contract for a cluster with no
+        # alternate handler: one statement, not a stray "CREATE EXTENSION ;".
+        with tempfile.TemporaryDirectory() as td:
+            rc, line, args = self._render(
+                'documentdb_create_extension_command postgres postgres "" '
+                '--cluster 18/main', td)
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(
+                [a for i, a in enumerate(args) if i and args[i - 1] == "-c"],
+                [self.BEGIN_SQL, self.BASE_SQL, self.COMMIT_SQL],
+                f"rendered: {line}")
+
+    def test_recipe_keeps_shell_metacharacters_as_argument_data(self):
+        # The socket directory and owner come from the host's configuration and
+        # from stat, and the result is printed for an administrator to paste.
+        # A value that carries shell syntax has to arrive as one literal
+        # argument -- the marker file below is what "it did not" looks like.
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "executed"
+            socket_dir = f"/run/pg; touch {marker}"
+            rc, line, args = self._render(
+                'documentdb_create_extension_command "wei\'rd" postgres "" '
+                f'-h {shlex.quote(socket_dir)} -p 5432', td)
+            self.assertEqual(rc, 0, line)
+            self.assertFalse(marker.exists(),
+                             f"the rendered recipe executed its own argument: {line}")
+            self.assertIn(socket_dir, args, f"rendered: {line}")
+            self.assertIn("wei'rd", args, f"rendered: {line}")
+
+    def test_recipe_preserves_a_supported_socket_path_unquoted(self):
+        # "+" is legal in a socket directory and register's URI-host policy
+        # accepts it; quoting must not start rejecting or mangling it.
+        with tempfile.TemporaryDirectory() as td:
+            rc, line, args = self._render(
+                'documentdb_create_extension_command postgres postgres "" '
+                '-h /run/pg+tenant -p 5432', td)
+            self.assertEqual(rc, 0, line)
+            self.assertIn("-h /run/pg+tenant -p 5432", line)
+            self.assertIn("/run/pg+tenant", args)
+
+    def test_recipe_prefers_sudo_then_runuser_then_su(self):
+        # The recipe is pasted into the operator's own shell, where runuser and
+        # su need root -- so sudo wins when it exists, and the fallbacks are
+        # only rendered when it does not.
+        with tempfile.TemporaryDirectory() as td:
+            binaries = Path(td) / "bin"
+            binaries.mkdir()
+            for name in ("sudo", "runuser", "su"):
+                self._stub(binaries, name, "exit 0\n")
+            call = ('documentdb_create_extension_command postgres postgres "" '
+                    '--cluster 18/main')
+
+            rc, line, args = self._render(call, td, path_dirs=[binaries])
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(args[:3], ["sudo", "-u", "postgres"], line)
+
+            (binaries / "sudo").unlink()
+            rc, line, args = self._render(call, td, path_dirs=[binaries])
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(args[:4], ["runuser", "-u", "postgres", "--"], line)
+
+            (binaries / "runuser").unlink()
+            rc, line, args = self._render(call, td, path_dirs=[binaries])
+            self.assertEqual(rc, 0, line)
+            self.assertEqual(args[:4], ["su", "-s", "/bin/bash", "postgres"], line)
+            self.assertEqual(args[4], "-c", line)
+            # su takes ONE command string: the inner command has to survive
+            # being quoted twice, or the statements arrive as su's arguments.
+            self.assertIn(self.BASE_SQL, args[5], line)
+
+    def test_advice_prints_the_statements_when_no_runner_exists(self):
+        # Surfacing "there is nothing to paste here" beats printing a command
+        # the host cannot run.
+        with tempfile.TemporaryDirectory() as td:
+            binaries = Path(td) / "empty-bin"
+            binaries.mkdir()
+            stage_tools_lib(td)
+            lib = shlex.quote(str(Path(td) / "documentdb-tools-lib.sh"))
+            env = dict(os.environ)
+            env["PATH"] = str(binaries)
+            r = self._bash(
+                "set -uo pipefail\n"
+                f"source {lib}\n"
+                'documentdb_create_extension_advice postgres postgres '
+                'documentdb_extended_rum --cluster 18/main\n',
+                env=env,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("no sudo, runuser or su", r.stdout)
+            # Pasted statements need the transaction too.
+            self.assertIn(
+                "\n".join([self.BEGIN_SQL, self.BASE_SQL, self.EXTRA_SQL,
+                           self.COMMIT_SQL]),
+                r.stdout)
+            self.assertIn("--cluster 18/main", r.stdout,
+                          "statements without a target land in whichever cluster "
+                          "owns the default socket")
+            self.assertNotIn("psql", r.stdout)
+
+    def test_advice_says_the_fallback_needs_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            binaries = Path(td) / "bin"
+            binaries.mkdir()
+            self._stub(binaries, "runuser", "exit 0\n")
+            stage_tools_lib(td)
+            lib = shlex.quote(str(Path(td) / "documentdb-tools-lib.sh"))
+            env = dict(os.environ)
+            env["PATH"] = str(binaries)
+            r = self._bash(
+                "set -uo pipefail\n"
+                f"source {lib}\n"
+                'documentdb_create_extension_advice postgres postgres "" '
+                '--cluster 18/main\n',
+                env=env,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("runuser", r.stdout.splitlines()[0])
+            self.assertIn("as root", r.stdout.splitlines()[1])
+
+    # ---- T5/T7: what the resolver actually knows --------------------------
+
+    def _resolver_fixture(self, td, live_output="", live_exit=0,
+                          control_file=True, bindir_has_pg_config=True):
+        """A psql that answers the handler query with `live_output` (or fails),
+        plus a PostgreSQL bin/share layout that either ships the extended-RUM
+        control file or does not. Returns (env, psql_path, calls_log)."""
+        td = Path(td)
+        stage_tools_lib(td, self._tools_lib_with_fake_bindir())
+        bindir = td / "pgbin"
+        bindir.mkdir()
+        sharedir = td / "pgshare"
+        (sharedir / "extension").mkdir(parents=True)
+        if control_file:
+            (sharedir / "extension" / "documentdb_extended_rum.control").write_text(
+                "default_version = '0.106-0'\n", encoding="utf-8")
+        calls = td / "calls.log"
+        if bindir_has_pg_config:
+            self._stub(bindir, "pg_config",
+                       f'echo pg_config >> {shlex.quote(str(calls))}\n'
+                       f'echo {shlex.quote(str(sharedir))}\n')
+        psql = self._stub(td, "psql",
+                          f'echo psql >> {shlex.quote(str(calls))}\n'
+                          f'printf "%s\\n" {shlex.quote(live_output)}\n'
+                          f'exit {live_exit}\n')
+        env = dict(os.environ)
+        env["DDB_TEST_BINDIR"] = str(bindir)
+        return env, psql, calls
+
+    def _resolve(self, td, major="18", **fixture):
+        env, psql, calls = self._resolver_fixture(td, **fixture)
+        lib = shlex.quote(str(Path(td) / "documentdb-tools-lib.sh"))
+        r = self._bash(
+            "set -euo pipefail\n"
+            f"source {lib}\n"
+            "rc=0\n"
+            f'out="$(documentdb_required_index_extension {shlex.quote(str(psql))} '
+            f'/run/postgresql 5432 postgres "" {shlex.quote(major)})" || rc=$?\n'
+            'printf "RC[%s]OUT[%s]\\n" "${rc}" "${out}"\n',
+            env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.startswith("RC["), r.stdout)
+        rc, _, rest = r.stdout.strip()[3:].partition("]OUT[")
+        calls_text = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        return int(rc), rest.rstrip("]"), calls_text
+
+    def test_resolver_returns_the_live_answer_as_authoritative(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, calls = self._resolve(td, live_output="extended_rum")
+            self.assertEqual((rc, out), (0, "documentdb_extended_rum"))
+            self.assertNotIn("pg_config", calls,
+                             "a live answer must not be second-guessed against disk")
+
+    def test_resolver_treats_an_empty_live_answer_as_an_answer(self):
+        # The GUC exists and is empty: this cluster has no alternate handler,
+        # and predicting a future one from the installed files would tell the
+        # operator to create an extension the server does not want.
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, calls = self._resolve(td, live_output="")
+            self.assertEqual((rc, out), (0, ""))
+            self.assertNotIn("pg_config", calls)
+
+    def test_resolver_marks_a_control_file_answer_as_not_live_confirmed(self):
+        # Pre-restart the GUC does not exist yet, so the answer comes from the
+        # installed control file -- correct, but status 2: the caller has to
+        # say "restart first", not "this cluster pins".
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, calls = self._resolve(
+                td, live_output="__documentdb_guc_absent__")
+            self.assertEqual((rc, out), (2, "documentdb_extended_rum"))
+            self.assertIn("pg_config", calls)
+
+    def test_resolver_marks_an_unreadable_server_as_not_live_confirmed(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, _ = self._resolve(td, live_exit=1)
+            self.assertEqual((rc, out), (2, "documentdb_extended_rum"))
+
+    def test_resolver_reports_status_2_when_it_never_reached_disk(self):
+        # Empty output at status 2 is "unknown", not "nothing needed": with no
+        # major there is no share directory to probe at all, and a caller that
+        # read this as 0 would print a confident single-statement repair.
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, calls = self._resolve(
+                td, major="", live_output="__documentdb_guc_absent__")
+            self.assertEqual((rc, out), (2, ""))
+            self.assertNotIn("pg_config", calls)
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, _ = self._resolve(
+                td, live_exit=1, bindir_has_pg_config=False)
+            self.assertEqual((rc, out), (2, ""))
+
+    def test_resolver_reports_no_extra_extension_when_it_is_not_installed(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, calls = self._resolve(
+                td, live_output="__documentdb_guc_absent__", control_file=False)
+            self.assertEqual((rc, out), (2, ""))
+            self.assertIn("pg_config", calls)
+
+    def test_status_2_needs_the_explicit_capture_both_callers_use(self):
+        # Why documentdb-gateway-admin and documentdb-register-gateway write
+        # `|| rc=$?`: under set -e the bare assignment aborts the tool on a
+        # perfectly ordinary pre-restart answer.
+        with tempfile.TemporaryDirectory() as td:
+            env, psql, _ = self._resolver_fixture(
+                td, live_output="__documentdb_guc_absent__")
+            lib = shlex.quote(str(Path(td) / "documentdb-tools-lib.sh"))
+            call = (f'documentdb_required_index_extension {shlex.quote(str(psql))} '
+                    '/run/postgresql 5432 postgres "" 18')
+            captured = self._bash(
+                "set -euo pipefail\n"
+                f"source {lib}\n"
+                "rc=0\n"
+                f'out="$({call})" || rc=$?\n'
+                'echo "SURVIVED rc=${rc} out=${out}"\n',
+                env=env,
+            )
+            self.assertEqual(captured.returncode, 0, captured.stderr)
+            self.assertIn("SURVIVED rc=2 out=documentdb_extended_rum",
+                          captured.stdout)
+
+            bare = self._bash(
+                "set -euo pipefail\n"
+                f"source {lib}\n"
+                f'out="$({call})"\n'
+                'echo "SURVIVED"\n',
+                env=env,
+            )
+            self.assertNotEqual(bare.returncode, 0,
+                                "control: a bare assignment must abort, which is "
+                                "the failure mode the callers guard against")
+            self.assertNotIn("SURVIVED", bare.stdout)
+
+    # ---- T3: documentdb-createcluster's order of operations ---------------
+
+    # Everything the wrapper shells out to, plus the handful of coreutils the
+    # script and the library need. The list is explicit so a case can leave one
+    # tool out and get the real "not installed" path.
+    CC_HOST_TOOLS = ("dirname", "cat", "sed", "grep", "tr", "cut", "uname",
+                     "mktemp", "rm", "head", "sort", "id", "stat", "awk")
+
+    def _createcluster_fixture(self, td, with_psql=True, control_file=True):
+        """The real wrapper, staged beside a library whose PostgreSQL layout
+        points at fixtures, with every external it calls replaced by a logging
+        stub. Nothing here creates a cluster or talks to a server."""
+        td = Path(td)
+        stage_tools_lib(td, self._tools_lib_with_fake_bindir())
+        text = self.CREATECLUSTER_SCRIPT.read_text(encoding="utf-8")
+        script = td / "documentdb-createcluster.sh"
+        script.write_text(text, encoding="utf-8")
+
+        stubs = td / "stubs"
+        stubs.mkdir()
+        log = td / "calls.log"
+        quoted_log = shlex.quote(str(log))
+        for name in ("pg_createcluster", "documentdb-tune"):
+            self._stub(stubs, name, f'echo "{name} $*" >> {quoted_log}\n')
+        self._stub(stubs, "pg_ctlcluster",
+                   f'echo "pg_ctlcluster $*" >> {quoted_log}\n'
+                   'exit "${DDB_START_EXIT:-0}"\n')
+        if with_psql:
+            self._stub(stubs, "psql",
+                       f'echo "psql $*" >> {quoted_log}\n'
+                       f'cat >> {quoted_log}\n'
+                       'exit "${DDB_PSQL_EXIT:-0}"\n')
+        # run_as_user's first choice; exec'ing through keeps the psql stub's
+        # stdin, which is where the DDL actually is.
+        self._stub(stubs, "runuser",
+                   f'echo "runuser $*" >> {quoted_log}\n'
+                   'shift 2\n'
+                   '[ "$1" = "--" ] && shift\n'
+                   'exec "$@"\n')
+        self._stub(stubs, "sudo", 'exit 0\n')
+
+        bindir = td / "pgbin"
+        bindir.mkdir()
+        sharedir = td / "pgshare"
+        (sharedir / "extension").mkdir(parents=True)
+        if control_file:
+            (sharedir / "extension" / "documentdb_extended_rum.control").write_text(
+                "default_version = '0.106-0'\n", encoding="utf-8")
+        self._stub(bindir, "pg_config", f'echo {shlex.quote(str(sharedir))}\n')
+
+        host = td / "hostbin"
+        host.mkdir()
+        for tool in self.CC_HOST_TOOLS:
+            found = shutil.which(tool)
+            if found:
+                (host / tool).symlink_to(found)
+
+        env = dict(os.environ)
+        env["PATH"] = os.pathsep.join([str(stubs), str(host)])
+        env["DDB_TEST_BINDIR"] = str(bindir)
+        return script, log, env
+
+    def _run_createcluster(self, script, env, *args, timeout=30):
+        bash = shutil.which("bash") or "/bin/bash"
+        return subprocess.run(
+            [bash, str(script), *args], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+
+    def test_createcluster_without_start_prints_start_then_one_recipe(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, log, env = self._createcluster_fixture(td)
+            r = self._run_createcluster(script, env, "18", "probe")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = r.stdout.splitlines()
+            start_at = next(i for i, l in enumerate(out) if l.startswith("Start with:"))
+            recipe_at = next(i for i, l in enumerate(out) if self.BASE_SQL in l)
+            self.assertLess(start_at, recipe_at,
+                            f"the recipe must follow the start command:\n{r.stdout}")
+            self.assertEqual(sum(1 for l in out if self.BASE_SQL in l), 1,
+                             f"exactly one recipe (tune is run with --no-next-steps):\n{r.stdout}")
+            self.assertIn("--cluster 18/probe", out[recipe_at])
+            self.assertIn(self.EXTRA_SQL, out[recipe_at])
+            calls = log.read_text(encoding="utf-8")
+            self.assertIn("--no-next-steps", calls)
+            self.assertNotIn("pg_ctlcluster", calls,
+                             "no --start must not start anything")
+            self.assertNotIn("psql", calls,
+                             "no --start must not create extensions")
+
+    def test_createcluster_start_provisions_after_the_server_is_up(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, log, env = self._createcluster_fixture(td)
+            r = self._run_createcluster(script, env, "18", "probe", "--start")
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            calls = log.read_text(encoding="utf-8")
+            self.assertLess(calls.index("pg_ctlcluster"), calls.index("psql"),
+                            f"the DDL needs a running server:\n{calls}")
+            self.assertIn("psql --cluster 18/probe -d postgres -X -v ON_ERROR_STOP=1 -f -",
+                          calls)
+            self.assertIn(self.BASE_SQL, calls)
+            self.assertIn(self.EXTRA_SQL, calls)
+            self.assertLess(calls.index(self.BASE_SQL), calls.index(self.EXTRA_SQL),
+                            "documentdb_extended_rum's install SQL needs the base "
+                            "extension's objects")
+            self.assertIn("\n".join([self.BEGIN_SQL, self.BASE_SQL, self.EXTRA_SQL,
+                                     self.COMMIT_SQL]), calls,
+                          "a failed documentdb_extended_rum must roll documentdb back")
+            self.assertNotIn(self.BASE_SQL, r.stdout,
+                             "a successful --start must not also hand out a recipe")
+
+    def test_createcluster_reports_a_start_failure_with_both_next_steps(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, log, env = self._createcluster_fixture(td)
+            env["DDB_START_EXIT"] = "1"
+            r = self._run_createcluster(script, env, "18", "probe", "--start")
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("did not start", r.stderr)
+            self.assertIn("pg_ctlcluster 18 probe start", r.stderr)
+            self.assertIn(self.BASE_SQL, r.stderr)
+            self.assertIn("--cluster 18/probe", r.stderr)
+            self.assertIn("refuse", r.stderr,
+                          "re-running the wrapper will not work; say so")
+            self.assertNotIn("psql", log.read_text(encoding="utf-8"),
+                             "no DDL against a server that did not start")
+
+    def test_createcluster_reports_a_ddl_failure_against_a_running_cluster(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, log, env = self._createcluster_fixture(td)
+            env["DDB_PSQL_EXIT"] = "1"
+            r = self._run_createcluster(script, env, "18", "probe", "--start")
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("failed to create the DocumentDB extensions", r.stderr)
+            self.assertIn("running", r.stderr)
+            self.assertIn("--cluster 18/probe", r.stderr)
+            self.assertIn(self.EXTRA_SQL, r.stderr)
+
+    def test_createcluster_checks_for_psql_before_creating_anything(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, log, env = self._createcluster_fixture(td, with_psql=False)
+            r = self._run_createcluster(script, env, "18", "probe", "--start")
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("psql is not available", r.stderr)
+            self.assertFalse(log.exists(),
+                             "the preflight must fire before pg_createcluster runs")
+
+    def test_createcluster_help_and_platform_guard_precede_the_library(self):
+        # --help and the "Debian/Ubuntu only" diagnostic have to work on a host
+        # where neither the library nor pg_createcluster is installed.
+        with tempfile.TemporaryDirectory() as td:
+            script, log, env = self._createcluster_fixture(td)
+            (Path(td) / "documentdb-tools-lib.sh").unlink()
+            r = self._run_createcluster(script, env, "--help")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Usage: documentdb-createcluster", r.stdout)
+
+            (Path(td) / "stubs" / "pg_createcluster").unlink()
+            r = self._run_createcluster(script, env, "18", "probe")
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("Debian/Ubuntu only", r.stderr)
+
+    # ---- T4: documentdb-tune's post-apply guidance ------------------------
+
+    def _tune_fixture(self, td, owner="documentdb-local", stat_exit=0,
+                      control_file=True):
+        """The real documentdb-tune against a throwaway --pgdata, with the
+        extended-RUM control file present (so it pins the handler) and a stat
+        that reports `owner` for the data directory."""
+        td = Path(td)
+        stage_tools_lib(td, self._tools_lib_with_fake_bindir())
+        script = td / "documentdb-tune.sh"
+        script.write_text(TUNE_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+
+        data_dir = td / "data"
+        data_dir.mkdir()
+        (data_dir / "PG_VERSION").write_text("18\n", encoding="utf-8")
+        (data_dir / "postgresql.conf").write_text(
+            "unix_socket_directories = '/tmp/ok'\nport = 5442\n", encoding="utf-8")
+
+        bindir = td / "pgbin"
+        bindir.mkdir()
+        sharedir = td / "pgshare"
+        (sharedir / "extension").mkdir(parents=True)
+        if control_file:
+            (sharedir / "extension" / "documentdb_extended_rum.control").write_text(
+                "default_version = '0.106-0'\n", encoding="utf-8")
+        self._stub(bindir, "pg_config", f'echo {shlex.quote(str(sharedir))}\n')
+
+        stubs = td / "stubs"
+        stubs.mkdir()
+        self._stub(stubs, "stat",
+                   f'printf "%s\\n" {shlex.quote(owner)}\nexit {stat_exit}\n')
+        # Pinned for the same reason as in _render: the printed runner follows
+        # the host, and the assertions below name one.
+        self._stub(stubs, "sudo", "exit 0\n")
+        env = dict(os.environ)
+        env["PATH"] = os.pathsep.join([str(stubs), env["PATH"]])
+        env["DDB_TEST_BINDIR"] = str(bindir)
+        return script, data_dir, env
+
+    def _run_tune(self, script, data_dir, env, *args):
+        bash = shutil.which("bash") or "/bin/bash"
+        return subprocess.run(
+            [bash, str(script), "--pgdata", str(data_dir), *args],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=30, env=env,
+        )
+
+    def test_tune_prints_the_restart_before_one_targeted_recipe(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, data_dir, env = self._tune_fixture(td)
+            r = self._run_tune(script, data_dir, env, "--yes")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            lines = r.stdout.splitlines()
+            restart_at = next(i for i, l in enumerate(lines) if "restart" in l.lower())
+            recipe_at = next(i for i, l in enumerate(lines) if self.BASE_SQL in l)
+            self.assertLess(restart_at, recipe_at,
+                            f"the library loads only from shared_preload_libraries:\n{r.stdout}")
+            self.assertEqual(sum(1 for l in lines if self.BASE_SQL in l), 1, r.stdout)
+            recipe = lines[recipe_at]
+            self.assertIn("sudo -u documentdb-local psql", recipe)
+            self.assertIn("-h /tmp/ok -p 5442", recipe)
+            self.assertIn("-d postgres -X -v ON_ERROR_STOP=1", recipe)
+            self.assertIn(self.EXTRA_SQL, recipe)
+
+    def test_tune_repeats_the_recovery_advice_when_the_config_is_current(self):
+        # Re-running tune is what an operator does when indexes fail, and the
+        # answer is usually the CREATE EXTENSION they never ran -- so the
+        # already-current path has to say it too, not just "up to date".
+        with tempfile.TemporaryDirectory() as td:
+            script, data_dir, env = self._tune_fixture(td)
+            first = self._run_tune(script, data_dir, env, "--yes")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            second = self._run_tune(script, data_dir, env, "--yes")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("already up to date", second.stdout)
+            lines = second.stdout.splitlines()
+            restart_at = next(i for i, l in enumerate(lines) if "restart" in l.lower())
+            recipe_at = next(i for i, l in enumerate(lines) if self.BASE_SQL in l)
+            self.assertLess(restart_at, recipe_at, second.stdout)
+            self.assertIn("-h /tmp/ok -p 5442", lines[recipe_at])
+
+    def test_tune_no_next_steps_suppresses_guidance_on_both_paths(self):
+        # documentdb-createcluster prints its own, in an order that accounts
+        # for a cluster it has not started yet: nothing may escape the flag.
+        with tempfile.TemporaryDirectory() as td:
+            script, data_dir, env = self._tune_fixture(td)
+            first = self._run_tune(script, data_dir, env, "--yes", "--no-next-steps")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertNotIn(self.BASE_SQL, first.stdout)
+            self.assertNotIn("restart", first.stdout.lower())
+
+            second = self._run_tune(script, data_dir, env, "--yes", "--no-next-steps")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("already up to date", second.stdout)
+            self.assertNotIn(self.BASE_SQL, second.stdout)
+            self.assertNotIn("restart", second.stdout.lower(),
+                             "the already-current path must obey the flag too")
+
+    def test_tune_dry_run_prints_no_recipe_for_work_it_did_not_do(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, data_dir, env = self._tune_fixture(td)
+            fresh = self._run_tune(script, data_dir, env, "--dry-run")
+            self.assertEqual(fresh.returncode, 0, fresh.stderr)
+            self.assertNotIn(self.BASE_SQL, fresh.stdout)
+
+            self.assertEqual(self._run_tune(script, data_dir, env, "--yes").returncode, 0)
+            current = self._run_tune(script, data_dir, env, "--dry-run")
+            self.assertEqual(current.returncode, 0, current.stderr)
+            self.assertNotIn(self.BASE_SQL, current.stdout)
+
+    def test_tune_withholds_the_command_when_the_owner_is_unusable(self):
+        # stat's UNKNOWN sentinel, root (which PostgreSQL refuses to run as),
+        # and a stat that fails are all "no account to name": printing
+        # `sudo -u UNKNOWN psql` would just waste the operator's time.
+        for owner, stat_exit in (("UNKNOWN", 0), ("root", 0), ("", 1)):
+            with self.subTest(owner=owner or "stat-failure"):
+                with tempfile.TemporaryDirectory() as td:
+                    script, data_dir, env = self._tune_fixture(
+                        td, owner=owner, stat_exit=stat_exit)
+                    r = self._run_tune(script, data_dir, env, "--yes")
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn(self.BASE_SQL, r.stdout,
+                                  "the statements themselves are still useful")
+                    recipe = next(l for l in r.stdout.splitlines()
+                                  if self.BASE_SQL in l)
+                    self.assertNotIn("psql", recipe,
+                                     "no runnable command without an account to run it as")
+                    if owner:
+                        self.assertIn(f"owned by '{owner}'", r.stdout)
+                    else:
+                        self.assertIn("Cannot read the owner", r.stdout)
+
+    def test_tune_restore_is_unaffected_by_the_new_guidance(self):
+        with tempfile.TemporaryDirectory() as td:
+            script, data_dir, env = self._tune_fixture(td)
+            self.assertEqual(self._run_tune(script, data_dir, env, "--yes").returncode, 0)
+            conf = data_dir / "postgresql.conf"
+            self.assertIn("documentdb-setup managed configuration",
+                          conf.read_text(encoding="utf-8"))
+            r = self._run_tune(script, data_dir, env, "--restore", "--yes")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("documentdb-setup managed configuration",
+                             conf.read_text(encoding="utf-8"))
+            self.assertNotIn(self.BASE_SQL, r.stdout)
+
+    # ---- T6: what `documentdb-gateway-admin check` tells an operator ------
+
+    def _admin_check(self, td, live="extended_rum", live_exit=0, base="1",
+                     extra="1", extra_exit=0, extra_stderr="",
+                     control_file=True, break_mktemp=False):
+        """Run the real cmd_check with a psql that answers each of its queries
+        from the arguments above. Only the caller's logic is under test here --
+        no server, no catalog."""
+        td = Path(td)
+        bindir = td / "pgbin"
+        bindir.mkdir()
+        sharedir = td / "pgshare"
+        (sharedir / "extension").mkdir(parents=True)
+        if control_file:
+            (sharedir / "extension" / "documentdb_extended_rum.control").write_text(
+                "default_version = '0.106-0'\n", encoding="utf-8")
+        self._stub(bindir, "pg_config", f'echo {shlex.quote(str(sharedir))}\n')
+        psql = self._stub(
+            td, "psql",
+            'sql=""\n'
+            'for a in "$@"; do sql="$a"; done\n'
+            'case "$sql" in\n'
+            '  *alternate_index_handler_name*)\n'
+            f'    printf "%s\\n" {shlex.quote(live)}; exit {live_exit} ;;\n'
+            '  *server_version_num*) echo 18; exit 0 ;;\n'
+            "  *\"extname = 'documentdb_extended_rum'\"*)\n"
+            f'    printf "%s" {shlex.quote(extra_stderr)} >&2\n'
+            f'    [ -n {shlex.quote(extra)} ] && printf "%s\\n" {shlex.quote(extra)}\n'
+            f'    exit {extra_exit} ;;\n'
+            "  *\"extname = 'documentdb'\"*)\n"
+            f'    [ -n {shlex.quote(base)} ] && printf "%s\\n" {shlex.quote(base)}\n'
+            '    exit 0 ;;\n'
+            '  *) echo 1; exit 0 ;;\n'
+            'esac\n')
+
+        # Staged without its `main "$@"` line, so sourcing defines the
+        # functions instead of running the CLI; the library goes with it
+        # because the script finds it beside itself.
+        stage_tools_lib(td, self._tools_lib_with_fake_bindir())
+        admin = td / "documentdb-gateway-admin.sh"
+        admin.write_text(
+            "\n".join(l for l in GATEWAY_ADMIN_SCRIPT.read_text(encoding="utf-8").splitlines()
+                       if l != 'main "$@"') + "\n",
+            encoding="utf-8")
+
+        harness = [
+            "set -uo pipefail",
+            "source " + shlex.quote(str(admin)),
+            # The library's PostgreSQL layout, pointed at the fixture above.
+            'documentdb_pg_bindir_candidates() { printf "%s\\n" '
+            + shlex.quote(str(bindir)) + "; }",
+            'find_psql() { printf "%s" ' + shlex.quote(str(psql)) + "; }",
+            # Inert: drop the account and run the stub directly.
+            'run_as_user() { shift; "$@"; }',
+            'PG_OWNER=postgres; TARGET_DB=appdb; SOCKET_DIR=/run/postgresql; PG_PORT=5432',
+            "_TEMP_FILES=()",
+        ]
+        if break_mktemp:
+            harness.append("mktemp() { return 1; }")
+        harness.append("cmd_check")
+        return self._bash("\n".join(harness) + "\n")
+
+    def test_admin_check_reports_a_healthy_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self._admin_check(td)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("DocumentDB extension: loaded", r.stdout)
+            self.assertIn("(documentdb_extended_rum): available", r.stdout)
+            self.assertNotIn(self.BASE_SQL, r.stdout,
+                             "nothing to repair, so no recipe")
+
+    def test_admin_check_names_the_missing_index_extension_and_its_remedy(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self._admin_check(td, extra="")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("(documentdb_extended_rum): MISSING", r.stdout)
+            self.assertIn("New index builds fail", r.stdout)
+            recipe = next(l for l in r.stdout.splitlines() if self.BASE_SQL in l)
+            self.assertIn("-h /run/postgresql -p 5432", recipe)
+            self.assertIn("-d appdb", recipe)
+            self.assertIn(self.EXTRA_SQL, recipe)
+
+    def test_admin_check_fails_when_the_extension_query_fails(self):
+        # A permission error is not "the extension is missing": reporting it as
+        # missing would send the operator to create something that is there.
+        with tempfile.TemporaryDirectory() as td:
+            r = self._admin_check(td, extra="", extra_exit=1,
+                                  extra_stderr="permission denied for table pg_extension")
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("Cannot probe for the 'documentdb_extended_rum' extension",
+                          r.stderr)
+            self.assertIn("permission denied", r.stderr)
+            self.assertNotIn("MISSING", r.stdout)
+
+    def test_admin_check_says_when_the_requirement_is_only_inferred(self):
+        # Pre-restart the GUC does not exist, so the answer comes from the
+        # installed control file: the restart has to come before the recipe.
+        with tempfile.TemporaryDirectory() as td:
+            r = self._admin_check(td, live="__documentdb_guc_absent__",
+                                  base="", extra="")
+            # documentdb is missing, so --check fails after printing the remedy.
+            self.assertEqual(r.returncode, 1, r.stderr)
+            lines = r.stdout.splitlines()
+            self.assertIn("installed control file", r.stdout)
+            restart_at = next(i for i, l in enumerate(lines) if "restart" in l.lower())
+            recipe_at = next(i for i, l in enumerate(lines) if self.BASE_SQL in l)
+            self.assertLess(restart_at, recipe_at, r.stdout)
+            self.assertIn(self.EXTRA_SQL, lines[recipe_at])
+
+    def test_admin_check_warns_when_it_cannot_determine_the_requirement(self):
+        # No live answer and nothing installed to infer from: an empty result
+        # is "unknown", and a confident base-only recipe would be a lie.
+        with tempfile.TemporaryDirectory() as td:
+            r = self._admin_check(td, live="__documentdb_guc_absent__",
+                                  base="", extra="", control_file=False)
+            # documentdb is missing, so --check fails after printing the remedy.
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("cannot tell which index extension", r.stdout)
+            self.assertIn("may be incomplete", r.stdout)
+
+    def test_admin_check_reports_a_failed_temp_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self._admin_check(td, break_mktemp=True)
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("temporary file", r.stderr)
+
+    def test_admin_check_does_not_blame_the_libraries_for_a_failed_read(self):
+        # Status 2 means "not live-confirmed", which covers both a GUC that
+        # does not exist yet and a query that simply did not answer. Stating
+        # the first sends an operator to restart a healthy server on the
+        # strength of a failed observation.
+        with tempfile.TemporaryDirectory() as td:
+            r = self._admin_check(td, live="", live_exit=1, base="", extra="")
+            # documentdb is missing, so --check fails after printing the remedy.
+            self.assertEqual(r.returncode, 1, r.stderr)
+            # The diagnosis wraps across log lines, each with its own prefix;
+            # compare it as one sentence.
+            flat = " ".join(" ".join(
+                l.replace("[documentdb-gateway-admin]", "") for l in r.stdout.splitlines()
+            ).split())
+            self.assertNotIn("has not loaded", flat)
+            self.assertIn("could not be read from this server", flat)
+            self.assertIn("inferred from installed files", flat)
+            self.assertIn("If PostgreSQL has not restarted since documentdb-tune ran", flat)
+            recipe = next(l for l in r.stdout.splitlines() if self.BASE_SQL in l)
+            self.assertIn(self.EXTRA_SQL, recipe,
+                          "the inferred requirement still belongs in the remedy")
+
+
+def _shell_function(test, path, name):
+    """Return the full definition of shell function ``name`` in ``path``."""
+    match = re.search(
+        rf"^{re.escape(name)}\(\)\s*\{{.*?^\}}",
+        Path(path).read_text(encoding="utf-8"),
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    test.assertIsNotNone(match, f"could not locate shell function {name} in {path}")
+    return match.group(0)
+
+
+class PgCtlRestartDetachesFromCallerTests(unittest.TestCase):
+    """A non-systemd restart must not leave
+    the new postmaster holding setup's stdout, and the nohup gateway must not
+    share the caller's process group."""
+
+    def test_restart_path_returns_to_a_piped_caller(self):
+        shell = shutil.which("bash")
+        if not shell:
+            self.skipTest("bash not available")
+        func = _shell_function(self, SETUP_SCRIPT, "start_or_restart_postgres")
+        with tempfile.TemporaryDirectory() as tmp:
+            # Stand-in pg_ctl: the "postmaster" is a long-lived child that keeps
+            # the caller's stdout unless -l redirects it, exactly like the real one.
+            fake = Path(tmp) / "pg_ctl"
+            fake.write_text(
+                "#!/bin/bash\n"
+                'log=""; prev=""\n'
+                'for a in "$@"; do [[ "$prev" == -l ]] && log="$a"; prev="$a"; done\n'
+                'case " $* " in *" status "*) exit 0 ;; esac\n'
+                'if [[ -n "$log" ]]; then sleep 30 >>"$log" 2>&1 & else sleep 30 & fi\n'
+                f'echo "$!" > {tmp}/postmaster.pid\n',
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            script = (
+                "set -euo pipefail\n"
+                "log_info() { :; }; log_warn() { :; }\n"
+                "ensure_socket_dir_writable() { :; }; wait_for_postgres() { :; }\n"
+                "has_systemd_unit_file() { return 1; }\n"
+                'run_as_user() { shift; "$@"; }\n'
+                'TARGET_CLUSTER=""; HAS_WORKING_SYSTEMD=false\n'
+                "PG_CONFIG_CHANGED=true; PG_RELOAD_CHANGED=false; PG_VERSION=17\n"
+                f"DATA_DIR={tmp}; PG_CTL={fake}\n"
+                + func + "\nstart_or_restart_postgres\necho restarted\n"
+            )
+            try:
+                r = subprocess.run([shell, "-c", script], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=10)
+            except subprocess.TimeoutExpired:
+                self.fail("pg_ctl restart without -l kept the caller's pipe open")
+            finally:
+                pid_file = Path(tmp) / "postmaster.pid"
+                if pid_file.exists():
+                    subprocess.run(["kill", pid_file.read_text().strip()],
+                                   capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("restarted", r.stdout)
+
+    def test_nohup_gateway_launch_gets_its_own_session(self):
+        text = SETUP_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("{ ${setsid_clause}nohup ${escaped_binary}", text)
+        shell = shutil.which("bash")
+        if not shell or not shutil.which("setsid") or not os.path.isdir("/proc"):
+            self.skipTest("needs bash, setsid and /proc")
+        with tempfile.TemporaryDirectory() as tmp:
+            # Same shape as the shipped launch: $! must still be the daemon,
+            # and the daemon must lead its own session.
+            cmd = (f"{{ setsid nohup sleep 30 > {tmp}/gw.log 2>&1 & "
+                   f"{{ echo $! > {tmp}/gw.pid; }} 2>/dev/null || true; }}")
+            subprocess.run([shell, "-c", cmd], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=10)
+            pid = (Path(tmp) / "gw.pid").read_text().strip()
+            try:
+                comm = sid = ""
+                for _ in range(50):
+                    stat = Path(f"/proc/{pid}/stat").read_text()
+                    comm = stat[stat.index("(") + 1:stat.rindex(")")]
+                    sid = stat[stat.rindex(")") + 2:].split()[3]
+                    if comm == "sleep":
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(comm, "sleep", "the record must name the daemon")
+                self.assertEqual(sid, pid, "the daemon must lead its own session")
+            finally:
+                subprocess.run(["kill", pid], capture_output=True)
+
+
+class NohupGatewayLifecycleTests(unittest.TestCase):
+    """Without systemd, scoped --restore,
+    --status and a --listen-port change must go through the per-port gateway
+    record instead of trusting (or ignoring) whatever holds the port."""
+
+    def setUp(self):
+        self.shell = shutil.which("bash")
+        if not self.shell:
+            self.skipTest("bash not available")
+
+    def _lib(self, *names):
+        return "\n".join(
+            _shell_function(self, SETUP_SCRIPT if name in (
+                "stop_gateway_process", "wait_for_listener_to_clear",
+                "stop_recorded_nohup_gateway", "status_only",
+                "find_listener_pid", "command_exists") else TOOLS_LIB, name)
+            for name in names
+        ) + "\n"
+
+    def test_stop_recorded_nohup_gateway_stops_the_recorded_pid(self):
+        if not os.access("/proc/net/tcp", os.R_OK):
+            self.skipTest("needs readable /proc/net/tcp")
+        proc, port = GatewayListenerPidSafetyTests._spawn_listener()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                record = Path(tmp) / f"gateway-{port}.pid"
+                record.write_text(str(proc.pid))
+                script = (
+                    'log_info() { echo "INFO: $*"; }; log_warn() { echo "WARN: $*" >&2; }\n'
+                    + self._lib("port_listen_inodes", "wait_for_listener_to_clear",
+                                "stop_gateway_process", "stop_recorded_nohup_gateway")
+                    + f"nohup_gateway_pidfile() {{ printf '%s' {tmp}/gateway-$1.pid; }}\n"
+                    + f"nohup_gateway_pid_for_port() {{ printf '%s' {proc.pid}; }}\n"
+                    + f"stop_recorded_nohup_gateway {port}\n"
+                )
+                r = subprocess.run([self.shell, "-c", script], capture_output=True,
+                                   text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f"pid {proc.pid}", r.stdout)
+                self.assertIsNotNone(proc.wait(timeout=5), "the recorded gateway must be stopped")
+                self.assertFalse(record.exists(), "the record of a stopped gateway must go")
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_stop_recorded_nohup_gateway_leaves_unrecorded_listeners_alone(self):
+        proc, port = GatewayListenerPidSafetyTests._spawn_listener()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                record = Path(tmp) / f"gateway-{port}.pid"
+                record.write_text("999999")
+                script = (
+                    "log_info() { :; }; log_warn() { :; }\n"
+                    + self._lib("stop_recorded_nohup_gateway")
+                    + f"nohup_gateway_pidfile() {{ printf '%s' {tmp}/gateway-$1.pid; }}\n"
+                    + "nohup_gateway_pid_for_port() { return 1; }\n"
+                    + "stop_gateway_process() { echo SIGNALLED; }\n"
+                    + f"stop_recorded_nohup_gateway {port}\n"
+                )
+                r = subprocess.run([self.shell, "-c", script], capture_output=True,
+                                   text=True, timeout=20)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("SIGNALLED", r.stdout)
+                self.assertIsNone(proc.poll(), "an unrecorded listener must survive")
+                self.assertFalse(record.exists(), "a stale record must still be dropped")
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def _status(self, port, recorded, uid):
+        script = (
+            "log_warn() { :; }; documentdb_default_pg_port() { echo 1; }\n"
+            + f"id() {{ echo {uid}; }}\n"
+            + ("nohup_gateway_pid_for_port() { echo 4242; }\n" if recorded
+               else "nohup_gateway_pid_for_port() { return 1; }\n")
+            + self._lib("status_only")
+            + f"PG_VERSION=99; GATEWAY_PORT={port}\nstatus_only\n"
+        )
+        return subprocess.run([self.shell, "-c", script], capture_output=True,
+                              text=True, timeout=20)
+
+    def test_status_does_not_call_a_foreign_listener_active(self):
+        if not (shutil.which("ss") or os.access("/proc/net/tcp", os.R_OK)):
+            self.skipTest("needs ss or /proc/net/tcp")
+        proc, port = GatewayListenerPidSafetyTests._spawn_listener()
+        try:
+            r = self._status(port, recorded=False, uid=0)
+            self.assertIn(f"gateway listener:              {port}", r.stdout)
+            self.assertNotIn("active (nohup", r.stdout)
+            self.assertIn("not this install's recorded gateway", r.stdout)
+            self.assertNotEqual(r.returncode, 0)
+
+            r = self._status(port, recorded=False, uid=1000)
+            self.assertIn("run as root", r.stdout)
+            self.assertNotIn("active (nohup", r.stdout)
+
+            r = self._status(port, recorded=True, uid=0)
+            self.assertIn("active (nohup; no systemd)", r.stdout)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_scoped_restore_stops_its_gateway_before_removing_state(self):
+        text = SETUP_SCRIPT.read_text(encoding="utf-8")
+        start = text.index('if [[ "${RESTORE}" == "true" ]]; then\n        [[ "${DRY_RUN}"')
+        body = text[start:text.index('log_success "Restore complete.', start)]
+        read_at = body.index('scoped_gateway_port="$(persisted_gateway_port "${restore_scope}")"')
+        self.assertLess(read_at, body.index('rm -f "${per_major_conf}"'),
+                        "the port must be read before setup.conf is deleted")
+        self.assertLess(read_at, body.index('rm -f "${per_major_brownfield}"'))
+        stop_at = body.index('stop_recorded_nohup_gateway "${scoped_gateway_port}"')
+        self.assertLess(stop_at, body.index('rm -f "${per_major_conf}"'),
+                        "a gateway that will not stop must leave the install intact")
+        self.assertLess(stop_at, body.index('rm -f "${per_major_brownfield}"'))
+        self.assertIn("Nothing was removed", body[stop_at:stop_at + 300])
+
+    def test_listen_port_change_stops_the_previous_ports_gateway(self):
+        # Right before the new state is moved into place: a refused or failed
+        # run must leave the old gateway serving.
+        for persist, refusal, publish in (
+                ("persist_self_managed_postgres_state", "A brownfield install", 'mv "${per_major_temp}"'),
+                ("persist_brownfield_state", "A greenfield (package-owned)", 'mv "${tmp}" "${brownfield_conf}"')):
+            body = _shell_function(self, SETUP_SCRIPT, persist)
+            retire_at = body.index("retire_previous_port_gateway")
+            self.assertGreater(retire_at, body.index(refusal), persist)
+            self.assertGreater(retire_at, body.index("GATEWAY_PORT="), persist)
+            self.assertLess(retire_at, body.index(publish), persist)
+        retire = _shell_function(self, SETUP_SCRIPT, "retire_previous_port_gateway")
+        self.assertLess(retire.index('"${NO_ENABLE}" == "true"'), retire.index("stop_recorded_nohup_gateway"))
+        persisted = _shell_function(self, SETUP_SCRIPT, "default_gateway_settings_from_persisted_state")
+        self.assertIn('[[ -n "${PERSISTED_GATEWAY_PORT}" ]] || PERSISTED_GATEWAY_PORT=', persisted,
+                      "the previous port must be captured once, before setup.conf is rewritten")
+
+
+class TeardownStopsWhatSetupStartedTests(unittest.TestCase):
+    """Reset and package removal must not
+    report success while this major's postmaster or nohup gateway still runs
+    on a host without systemd."""
+
+    GATEWAY_PRERM = OSS_ROOT / "documentdb-local" / "maintainer-scripts" / "gateway" / "prerm"
+    GATEWAY_SPEC = OSS_ROOT / "packaging" / "rpm" / "spec" / "documentdb-gateway.spec"
+
+    def setUp(self):
+        self.shell = shutil.which("bash")
+        if not self.shell or not os.path.isdir("/proc"):
+            self.skipTest("needs bash and /proc")
+        self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+
+    def _spawn(self, tmp, name, *args):
+        # A symlink sets both argv[0] and /proc/PID/comm to `name`.
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir(exist_ok=True)
+        link = bindir / name
+        if not link.exists():
+            link.symlink_to(shutil.which("python3"))
+        p = subprocess.Popen([str(link), "-c", "import time; time.sleep(60)", *args])
+        self.procs.append(p)
+        for _ in range(50):
+            if Path(f"/proc/{p.pid}/comm").read_text().strip() == name[:15]:
+                break
+            time.sleep(0.1)
+        return p
+
+    def _lib(self, body):
+        return (f'. {TOOLS_LIB}\n' 'log_warn() { echo "WARN: $*" >&2; }\n'
+                'die() { echo "$*" >&2; exit 1; }\n' + body)
+
+    def test_postmaster_found_after_its_data_directory_is_gone(self):
+        # Only the socket lock is left; a same-path cluster elsewhere is not ours.
+        with tempfile.TemporaryDirectory() as tmp:
+            gone = f"{tmp}/data"
+            ours = self._spawn(tmp, "postgres", "-D", gone)
+            self._spawn(tmp, "postgres", "-D", gone)
+            lock = Path(tmp) / ".s.PGSQL.9717.lock"
+            lock.write_text(f"{ours.pid}\n{gone}\n")
+            r = subprocess.run([self.shell, "-c", self._lib(
+                f'documentdb_postmaster_pids {gone} {lock}\n')],
+                capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.stdout.split(), [str(ours.pid)], r.stderr)
+
+    def test_persisted_path_matches_pg_ctls_normalized_argv(self):
+        # pg_ctl strips trailing slashes, "//" and "/./" before exec'ing postgres.
+        with tempfile.TemporaryDirectory() as tmp:
+            ours = self._spawn(tmp, "postgres", "-D", f"{tmp}/data")
+            lock = Path(tmp) / ".s.PGSQL.9717.lock"
+            lock.write_text(f"{ours.pid}\n")
+            r = subprocess.run([self.shell, "-c", self._lib(
+                f'documentdb_postmaster_pids {tmp}//./data/ {lock}\n')],
+                capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.stdout.split(), [str(ours.pid)], r.stderr)
+
+    def test_a_symlinked_data_dir_matches_only_the_same_directory(self):
+        # Setup accepts --data-dir via a symlink while postgres keeps the -D it started with.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "volume" / "other").mkdir(parents=True)
+            for alias in ("db", "alt"):
+                (Path(tmp) / alias).symlink_to(Path(tmp) / "volume")
+            other = self._spawn(tmp, "postgres", "-D", f"{tmp}/volume/other")
+            data = Path(tmp) / "volume" / "data"
+            lock = Path(tmp) / ".s.PGSQL.9717.lock"
+
+            def pids():
+                r = subprocess.run([self.shell, "-c", self._lib(
+                    f'documentdb_postmaster_pids {tmp}/db/data {lock}\n')],
+                    capture_output=True, text=True, timeout=20)
+                return r.stdout.split(), r.stderr
+
+            # Attached form through a second alias: neither spelling is literal.
+            for argv in (["-D", str(data)], [f"-D{tmp}/alt/data"]):
+                data.mkdir()
+                ours = self._spawn(tmp, "postgres", *argv)
+                (data / "postmaster.pid").write_text(f"{ours.pid}\n")
+                lock.write_text(f"{other.pid}\n")
+                found, err = pids()
+                self.assertEqual(found, [str(ours.pid)], f"{argv}: {err}")
+
+                # Still found by its socket lock once the directory is gone.
+                shutil.rmtree(data)
+                lock.write_text(f"{ours.pid}\n")
+                found, err = pids()
+                self.assertEqual(found, [str(ours.pid)], f"{argv}: {err}")
+
+    def test_a_relative_data_dir_matches_only_the_recorded_postmaster(self):
+        # Two clusters launched from different directories share "-D data".
+        with tempfile.TemporaryDirectory() as tmp:
+            ours = self._spawn(tmp, "postgres", "-D", "data")
+            self._spawn(tmp, "postgres", "-D", "data")
+            lock = Path(tmp) / ".s.PGSQL.9717.lock"
+            lock.write_text(f"{ours.pid}\n")
+            r = subprocess.run([self.shell, "-c", self._lib(f'documentdb_postmaster_pids data {lock}\n')],
+                               capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.stdout.split(), [str(ours.pid)], r.stderr)
+
+    def test_setup_persists_an_absolute_normalized_data_dir(self):
+        func = _shell_function(self, SETUP_SCRIPT, "parse_arguments")
+        with tempfile.TemporaryDirectory() as tmp:
+            r = subprocess.run([self.shell, "-c", func + '\nparse_arguments --data-dir "clusters//18/./data/"\n'
+                                'echo "DATA_DIR=${DATA_DIR}"'], cwd=tmp, capture_output=True, text=True, timeout=20)
+            self.assertIn(f"DATA_DIR={os.path.realpath(tmp)}/clusters/18/data", r.stdout, r.stderr)
+
+    def test_pid_and_lock_files_are_not_trusted(self):
+        # A stale file's PID may now be another cluster's postgres.
+        with tempfile.TemporaryDirectory() as tmp:
+            other = self._spawn(tmp, "postgres", "-D", f"{tmp}/pg17")
+            data = Path(tmp) / "data"
+            data.mkdir()
+            (data / "postmaster.pid").write_text(f"{other.pid}\n{data}\n")
+            r = subprocess.run([self.shell, "-c", self._lib(f'documentdb_postmaster_pids {data}\n')],
+                               capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.stdout.strip(), "")
+
+    def test_stop_local_major_stops_gateway_and_greenfield_postmaster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "etc" / "17"
+            conf.mkdir(parents=True)
+            data = f"{tmp}/data-already-deleted"
+            (conf / "setup.conf").write_text(
+                "DOCUMENTDB_MANAGED_POSTGRES=true\nDOCUMENTDB_MODE=greenfield\n"
+                f"PG_PORT=9717\nDATA_DIR={data}\nGATEWAY_PORT=10399\n")
+            pm = self._spawn(tmp, "postgres", "-D", data)
+            gw = self._spawn(tmp, "documentdb-gateway-daemon")
+            record = Path(tmp) / "gateway-10399.pid"
+            record.write_text(str(gw.pid))
+            (Path(tmp) / "run" / "17" / "postgresql").mkdir(parents=True)
+            (Path(tmp) / "run" / "17" / "postgresql" / ".s.PGSQL.9717.lock").write_text(f"{pm.pid}\n")
+            func = _shell_function(self, TOOLS_LIB, "documentdb_stop_local_major").replace(
+                "/etc/documentdb/local/", f"{tmp}/etc/").replace("/run/documentdb-local/", f"{tmp}/run/")
+            r = subprocess.run([self.shell, "-c", self._lib(
+                func + "\n"
+                + f"nohup_gateway_pidfile() {{ printf '%s' {tmp}/gateway-$1.pid; }}\n"
+                + f'nohup_gateway_pid_for_port() {{ documentdb_pid_running {gw.pid} && printf %s {gw.pid}; }}\n'
+                + "documentdb_stop_local_major 17\n")],
+                capture_output=True, text=True, timeout=90)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIsNotNone(gw.wait(timeout=5))
+            self.assertIsNotNone(pm.wait(timeout=5))
+            self.assertFalse(record.exists())
+
+    def test_stop_local_major_leaves_brownfield_postgres_alone(self):
+        func = _shell_function(self, TOOLS_LIB, "documentdb_stop_local_major")
+        self.assertIn('[[ "${managed}" == "true" && -n "${data_dir}" ]]', func)
+        self.assertIn('"${conf_dir}/setup.conf"', func[func.index("Brownfield PostgreSQL"):])
+
+    def test_stop_postmaster_escalates_to_immediate_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = f"{tmp}/data"
+            Path(data).mkdir()
+            (Path(tmp) / "bin").mkdir()
+            (Path(tmp) / "bin" / "postgres").symlink_to(shutil.which("python3"))
+            # A fast shutdown that never finishes, e.g. a long checkpoint.
+            pm = subprocess.Popen([str(Path(tmp) / "bin" / "postgres"), "-c",
+                                   "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(60)",
+                                   "-D", data])
+            self.procs.append(pm)
+            (Path(data) / "postmaster.pid").write_text(f"{pm.pid}\n{data}\n")
+            time.sleep(0.5)
+            func = _shell_function(self, TOOLS_LIB, "documentdb_stop_postmaster").replace("i < 150", "i < 10")
+            r = subprocess.run([self.shell, "-c", self._lib(func + f"\ndocumentdb_stop_postmaster {data}\n")],
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.stdout.strip(), "", r.stderr)
+            self.assertEqual(pm.wait(timeout=5), -signal.SIGQUIT)
+
+    def _run_gateway_prerm(self, tmp):
+        text = self.GATEWAY_PRERM.read_text(encoding="utf-8")
+        text = text.replace("/run/documentdb-gateway/", f"{tmp}/run/")
+        text = text.replace("[[ -d /run/systemd/system ]]", "false")
+        prerm = Path(tmp) / "prerm"
+        prerm.write_text(text)
+        return subprocess.run([self.shell, str(prerm), "remove"],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_gateway_prerm_stops_recorded_nohup_gateways_without_systemd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "run").mkdir()
+            gw = self._spawn(tmp, "documentdb-gateway-daemon")
+            bystander = self._spawn(tmp, "unrelated")
+            stat = Path(f"/proc/{gw.pid}/stat").read_text()
+            start = stat[stat.rindex(")") + 2:].split()[19]
+            (Path(tmp) / "run" / "gateway-10260.pid").write_text(f"{gw.pid} {start}")
+            (Path(tmp) / "run" / "gateway-10261.pid").write_text(str(bystander.pid))
+            r = self._run_gateway_prerm(tmp)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn(f"pid {gw.pid}", r.stdout)
+            self.assertIsNotNone(gw.wait(timeout=5))
+            self.assertIsNone(bystander.poll(), "a record naming another program must not be signalled")
+            self.assertEqual(list((Path(tmp) / "run").iterdir()), [])
+
+    def test_gateway_prerm_ignores_a_record_with_a_different_start_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "run").mkdir()
+            gw = self._spawn(tmp, "documentdb-gateway-daemon")
+            (Path(tmp) / "run" / "gateway-10260.pid").write_text(f"{gw.pid} 1")
+            r = self._run_gateway_prerm(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNone(gw.poll(), "a recycled PID must not be signalled")
+
+    def _hostile_records(self, run):
+        # The record directory is gateway-writable; root must never block on it.
+        for f in run.iterdir():
+            f.unlink()
+        for i in range(200):
+            os.mkfifo(run / f"gateway-{i}.pid")
+        held = run / "gateway-900.pid"
+        os.mkfifo(held)
+        self.procs.append(subprocess.Popen(["sh", "-c", f'exec 3<> "{held}"; sleep 30']))
+        (run / "gateway-901.pid").symlink_to("/dev/zero")
+
+    def test_hostile_records_never_stall_readers_or_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run"
+            run.mkdir()
+            self._hostile_records(run)
+            r = subprocess.run([self.shell, "-c", self._lib(
+                f'for f in {run}/gateway-0.pid {run}/gateway-900.pid {run}/gateway-901.pid; do '
+                'nohup_gateway_record_pid "$f" && echo "read $f"; done; echo done\n')],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.stdout.strip(), "done", r.stderr)
+
+            preun = "\n".join(l for l in self._preun(self.GATEWAY_SPEC).splitlines()
+                              if not l.startswith("%systemd_preun"))
+            preun = preun.replace("/run/documentdb-gateway/", f"{run}/").replace("[ -d /run/systemd/system ]", "false")
+            r = subprocess.run(["sh", "-c", preun, "preun", "0"], capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+            self._hostile_records(run)
+            r = self._run_gateway_prerm(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    @staticmethod
+    def _preun(spec):
+        return re.search(r"^%preun\n(.*?)^%postun", spec.read_text(encoding="utf-8"),
+                         flags=re.DOTALL | re.MULTILINE).group(1)
+
+    def test_rpm_gateway_preun_mirrors_the_deb_prerm(self):
+        preun = self._preun(self.GATEWAY_SPEC)
+        self.assertIn('elif [ "$1" -eq 0 ]; then', preun)
+        self.assertIn("/run/documentdb-gateway/gateway-*.pid", preun)
+        self.assertIn('[ "${start}" = "${cur}" ]', preun)
+        self.assertIn("warning: gateway pid(s)", preun)
+        self.assertNotIn("exit 1", preun, "removal must never be blocked")
+
+    def test_documentdb_n_removal_stops_its_major_without_systemd(self):
+        deb = STANDALONE_BUILD_SCRIPT.read_text(encoding="utf-8")
+        prerm = re.search(r'cat > "\$\{PKG_DIR\}/DEBIAN/prerm" <<PRERM\n(.*?)\nPRERM',
+                          deb, flags=re.DOTALL).group(1)
+        preun = self._preun(STANDALONE_SPEC)
+        for body, major in ((prerm, "${PG_VERSION}"), (preun, "%{pg_version}")):
+            else_branch = body[body.index("else" if body is prerm else "elif"):]
+            self.assertIn("documentdb_stop_local_major", else_branch)
+            self.assertIn(f'"{major}" || {{', else_branch)
+            self.assertIn("warning: DocumentDB for PostgreSQL", else_branch)
+            self.assertNotRegex(else_branch, r"warning:[^\n]*\n\s*exit 1", "removal must never be blocked")
+
+    def test_reset_finds_the_postmaster_and_verifies_before_deleting(self):
+        script = RESET_SCRIPT.read_text(encoding="utf-8")
+        first_rm = script.index('rm -rf "${data_dir}"')
+        nothing = script.index("Nothing to reset for PostgreSQL")
+        self.assertLess(nothing, script.index('systemctl stop "documentdb-local@'),
+                        "a never-installed major must be reported before touching anything")
+        finder = script.index('_pm_pids="$(documentdb_postmaster_pids', nothing + 1)
+        self.assertLess(finder, first_rm)
+        self.assertLess(script.index("still running for ${data_dir}"), first_rm)
+        self.assertLess(script.index("did not stop. Nothing was deleted"), first_rm)
+
+
+class ListenAddressSurvivesRerunTests(unittest.TestCase):
+    """A re-run must keep a restricted
+    gateway bind address, and --status must show it plus the extension
+    versions actually created."""
+
+    def setUp(self):
+        self.shell = shutil.which("bash")
+        if not self.shell:
+            self.skipTest("bash not available")
+
+    def _funcs(self, tmp, *names):
+        return "\n".join(
+            _shell_function(self, SETUP_SCRIPT, n).replace("/etc/documentdb/local/", f"{tmp}/")
+            for n in names) + "\n"
+
+    def _defaults(self, env_lines, extra=""):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "17").mkdir()
+            (Path(tmp) / "17" / "gateway.env").write_text("\n".join(env_lines) + "\n")
+            (Path(tmp) / "17" / "setup.conf").write_text("GATEWAY_PORT=10260\n")
+            script = (
+                'log_info() { echo "INFO: $*"; }\n'
+                + self._funcs(tmp, "persisted_listen_addr", "persisted_gateway_port",
+                              "default_gateway_settings_from_persisted_state")
+                + 'PG_VERSION=17; GATEWAY_PORT=10260; GATEWAY_PORT_EXPLICIT=false; DRY_RUN=false\n'
+                + 'PERSISTED_GATEWAY_PORT=""; GATEWAY_LISTEN_HOST=""\n'
+                + 'TLS_CERT_FILE=""; TLS_KEY_FILE=""; TLS_AUTO_GENERATE=""\n' + extra
+                + 'default_gateway_settings_from_persisted_state\n'
+                + 'echo "ADDR=${GATEWAY_LISTEN_HOST}:${GATEWAY_PORT}"\n'
+            )
+            r = subprocess.run([self.shell, "-c", script], capture_output=True,
+                               text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+
+    def test_rerun_keeps_a_loopback_bind(self):
+        out = self._defaults(["DOCUMENTDB_PG_URL_FILE=/x", "DOCUMENTDB_LISTEN_ADDR=127.0.0.1:10260"])
+        self.assertIn("ADDR=127.0.0.1:10260", out)
+        self.assertIn("Keeping gateway bind address 127.0.0.1", out)
+
+    def test_the_effective_last_assignment_wins(self):
+        # An operator line outside the managed block comes first; the block's
+        # value is the one the gateway sees.
+        out = self._defaults(["DOCUMENTDB_LISTEN_ADDR=127.0.0.1:10260",
+                              "# >>> documentdb-register-gateway managed env >>>",
+                              "DOCUMENTDB_LISTEN_ADDR=[::1]:10260",
+                              "# <<< documentdb-register-gateway managed env <<<"])
+        self.assertIn("ADDR=[::1]:10260", out)
+
+    def test_a_port_change_does_not_widen_the_bind(self):
+        out = self._defaults(["DOCUMENTDB_LISTEN_ADDR=localhost:10260"],
+                             extra="GATEWAY_PORT=27017; GATEWAY_PORT_EXPLICIT=true\n")
+        self.assertIn("ADDR=localhost:27017", out)
+
+    def test_quoted_and_exported_binds_are_kept(self):
+        # The gateway wrapper accepts these forms, so a re-run must too.
+        for line in ('DOCUMENTDB_LISTEN_ADDR="127.0.0.1:10260"',
+                     "export DOCUMENTDB_LISTEN_ADDR='127.0.0.1:10260'",
+                     "  DOCUMENTDB_LISTEN_ADDR = 127.0.0.1:10260  ",
+                     'DOCUMENTDB_LISTEN_ADDR=" 127.0.0.1:10260 "'):
+            with self.subTest(line=line):
+                self.assertIn("ADDR=127.0.0.1:10260", self._defaults([line]))
+
+    def test_only_binds_the_gateway_accepts_are_kept(self):
+        # The gateway refuses explicit non-loopback hosts; keeping one would break every re-run.
+        for line in ("DOCUMENTDB_LISTEN_ADDR=0.0.0.0:10260", "DOCUMENTDB_LISTEN_ADDR=[::]:10260",
+                     "DOCUMENTDB_LISTEN_ADDR=10.0.0.5:10260"):
+            with self.subTest(line=line):
+                self.assertIn("ADDR=:10260", self._defaults([line]))
+        self.assertIn("ADDR=[::1]:10260", self._defaults(["DOCUMENTDB_LISTEN_ADDR=[::1]"]))
+        self.assertIn("ADDR=::1:10260", self._defaults(["DOCUMENTDB_LISTEN_ADDR=::1:10260"]))
+
+    def test_a_wildcard_bind_stays_wildcard(self):
+        out = self._defaults(["DOCUMENTDB_LISTEN_ADDR=:10260"])
+        self.assertIn("ADDR=:10260", out)
+        self.assertNotIn("bind address", out)
+
+    def test_register_gateway_accepts_a_bracketed_ipv6_loopback(self):
+        text = GATEWAY_SETUP_SCRIPT.read_text(encoding="utf-8")
+        regex = re.search(r'if ! \[\[ "\$2" =~ (\S+) \]\]; then\n\s*die "--listen-addr', text).group(1)
+        for value, ok in (("[::1]:10260", True), ("127.0.0.1:10260", True), (":10260", True),
+                          ("[::1]", False), ("a b:1", False)):
+            r = subprocess.run([self.shell, "-c", f'[[ "$1" =~ {regex} ]]', "_", value])
+            self.assertEqual(r.returncode == 0, ok, value)
+
+    def test_status_shows_the_bind_address_and_extension_versions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "99").mkdir()
+            (Path(tmp) / "99" / "setup.conf").write_text("GATEWAY_PORT=10399\n")
+            (Path(tmp) / "99" / "gateway.env").write_text("DOCUMENTDB_LISTEN_ADDR=127.0.0.1:10399\n")
+            script = (
+                "log_warn() { :; }; documentdb_default_pg_port() { echo 1; }\n"
+                "nohup_gateway_pid_for_port() { return 1; }\n"
+                "status_extension_versions() { echo 'documentdb_core 0.110-0, documentdb 0.110-0'; }\n"
+                + self._funcs(tmp, "persisted_listen_addr", "status_only")
+                + "PG_VERSION=99; GATEWAY_PORT=10260\nstatus_only\n"
+            )
+            r = subprocess.run([self.shell, "-c", script], capture_output=True,
+                               text=True, timeout=20)
+            self.assertIn("gateway bind address:          127.0.0.1:10399", r.stdout)
+            self.assertIn("extensions:                    documentdb_core 0.110-0, documentdb 0.110-0",
+                          r.stdout)
+
+    def test_status_labels_only_a_bare_port_as_all_interfaces(self):
+        for addr, shown in (("::1:10399", "::1:10399\n"), (":10399", ":10399 (all interfaces)")):
+            with self.subTest(addr=addr), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "99").mkdir()
+                (Path(tmp) / "99" / "setup.conf").write_text("GATEWAY_PORT=10399\n")
+                (Path(tmp) / "99" / "gateway.env").write_text(f"DOCUMENTDB_LISTEN_ADDR={addr}\n")
+                script = ("log_warn() { :; }; documentdb_default_pg_port() { echo 1; }\n"
+                          "nohup_gateway_pid_for_port() { return 1; }\n"
+                          "status_extension_versions() { :; }\n"
+                          + self._funcs(tmp, "persisted_listen_addr", "status_only")
+                          + "PG_VERSION=99; GATEWAY_PORT=10260\nstatus_only\n")
+                r = subprocess.run([self.shell, "-c", script], capture_output=True, text=True, timeout=20)
+                self.assertIn(f"gateway bind address:          {shown}", r.stdout)
+
+    def test_status_extension_versions_flags_a_stale_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "psql").write_text("#!/bin/sh\n")
+            (Path(tmp) / "psql").chmod(0o755)
+            (Path(tmp) / "pg-url").write_text("postgresql://documentdb-gateway@/postgres?host=/x\n")
+            rows = ("documentdb_core 0.110-0 0.111-0\n"
+                    "documentdb 0.110-0 0.111-0\n"
+                    "documentdb_extended_rum - 0.111-0\n")
+            script = (
+                "id() { echo 0; }\n"
+                f"documentdb_pg_bindir_candidates() {{ echo {tmp}; }}\n"
+                f"run_as_user() {{ printf '%s' {shlex.quote(rows)}; }}\n"
+                + _shell_function(self, SETUP_SCRIPT, "status_extension_versions")
+                + f"\nstatus_extension_versions 17 {tmp}/pg-url\n"
+            )
+            r = subprocess.run([self.shell, "-c", script], capture_output=True,
+                               text=True, timeout=20)
+            self.assertEqual(
+                r.stdout.strip(),
+                "documentdb_core 0.110-0 (package has 0.111-0; re-run documentdb-setup), "
+                "documentdb 0.110-0 (package has 0.111-0; re-run documentdb-setup)")
+
+
+class ProcpsDependencyTests(unittest.TestCase):
+    """pgrep/ps come from procps, which minimal
+    RHEL images lack. Declare it, and never let a missing pgrep turn the
+    orphan-gateway sweep into a silent no-op."""
+
+    def test_the_package_shipping_setup_and_reset_declares_procps(self):
+        self.assertRegex(COMMON_BUILD_SCRIPT.read_text(encoding="utf-8"), r"(?m)^Depends:.*\bprocps\b")
+        self.assertRegex(COMMON_SPEC.read_text(encoding="utf-8"), r"(?m)^Requires:\s+procps-ng\s*$")
+
+    def _sweep(self, pgrep_body):
+        shell = shutil.which("bash")
+        if not shell:
+            self.skipTest("bash not available")
+        text = SETUP_SCRIPT.read_text(encoding="utf-8")
+        func = re.search(r"^(\s+)_kill_nohup_gateway_orphans\(\) \{\n.*?^\1\}", text,
+                         flags=re.DOTALL | re.MULTILINE).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "pgrep").write_text("#!/bin/sh\n" + pgrep_body)
+            (Path(tmp) / "pgrep").chmod(0o755)
+            script = ('set -euo pipefail\ndie() { echo "DIE: $*"; exit 3; }\n'
+                      'log_info() { echo "INFO: $*"; }\nDRY_RUN=false\n'
+                      f'PATH={tmp}:$PATH\n{func}\n'
+                      '_kill_nohup_gateway_orphans TERM && echo HIT || echo "NONE rc=$?"\n')
+            return subprocess.run([shell, "-c", script], capture_output=True, text=True, timeout=20)
+
+    def test_sweep_fails_loudly_when_pgrep_cannot_run(self):
+        r = self._sweep("exit 127\n")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("pgrep exit 127", r.stdout)
+
+    def test_sweep_treats_no_match_as_nothing_to_stop(self):
+        r = self._sweep("exit 1\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("NONE rc=1", r.stdout)
+
+    def test_unscoped_restore_checks_for_pgrep_before_changing_anything(self):
+        text = SETUP_SCRIPT.read_text(encoding="utf-8")
+        check = text.index('if [[ -z "${restore_scope}" ]] && ! command_exists pgrep; then')
+        self.assertLess(check, text.index('_restore_strip_block "${config_file}"'))

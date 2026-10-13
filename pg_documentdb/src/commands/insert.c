@@ -22,6 +22,8 @@
 #include <catalog/pg_class.h>
 #include <parser/parse_relation.h>
 #include <utils/lsyscache.h>
+#include <access/heaptoast.h>
+#include <access/toast_internals.h>
 
 #include "access/xact.h"
 #include "executor/spi.h"
@@ -102,6 +104,7 @@ PG_FUNCTION_INFO_V1(command_insert_one);
 PG_FUNCTION_INFO_V1(command_insert_worker);
 PG_FUNCTION_INFO_V1(command_insert_bulk);
 PG_FUNCTION_INFO_V1(command_insert_txn_proc);
+PG_FUNCTION_INFO_V1(test_compress_bson_if_needed);
 
 
 static BatchInsertionSpec * BuildBatchInsertionSpec(bson_iter_t *insertCommandIter,
@@ -163,6 +166,8 @@ bool EnableCreateCollectionOnInsert = true;
 extern bool UseLocalExecutionShardQueries;
 extern bool EnableBypassDocumentValidation;
 extern int BatchUpdateLockTimeoutMs;
+extern int32_t DocumentToastCompressionThreshold;
+extern bool DefaultInlineWriteOperations;
 
 /*
  * command_insert handles the insert command invocation through a PostgreSQL function.
@@ -266,7 +271,8 @@ CreateCollectionForInsert(Datum databaseNameDatum, Datum collectionNameDatum)
 	 * calls in an idempotent manner, which means that if a concurrent insert raced
 	 * to create the collection before us, this will be a noop.
 	 */
-	CreateCollection(databaseNameDatum, collectionNameDatum);
+	bool canUseLibPq = true;
+	CreateCollection(databaseNameDatum, collectionNameDatum, canUseLibPq);
 
 	MongoCollection *collection = GetMongoCollectionByNameDatum(databaseNameDatum,
 																collectionNameDatum,
@@ -572,6 +578,24 @@ CreateBsonParam(int paramIndex, ParamListInfo paramListInfo, pgbson *bsonValue)
 
 
 /*
+ * SetCompressedDocumentParam compresses the document in the given parameter if
+ * needed. A compressed document is left as a runtime Param instead of a
+ * constant, since constant folding during planning flattens varlena values and
+ * would decompress it before it is written.
+ */
+static void
+SetCompressedDocumentParam(ParamExternData *documentParam)
+{
+	Datum compressedValue = CompressBsonIfNeeded(documentParam->value);
+	if (compressedValue != documentParam->value)
+	{
+		documentParam->value = compressedValue;
+		documentParam->pflags = 0;
+	}
+}
+
+
+/*
  * Applies a set of inserts in a single transaction.
  * This applies without the case of retriable writes. In this case we just
  * directly call INSERT from the coordinator on a batch of documents.
@@ -636,6 +660,8 @@ DoMultiInsertWithoutTransactionId(MongoCollection *collection, List *inserts, Oi
 			paramIndex++;
 
 			Expr *documentParam = CreateBsonParam(paramIndex, paramListInfo, insertDoc);
+			SetCompressedDocumentParam(&paramListInfo->params[paramIndex]);
+
 			paramIndex++;
 
 			List *values = CreateValuesListForInsert(shardKeyConst, objectidParam,
@@ -1013,6 +1039,107 @@ DoBatchInsertNoTransactionId(MongoCollection *collection, BatchInsertionSpec *ba
 
 
 /*
+ * CompressBsonIfNeeded returns an inline compressed copy of the document if it
+ * exceeds the configured compression threshold but is small enough that the
+ * heap would not compress it on its own. Returns the input otherwise, including
+ * when compression does not reduce the size.
+ */
+Datum
+CompressBsonIfNeeded(Datum inputDatum)
+{
+	Size varSize = VARSIZE(DatumGetPointer(inputDatum));
+	if (DocumentToastCompressionThreshold > 0 &&
+		varSize > (Size) DocumentToastCompressionThreshold &&
+		varSize < TOAST_TUPLE_THRESHOLD)
+	{
+		Datum compressedDatum = toast_compress_datum(inputDatum,
+													 default_toast_compression);
+		if (DatumGetPointer(compressedDatum) != NULL)
+		{
+			return compressedDatum;
+		}
+	}
+
+	return inputDatum;
+}
+
+
+/*
+ * test_compress_bson_if_needed is a test only function that returns the input
+ * document compressed with CompressBsonIfNeeded. It is not part of the
+ * extension schema and is created by tests that need it.
+ */
+Datum
+test_compress_bson_if_needed(PG_FUNCTION_ARGS)
+{
+	pgbson *document = PG_GETARG_PGBSON(0);
+	PG_RETURN_DATUM(CompressBsonIfNeeded(PointerGetDatum(document)));
+}
+
+
+/*
+ * IsDocumentCompressionEligible returns true if writes to the given target can
+ * pass the document as a compressed bson parameter. The bson type is only used
+ * as a parameter type when the write executes locally.
+ */
+bool
+IsDocumentCompressionEligible(const char *shardTableName)
+{
+	if (DocumentToastCompressionThreshold <= 0)
+	{
+		return false;
+	}
+
+	return (shardTableName != NULL && shardTableName[0] != '\0') ||
+		   DefaultInlineWriteOperations;
+}
+
+
+/*
+ * ExecuteSPIPlanWithCompressedDocument executes the plan with the document
+ * argument at documentArgIndex compressed if needed. Parameters flagged
+ * PARAM_FLAG_CONST are folded into Const nodes when the plan cache builds a
+ * custom plan, and makeConst flattens varlena values, which decompresses the
+ * document. The document is therefore left as a runtime Param so that the
+ * compressed datum reaches the heap as is. None of the arguments can be null.
+ */
+int
+ExecuteSPIPlanWithCompressedDocument(SPIPlanPtr plan, Datum *argValues, Oid *argTypes,
+									 int argCount, int documentArgIndex, bool readOnly,
+									 long maxTupleCount)
+{
+	Assert(documentArgIndex >= 0 && documentArgIndex < argCount);
+
+	ParamListInfo paramList = makeParamList(argCount);
+	paramList->numParams = argCount;
+	for (int i = 0; i < argCount; i++)
+	{
+		paramList->params[i].value = argValues[i];
+		paramList->params[i].isnull = false;
+		paramList->params[i].ptype = argTypes[i];
+		paramList->params[i].pflags = PARAM_FLAG_CONST;
+	}
+
+	if (DocumentToastCompressionThreshold > 0)
+	{
+		paramList->params[documentArgIndex].value =
+			CompressBsonIfNeeded(argValues[documentArgIndex]);
+		paramList->params[documentArgIndex].pflags = 0;
+	}
+	else
+	{
+		paramList->params[documentArgIndex].value = argValues[documentArgIndex];
+		paramList->params[documentArgIndex].pflags = PARAM_FLAG_CONST;
+	}
+
+	int spiStatus = SPI_execute_plan_with_paramlist(plan, paramList, readOnly,
+													maxTupleCount);
+	pfree(paramList);
+	return spiStatus;
+}
+
+
+/*
  * ProcessInsertion processes a single insertion operation.
  */
 static uint64
@@ -1066,6 +1193,8 @@ ProcessInsertion(MongoCollection *collection,
 		paramListInfo->numParams = 2;
 		Expr *objectidParam = CreateBsonParam(0, paramListInfo, objectIdPtr);
 		Expr *documentParam = CreateBsonParam(1, paramListInfo, insertDoc);
+
+		SetCompressedDocumentParam(&paramListInfo->params[1]);
 
 		singleInsertList = CreateValuesListForInsert(shardKeyConst, objectidParam,
 													 documentParam,
@@ -1362,23 +1491,43 @@ InsertDocument(uint64 collectionId, const char *shardTableName,
 		appendStringInfo(&query, "documents_" UINT64_FORMAT, collectionId);
 	}
 
-	appendStringInfo(&query, " (shard_key_value, object_id, document) "
-							 " VALUES ($1, %s.bson_from_bytea($2), "
-							 "%s.bson_from_bytea($3))",
-					 CoreSchemaName, CoreSchemaName);
+	bool compressDocument = IsDocumentCompressionEligible(shardTableName);
+	if (compressDocument)
+	{
+		appendStringInfo(&query, " (shard_key_value, object_id, document) "
+								 " VALUES ($1, %s.bson_from_bytea($2), $3)",
+						 CoreSchemaName);
+	}
+	else
+	{
+		appendStringInfo(&query, " (shard_key_value, object_id, document) "
+								 " VALUES ($1, %s.bson_from_bytea($2), "
+								 "%s.bson_from_bytea($3))",
+						 CoreSchemaName, CoreSchemaName);
+	}
 
 	argTypes[0] = INT8OID;
 	argValues[0] = Int64GetDatum(shardKeyValue);
 	argTypes[1] = BYTEAOID;
 	argValues[1] = PointerGetDatum(CastPgbsonToBytea(objectId));
-	argTypes[2] = BYTEAOID;
+	argTypes[2] = compressDocument ? BsonTypeId() : BYTEAOID;
 	argValues[2] = PointerGetDatum(CastPgbsonToBytea(document));
 
 	SPIPlanPtr plan = GetSPIQueryPlanWithLocalShard(collectionId, shardTableName,
-													QUERY_ID_INSERT, query.data, argTypes,
-													argCount);
+													compressDocument ?
+													QUERY_ID_INSERT_COMPRESSED :
+													QUERY_ID_INSERT, query.data,
+													argTypes, argCount);
 
-	spiStatus = SPI_execute_plan(plan, argValues, NULL, false, 1);
+	if (compressDocument)
+	{
+		spiStatus = ExecuteSPIPlanWithCompressedDocument(plan, argValues, argTypes,
+														 argCount, 2, false, 1);
+	}
+	else
+	{
+		spiStatus = SPI_execute_plan(plan, argValues, NULL, false, 1);
+	}
 	pfree(query.data);
 
 	SPI_finish();
@@ -1420,12 +1569,22 @@ InsertOrReplaceDocument(MongoCollection *collection, const char *shardTableName,
 		appendStringInfo(&query, "documents_" UINT64_FORMAT, collection->collectionId);
 	}
 
-	appendStringInfo(&query, " (shard_key_value, object_id, document) "
-							 " VALUES ($1, %s.bson_from_bytea($2), "
-							 "%s.bson_from_bytea($3))",
-					 CoreSchemaName, CoreSchemaName);
-
-	planId = QUERY_ID_INSERT_OR_REPLACE;
+	bool compressDocument = IsDocumentCompressionEligible(shardTableName);
+	if (compressDocument)
+	{
+		appendStringInfo(&query, " (shard_key_value, object_id, document) "
+								 " VALUES ($1, %s.bson_from_bytea($2), $3)",
+						 CoreSchemaName);
+		planId = QUERY_ID_INSERT_OR_REPLACE_COMPRESSED;
+	}
+	else
+	{
+		appendStringInfo(&query, " (shard_key_value, object_id, document) "
+								 " VALUES ($1, %s.bson_from_bytea($2), "
+								 "%s.bson_from_bytea($3))",
+						 CoreSchemaName, CoreSchemaName);
+		planId = QUERY_ID_INSERT_OR_REPLACE;
+	}
 
 	const char *additionalArgs = "";
 	if (IsClusterVersionAtleast(DocDB_V0, 111, 0) &&
@@ -1469,7 +1628,7 @@ InsertOrReplaceDocument(MongoCollection *collection, const char *shardTableName,
 	argValues[0] = Int64GetDatum(shardKeyValue);
 	argTypes[1] = BYTEAOID;
 	argValues[1] = PointerGetDatum(CastPgbsonToBytea(objectId));
-	argTypes[2] = BYTEAOID;
+	argTypes[2] = compressDocument ? BsonTypeId() : BYTEAOID;
 	argValues[2] = PointerGetDatum(CastPgbsonToBytea(document));
 	argTypes[3] = BYTEAOID;
 	argValues[3] = PointerGetDatum(CastPgbsonToBytea(updateSpecDoc));
@@ -1479,7 +1638,15 @@ InsertOrReplaceDocument(MongoCollection *collection, const char *shardTableName,
 													planId, query.data, argTypes,
 													argCount);
 
-	spiStatus = SPI_execute_plan(plan, argValues, NULL, false, 1);
+	if (compressDocument)
+	{
+		spiStatus = ExecuteSPIPlanWithCompressedDocument(plan, argValues, argTypes,
+														 argCount, 2, false, 1);
+	}
+	else
+	{
+		spiStatus = SPI_execute_plan(plan, argValues, NULL, false, 1);
+	}
 	pfree(query.data);
 
 	SPI_finish();

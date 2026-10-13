@@ -181,6 +181,14 @@ SELECT test_documentdb_scram_sha256_dual_api('test\user', '<password_placeholder
 -- Failed test for incorrect password
 SELECT test_documentdb_scram_sha256_dual_api('test\user', '<password_placeholder111>');
 
+SELECT documentdb_api.create_user('{"createUser":"saslprep_auth_user", "pwd":"<password_placeholder_unicode_\u00e4>", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT test_documentdb_scram_sha256_dual_api('saslprep_auth_user', U&'<password_placeholder_unicode_\00e4>');
+
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_auth_user", "pwd":"<password_placeholder_unicode_\u00e4\u00ad>", "$db":"admin"}');
+SELECT test_documentdb_scram_sha256_dual_api('saslprep_auth_user', U&'<password_placeholder_unicode_\00e4\00ad>');
+SELECT test_documentdb_scram_sha256_dual_api('saslprep_auth_user', U&'<password_placeholder_unicode_\00e4>');
+SELECT documentdb_api.drop_user('{"dropUser":"saslprep_auth_user", "$db":"admin"}');
+
 -- Test with isNativeAuthEnabled set to OFF
 SET documentdb.isNativeAuthEnabled TO OFF;
 SELECT test_documentdb_scram_sha256_dual_api('testuser', '<password_placeholder111>');

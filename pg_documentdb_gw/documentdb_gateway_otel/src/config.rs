@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_otel/src/config.rs
  *
@@ -53,8 +54,6 @@ struct TracingOptions {
     otlp_endpoint: Option<String>,
     sampler_ratio: Option<f64>,
     export_timeout_ms: Option<u64>,
-    #[cfg(feature = "postgres-sql-commenter")]
-    sql_commenter_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,8 +167,6 @@ pub struct TracingConfig {
     otlp_endpoint: Option<String>,
     sampler_ratio: Option<f64>,
     export_timeout_ms: Option<u64>,
-    #[cfg(feature = "postgres-sql-commenter")]
-    sql_commenter_enabled: Option<bool>,
 }
 
 impl TracingConfig {
@@ -180,8 +177,6 @@ impl TracingConfig {
             otlp_endpoint: options.otlp_endpoint,
             sampler_ratio: options.sampler_ratio,
             export_timeout_ms: options.export_timeout_ms,
-            #[cfg(feature = "postgres-sql-commenter")]
-            sql_commenter_enabled: options.sql_commenter_enabled,
         }
     }
 
@@ -234,13 +229,6 @@ impl TracingConfig {
             .or_else(|| env_var(env_vars::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT))
             .or_else(|| env_var(env_vars::OTEL_EXPORTER_OTLP_TIMEOUT))
             .unwrap_or(DEFAULT_EXPORT_TIMEOUT_MS)
-    }
-
-    #[cfg(feature = "postgres-sql-commenter")]
-    pub(crate) fn sql_commenter_enabled(&self) -> bool {
-        self.sql_commenter_enabled
-            .or_else(|| env_var(env_vars::DOCUMENTDB_SQL_COMMENTER_ENABLED))
-            .unwrap_or(false)
     }
 }
 
@@ -322,13 +310,11 @@ mod tests {
     fn settings_are_provider_neutral() {
         let options = json!({
             "Metrics": { "Enabled": true },
-            "Tracing": { "Enabled": true, "SqlCommenterEnabled": true }
+            "Tracing": { "Enabled": true }
         });
         let config = TelemetryConfig::new(Some(&options)).expect("configuration should parse");
         let settings = config.settings();
         assert!(settings.request_metrics_enabled());
-        #[cfg(feature = "postgres-sql-commenter")]
-        assert!(config.tracing().sql_commenter_enabled());
     }
 
     #[test]

@@ -18,13 +18,9 @@ assets = [
 ]
 
 [features]
-default = ["request-tracing", "postgres-sql-commenter"]
+default = ["request-tracing"]
 mimalloc = ["dep:mimalloc"]
 request-tracing = ["documentdb_gateway_core/request-tracing"]
-postgres-sql-commenter = [
- "request-tracing",
- "documentdb_gateway_otel/postgres-sql-commenter",
-]
 
 [dependencies]
 documentdb_gateway_core.workspace = true

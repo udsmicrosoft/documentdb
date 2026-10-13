@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/configs/limit_configs.c
  *
@@ -44,6 +45,9 @@ int ShardingMaxChunks = DEFAULT_SHARDING_MAX_CHUNKS;
 
 #define DEFAULT_QUERY_PLAN_CACHE_SIZE_LIMIT 100
 int QueryPlanCacheSizeLimit = DEFAULT_QUERY_PLAN_CACHE_SIZE_LIMIT;
+
+#define DEFAULT_MAX_EXPLAIN_INDEX_COSTS 8
+int MaxExplainIndexCosts = DEFAULT_MAX_EXPLAIN_INDEX_COSTS;
 
 /* Cap on the number of ordered scans merged for an $in prefix. */
 #define DEFAULT_MAX_MERGE_SORT_IN_VALUES 200
@@ -217,6 +221,10 @@ bool EnableCursorsOnAggregationQueryRewrite =
 #define DEFAULT_ARRAY_STATISTICS_MAX_SAMPLE_COUNT 10
 int ArrayStatisticsMaxSampleCount = DEFAULT_ARRAY_STATISTICS_MAX_SAMPLE_COUNT;
 
+/* -1 leaves the PostgreSQL default toast compression threshold in place */
+#define DEFAULT_DOCUMENT_TOAST_COMPRESSION_THRESHOLD -1
+int32_t DocumentToastCompressionThreshold = DEFAULT_DOCUMENT_TOAST_COMPRESSION_THRESHOLD;
+
 static struct config_enum_entry rum_load_options[4] = {
 	{ "none", RumLibraryLoadOption_None, false },
 	{ "prefer_documentdb_extended_rum", RumLibraryLoadOption_PreferDocumentDBRum, false },
@@ -277,6 +285,16 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.max_explain_index_costs", newGucPrefix),
+		gettext_noop(
+			"The maximum number of candidate index cost estimates reported per scan in explain output."),
+		gettext_noop(
+			"Requires enableExtendedExplainPlans and enableExplainScanIndexCosts."),
+		&MaxExplainIndexCosts,
+		DEFAULT_MAX_EXPLAIN_INDEX_COSTS, 1, MAX_EXPLAIN_COSTS_SIZE,
+		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		psprintf("%s.max_merge_sort_in_values", newGucPrefix),
@@ -595,6 +613,15 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		NULL, &ArrayStatisticsMaxSampleCount,
 		DEFAULT_ARRAY_STATISTICS_MAX_SAMPLE_COUNT,
 		1, ARRAY_STATISTICS_MAX_SAMPLE_COUNT, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.document_toast_compression_threshold", newGucPrefix),
+		gettext_noop(
+			"The document size in bytes above which documents are compressed when toasted."),
+		gettext_noop("A value of -1 uses the PostgreSQL default threshold."),
+		&DocumentToastCompressionThreshold,
+		DEFAULT_DOCUMENT_TOAST_COMPRESSION_THRESHOLD,
+		-1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		psprintf("%s.enableCursorsOnAggregationQueryRewrite", newGucPrefix),

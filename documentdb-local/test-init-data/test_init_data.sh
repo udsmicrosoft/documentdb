@@ -200,6 +200,7 @@ main() {
         --name $CONTAINER_NAME \
         -p $DOCUMENTDB_PORT:$DOCUMENTDB_PORT \
         -e PASSWORD=$PASSWORD \
+        -e DOCUMENTDB_USAGE_TELEMETRY=false \
         -v "$INIT_DATA_DIR:/init_doc_db.d" \
         $IMAGE_NAME \
         --password $PASSWORD \

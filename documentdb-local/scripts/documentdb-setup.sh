@@ -133,6 +133,10 @@ PG_PORT=""
 PG_PORT_EXPLICIT=false
 GATEWAY_PORT="${DEFAULT_GATEWAY_PORT}"
 GATEWAY_PORT_EXPLICIT=false
+# Gateway port the previous run recorded for this major, before this run changes it.
+PERSISTED_GATEWAY_PORT=""
+# Host part of the gateway bind address ("" = all interfaces), kept across re-runs.
+GATEWAY_LISTEN_HOST=""
 DATA_DIR=""
 DATA_DIR_EXPLICIT=false
 NO_ENABLE=false
@@ -195,8 +199,11 @@ Required:
 Authentication (one of the following; interactive prompt is the default):
   --admin-password-file <FILE>  Read the admin password from a file
                          (also: --password-file; for non-interactive/CI use).
-                         File should be mode 0600.
-  --admin-password-stdin Read the admin password from stdin (single line).
+                         File should be mode 0600. It must hold one line of
+                         printable ASCII; one trailing newline (LF or CRLF)
+                         is removed.
+  --admin-password-stdin Read the admin password from stdin (same rules as
+                         --admin-password-file).
                          Best practice for piping a secret without
                          touching disk:
                            printf '%s' "\$PW" | sudo documentdb-setup ... \\
@@ -267,7 +274,8 @@ Options:
                           side effects.
   --status                Report the current per-major installation state
                           (PG service active, gateway service active, ports
-                          listening, admin user exists), and exit.
+                          listening, gateway bind address, extension
+                          versions, admin user exists), and exit.
   --no-enable             Do not start the gateway after setup
   --load-sample-data      Load built-in sample data after setup (requires mongosh)
   --skip-init-data        Skip the post-setup sample-data ingest step (the default
@@ -388,7 +396,8 @@ resolve_password() {
         if [[ -n "${file_perms}" && "${file_perms}" != "600" && "${file_perms}" != "400" ]]; then
             log_warn "Password file ${PASSWORD_FILE} has permissions ${file_perms} (recommended: 0600). Other users on this system may be able to read it."
         fi
-        PASSWORD="$(< "${PASSWORD_FILE}")"
+        documentdb_read_password PASSWORD "Password file ${PASSWORD_FILE}" < "${PASSWORD_FILE}" \
+            || die "Cannot use --admin-password-file ${PASSWORD_FILE} (see above)."
     elif [[ "${PASSWORD_FROM_STDIN}" == "true" ]]; then
         # Read a single line (strip trailing newline) from stdin. Best
         # practice for "pipe a secret without touching disk" — see
@@ -400,10 +409,9 @@ resolve_password() {
         if [[ -t 0 ]]; then
             die "--admin-password-stdin requires the password on stdin (e.g. 'printf %s \"\$PW\" | sudo documentdb-setup ... --admin-password-stdin'). Stdin is a TTY; omit the flag to use the interactive prompt."
         fi
-        # `IFS= read -r` reads one line preserving leading/trailing
-        # whitespace except the trailing newline. Allow non-zero exit
-        # from `read` when there's no trailing newline on the pipe.
-        IFS= read -r PASSWORD || true
+        # Same one-line contract as a password file.
+        documentdb_read_password PASSWORD "The password on stdin" \
+            || die "Cannot use the password from --admin-password-stdin (see above)."
     elif [[ -n "${DOCUMENTDB_PASSWORD:-}" ]]; then
         # Deprecation warning for the env-var path is printed earlier
         # in main so it surfaces even in --dry-run / --print-config /
@@ -421,20 +429,26 @@ resolve_password() {
         local pw_confirm=""
         local pw_attempts=0
         while true; do
-            read -r -s -p "[documentdb-setup] Enter admin password: " PASSWORD
+            IFS= read -r -s -p "[documentdb-setup] Enter admin password: " PASSWORD
             echo ""
-            read -r -s -p "[documentdb-setup] Confirm admin password: " pw_confirm
+            IFS= read -r -s -p "[documentdb-setup] Confirm admin password: " pw_confirm
             echo ""
-            [[ "${PASSWORD}" == "${pw_confirm}" ]] && break
+            if [[ "${PASSWORD}" != "${pw_confirm}" ]]; then
+                echo "[documentdb-setup] Passwords do not match; please try again." >&2
+            elif documentdb_check_password "${PASSWORD}" "The admin password"; then
+                break
+            fi
             pw_attempts=$((pw_attempts + 1))
             if (( pw_attempts >= 3 )); then
-                die "Passwords did not match after ${pw_attempts} attempts."
+                die "No usable password after ${pw_attempts} attempts."
             fi
-            echo "[documentdb-setup] Passwords do not match; please try again." >&2
         done
     fi
 
     [[ -n "${PASSWORD}" ]] || die "A password is required. Use --admin-password-file, --admin-password-stdin, set DOCUMENTDB_PASSWORD (deprecated), or run interactively to be prompted."
+    # File, stdin and the prompt were checked already; this covers the environment.
+    documentdb_check_password "${PASSWORD}" "The admin password" \
+        || die "Cannot use this admin password (see above)."
 }
 
 create_documentdb_user() {
@@ -1063,6 +1077,21 @@ validate_live_cluster_paths() {
 # STATE_MANAGED_KEYS_RE in documentdb-register-gateway.sh.
 readonly GREENFIELD_MANAGED_KEYS_RE='^(DOCUMENTDB_MANAGED_POSTGRES|DOCUMENTDB_MODE|PG_VERSION|PG_PORT|PG_OWNER|DATA_DIR|CONFIG_FILE|HBA_FILE|IDENT_FILE|GATEWAY_PORT)='
 
+# retire_previous_port_gateway — stop the previous port's nohup gateway. Called
+# right before the state file with the new port is moved into place, so a
+# refused or failed run leaves the old gateway serving; after the move nothing
+# records where it runs. --no-enable leaves gateways alone.
+retire_previous_port_gateway() {
+    [[ -n "${PERSISTED_GATEWAY_PORT}" && "${PERSISTED_GATEWAY_PORT}" != "${GATEWAY_PORT}" ]] || return 0
+    if [[ "${NO_ENABLE}" == "true" ]]; then
+        log_warn "--no-enable: a gateway on the previous port ${PERSISTED_GATEWAY_PORT} keeps running; stop it yourself."
+        return 0
+    fi
+    log_info "Gateway port changed from ${PERSISTED_GATEWAY_PORT} to ${GATEWAY_PORT}."
+    stop_recorded_nohup_gateway "${PERSISTED_GATEWAY_PORT}" \
+        || die "The gateway on the previous port ${PERSISTED_GATEWAY_PORT} did not stop; stop it, then re-run."
+}
+
 persist_self_managed_postgres_state() {
     local temp_file=""
 
@@ -1163,6 +1192,7 @@ persist_self_managed_postgres_state() {
             printf 'IDENT_FILE=%s\n' "${LIVE_IDENT_FILE}"
             printf 'GATEWAY_PORT=%s\n' "${GATEWAY_PORT}"
         } > "${per_major_temp}"
+        retire_previous_port_gateway
         mv "${per_major_temp}" "${per_major_conf}"
         chmod 644 "${per_major_conf}"
         log_verbose "Per-major state written to ${per_major_conf}"
@@ -1268,6 +1298,7 @@ persist_brownfield_state() {
         printf 'ADOPTED_PG_SERVICE_UNIT=%s\n' "${adopted_pg_unit}"
         printf 'GATEWAY_PORT=%s\n' "${GATEWAY_PORT}"
     } > "${tmp}"
+    retire_previous_port_gateway
     mv "${tmp}" "${brownfield_conf}"
     chmod 600 "${brownfield_conf}"
     log_verbose "Per-major brownfield state written to ${brownfield_conf}"
@@ -1905,20 +1936,27 @@ require_root() {
     fi
 }
 
+# refuse_home_tls_path <file> <hint> — the gateway units run with
+# ProtectHome=yes, so a file there stays invisible however it is owned.
+refuse_home_tls_path() {
+    local resolved
+    # Without systemd the gateway runs under nohup, outside that sandbox.
+    has_working_systemd || return 0
+    # The gateway opens the path as given, so both it and its target must be outside.
+    for resolved in "$(realpath -ms -- "$1" 2>/dev/null || printf '%s' "$1")" \
+        "$(realpath -m -- "$1" 2>/dev/null || printf '%s' "$1")"; do
+        case "${resolved}" in
+            /root|/root/*|/home|/home/*|/run/user|/run/user/*)
+                die "TLS file $1 is under /root, /home or /run/user, which the gateway service cannot read (ProtectHome=yes). $2"
+                ;;
+        esac
+    done
+}
+
 validate_required_arguments() {
     [[ -n "${USERNAME}" ]] || die "--username is required."
-
-    # Reject an admin name the GATEWAY will refuse at authentication. Without
-    # this the wizard ran to completion on e.g. --admin-user pgadmin, printed
-    # "SUCCESS: DocumentDB is ready" plus a connect command, and left an
-    # install whose only admin failed every login with "Username is invalid"
-    # (the gateway blocks the documentdb / citus / pg / internal_role
-    # prefixes). Validate here, in argument validation, so nothing is mutated
-    # before the operator is told.
-    if declare -F documentdb_validate_gateway_username >/dev/null 2>&1; then
-        documentdb_validate_gateway_username "${USERNAME}" \
-            || die "Admin username '${USERNAME}' is rejected by the gateway's reserved-prefix policy (see above). Re-run with a different --admin-user."
-    fi
+    # Before the TLS ownership repair below, so a refused password changes nothing.
+    resolve_password
 
     # TLS triple: --tls-cert / --tls-key must come together; combining
     # either with --tls-auto-generate true is a contradiction (the
@@ -1932,6 +1970,8 @@ validate_required_arguments() {
         [[ -n "${TLS_KEY_FILE}"  ]] || die "--tls-cert requires --tls-key to also be set."
         [[ -r "${TLS_CERT_FILE}" ]] || die "--tls-cert ${TLS_CERT_FILE} is not readable."
         [[ -r "${TLS_KEY_FILE}"  ]] || die "--tls-key  ${TLS_KEY_FILE} is not readable."
+        refuse_home_tls_path "${TLS_CERT_FILE}" "Copy it to a directory such as /etc/documentdb/tls and pass that path."
+        refuse_home_tls_path "${TLS_KEY_FILE}" "Copy it to a directory such as /etc/documentdb/tls and pass that path."
         if [[ "${TLS_AUTO_GENERATE}" == "true" ]]; then
             die "--tls-auto-generate=true cannot be combined with --tls-cert / --tls-key; pick one TLS source."
         fi
@@ -1982,8 +2022,6 @@ validate_required_arguments() {
             fi
         fi
     fi
-
-    resolve_password
 
     if [[ "${NO_ENABLE}" == "true" && "${LOAD_SAMPLE_DATA}" == "true" ]]; then
         die "--load-sample-data requires a running gateway and cannot be combined with --no-enable."
@@ -2238,24 +2276,68 @@ ensure_socket_dir_writable() {
 # flags explicitly, default them from what the previous run persisted
 # (GATEWAY_PORT in the per-major state file; TLS keys in the per-major
 # gateway.env managed fragment).
+# persisted_listen_addr <major> — the DOCUMENTDB_LISTEN_ADDR the gateway gets
+# from the major's gateway.env. Parsed as documentdb-gateway-wrapper.sh does
+# (optional export, one layer of quotes); the last assignment wins.
+persisted_listen_addr() {
+    local _env="/etc/documentdb/local/$1/gateway.env" _line _val=""
+    [[ -r "${_env}" ]] || return 0
+    while IFS= read -r _line || [[ -n "${_line}" ]]; do
+        [[ "${_line}" =~ ^[[:space:]]*(export[[:space:]]+)?DOCUMENTDB_LISTEN_ADDR[[:space:]]*=[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]] || continue
+        _val="${BASH_REMATCH[2]}"
+        if [[ "${_val}" =~ ^\"(.*)\"$ || "${_val}" =~ ^\'(.*)\'$ ]]; then
+            _val="${BASH_REMATCH[1]}"
+        fi
+        # The gateway trims the value it is given, quoted or not.
+        [[ "${_val}" =~ ^[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]] && _val="${BASH_REMATCH[1]}"
+    done < "${_env}"
+    printf '%s' "${_val}"
+}
+
+# persisted_gateway_port <major> — the GATEWAY_PORT a previous run recorded in
+# the major's setup.conf or brownfield.conf, or nothing.
+persisted_gateway_port() {
+    local _state _port=""
+    for _state in "/etc/documentdb/local/$1/setup.conf" "/etc/documentdb/local/$1/brownfield.conf"; do
+        [[ -r "${_state}" ]] || continue
+        _port="$(grep -E '^GATEWAY_PORT=' "${_state}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+        [[ -n "${_port}" ]] && break
+    done
+    [[ "${_port}" =~ ^[0-9]+$ ]] && printf '%s' "${_port}"
+    return 0
+}
+
 default_gateway_settings_from_persisted_state() {
     [[ -n "${PG_VERSION}" && "${PG_VERSION}" =~ ^[0-9]+$ ]] || return 0
     local per_major_dir="/etc/documentdb/local/${PG_VERSION}"
 
+    # First call only: later calls may run after this run rewrote setup.conf.
+    [[ -n "${PERSISTED_GATEWAY_PORT}" ]] || PERSISTED_GATEWAY_PORT="$(persisted_gateway_port "${PG_VERSION}")"
+
     if [[ "${GATEWAY_PORT_EXPLICIT}" != "true" ]]; then
-        local _state _persisted_port=""
-        for _state in "${per_major_dir}/setup.conf" "${per_major_dir}/brownfield.conf"; do
-            [[ -r "${_state}" ]] || continue
-            _persisted_port="$(grep -E '^GATEWAY_PORT=' "${_state}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
-            [[ -n "${_persisted_port}" ]] && break
-        done
-        if [[ -n "${_persisted_port}" && "${_persisted_port}" =~ ^[0-9]+$ \
-                && "${_persisted_port}" != "${GATEWAY_PORT}" ]]; then
+        local _persisted_port="${PERSISTED_GATEWAY_PORT}"
+        if [[ -n "${_persisted_port}" && "${_persisted_port}" != "${GATEWAY_PORT}" ]]; then
             local _keep_prefix=""
             [[ "${DRY_RUN}" == "true" ]] && _keep_prefix="[dry-run] "
             log_info "${_keep_prefix}Keeping gateway listen port ${_persisted_port} from the previous run (pass --listen-port to change it)."
             GATEWAY_PORT="${_persisted_port}"
         fi
+    fi
+
+    # A loopback bind is kept even when the port changes: setup has no flag for
+    # the host, so dropping it would silently widen the gateway to all
+    # interfaces. Other hosts are ones the gateway refuses, so they are dropped.
+    local _addr="" _host=""
+    _addr="$(persisted_listen_addr "${PG_VERSION}")"
+    if [[ "${_addr}" =~ ^(\[[^]]*\])(:[0-9]+)?$ || "${_addr}" =~ ^(.*):[0-9]+$ ]]; then
+        _host="${BASH_REMATCH[1]}"
+    fi
+    case "${_host}" in 127.0.0.1|localhost|::1|"[::1]") ;; *) _host="" ;; esac
+    if [[ -n "${_host}" && "${_host}" != "${GATEWAY_LISTEN_HOST}" ]]; then
+        local _keep_addr_prefix=""
+        [[ "${DRY_RUN}" == "true" ]] && _keep_addr_prefix="[dry-run] "
+        log_info "${_keep_addr_prefix}Keeping gateway bind address ${_host} from the previous run (set DOCUMENTDB_LISTEN_ADDR=:<port> in /etc/documentdb/local/${PG_VERSION}/gateway.env to listen on all interfaces)."
+        GATEWAY_LISTEN_HOST="${_host}"
     fi
 
     # TLS: only when the operator passed nothing at all this run.
@@ -2267,6 +2349,9 @@ default_gateway_settings_from_persisted_state() {
             _p_cert="$(grep -E '^DOCUMENTDB_TLS_CERT_FILE=' "${_env_file}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
             _p_key="$(grep -E '^DOCUMENTDB_TLS_KEY_FILE=' "${_env_file}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
             if [[ -n "${_p_cert}" && -n "${_p_key}" ]]; then
+                local _reuse_hint="A previous run recorded it; re-run with --tls-cert/--tls-key naming copies outside those directories, or with --tls-auto-generate true."
+                refuse_home_tls_path "${_p_cert}" "${_reuse_hint}"
+                refuse_home_tls_path "${_p_key}" "${_reuse_hint}"
                 local _keep_tls_prefix=""
                 [[ "${DRY_RUN}" == "true" ]] && _keep_tls_prefix="[dry-run] "
                 log_info "${_keep_tls_prefix}Keeping the operator TLS certificate from the previous run: ${_p_cert} (pass --tls-cert/--tls-key or --tls-auto-generate true to change it)."
@@ -2361,7 +2446,7 @@ ensure_pg_ident_map() {
     # load SetupConfiguration.json. So the operator's --listen-port has to
     # land in the per-major env file. Thread it through register-gateway.
     if [[ -n "${GATEWAY_PORT}" ]]; then
-        rg_args+=(--listen-addr ":${GATEWAY_PORT}")
+        rg_args+=(--listen-addr "${GATEWAY_LISTEN_HOST}:${GATEWAY_PORT}")
     fi
     # Standalone defaults to TLS auto-gen per design §4.3 — UNLESS the
     # operator explicitly passed --tls-cert/--tls-key (in which case
@@ -2933,7 +3018,7 @@ build_rerun_env_prefix() {
 
 build_rerun_suffix() {
     local suffix=""
-    [[ -n "${USERNAME}" ]] && suffix+=" --admin-user ${USERNAME}"
+    [[ -n "${USERNAME}" ]] && suffix+=" --admin-user $(printf '%q' "${USERNAME}")"
     if [[ -n "${PASSWORD_FILE}" ]]; then
         suffix+=" --admin-password-file ${PASSWORD_FILE}"
     elif [[ "${PASSWORD_FROM_STDIN}" == "true" ]]; then
@@ -3075,7 +3160,9 @@ start_or_restart_postgres() {
         if run_as_user documentdb-local "${PG_CTL}" -D "${DATA_DIR}" status >/dev/null 2>&1; then
             if [[ "${PG_CONFIG_CHANGED}" == "true" ]]; then
                 log_info "Configuration changed; restarting PostgreSQL to apply new settings."
-                run_as_user documentdb-local "${PG_CTL}" -D "${DATA_DIR}" -w restart
+                # -l as on start: without it the new postmaster inherits our
+                # stdout and a piped caller (| tee, $(...)) never sees EOF.
+                run_as_user documentdb-local "${PG_CTL}" -D "${DATA_DIR}" -l "${DATA_DIR}/pglog.log" -w restart
             elif [[ "${PG_RELOAD_CHANGED}" == "true" ]]; then
                 log_info "Authentication mapping changed; reloading PostgreSQL configuration."
                 run_as_user documentdb-local "${PG_CTL}" -D "${DATA_DIR}" reload
@@ -3114,6 +3201,9 @@ create_required_extensions_and_users() {
             _create_extended_rum_extension_inline
     fi
 
+    confirm_or_apply "Install temporary getParameter rejection stub if the backend function is missing" \
+        _install_getparameter_stub
+
     if run_as_user "${PG_OWNER}" "${PSQL}" -h "${PG_SOCKET_DIR}" -p "${PG_PORT}" -d postgres -X -tA -v ON_ERROR_STOP=1 -v role_name="${USERNAME}" <<'SQL' | grep -q '^1$'; then
 SELECT 1 FROM pg_roles WHERE rolname = :'role_name';
 SQL
@@ -3127,10 +3217,25 @@ SQL
         # path (it dies otherwise), so no "leave credentials unchanged"
         # branch exists: a re-run always offers the password reset (gated
         # by confirm_or_apply / --yes like every other invasive step).
-        log_info "User ${USERNAME} already exists; resetting password via documentdb_api.update_user()."
+        log_warn "Admin user '${USERNAME}' already exists: its password is replaced with the one given to this run, and the old password stops working."
         confirm_or_apply "Reset password for existing admin user '${USERNAME}'" \
             reset_documentdb_user_password "${PG_OWNER}" "${PG_PORT}" "${USERNAME}" "${PASSWORD}"
         return 0
+    fi
+
+    # A different --admin-user on a rerun adds an admin; it never replaces one.
+    local other_admins=""
+    other_admins="$(run_as_user "${PG_OWNER}" "${PSQL}" -h "${PG_SOCKET_DIR}" -p "${PG_PORT}" -d postgres -X -tA -v role_name="${USERNAME}" 2>/dev/null <<'SQL' | paste -sd ' ' - || true
+SELECT r.rolname FROM pg_roles r
+JOIN pg_auth_members m ON m.member = r.oid
+JOIN pg_roles g ON g.oid = m.roleid
+WHERE g.rolname = 'documentdb_admin_role' AND r.rolcanlogin
+  AND r.rolname <> :'role_name' AND r.rolname !~* '^(documentdb|citus|pg|internal_role)'
+ORDER BY 1;
+SQL
+    )"
+    if [[ -n "${other_admins}" ]]; then
+        log_warn "Adding admin user '${USERNAME}' alongside the existing DocumentDB admin(s): ${other_admins}. They keep full access; remove one with: sudo documentdb-gateway-admin drop-user --username <name>"
     fi
 
     confirm_or_apply "Bootstrap first admin user '${USERNAME}' via documentdb_api.create_user()" \
@@ -3222,6 +3327,8 @@ SQL
 # verbatim as "$@" args, so they live in tiny wrappers.
 _create_documentdb_extension_inline() {
     run_as_user "${PG_OWNER}" "${PSQL}" -h "${PG_SOCKET_DIR}" -p "${PG_PORT}" -d postgres -X -v ON_ERROR_STOP=1 <<'SQL'
+-- One transaction so a failed documentdb upgrade does not leave core upgraded alone.
+BEGIN;
 CREATE EXTENSION IF NOT EXISTS documentdb CASCADE;
 -- Idempotently upgrade the in-database extension to the installed default
 -- version. On a first install this is a no-op; on a re-run after a package
@@ -3232,8 +3339,23 @@ CREATE EXTENSION IF NOT EXISTS documentdb CASCADE;
 -- ever advances the extension's default_version without shipping the
 -- contiguous documentdb--X--Y.sql upgrade path ("extension has no update
 -- path"). Every release must ship the matching upgrade script.
+-- ALTER EXTENSION does not update dependencies, so upgrade core first.
+ALTER EXTENSION documentdb_core UPDATE;
 ALTER EXTENSION documentdb UPDATE;
+COMMIT;
 SQL
+}
+
+_install_getparameter_stub() {
+    local stub_script="/usr/share/documentdb/scripts/documentdb_install_getparameter_stub.sh"
+    if [[ ! -f "${stub_script}" ]]; then
+        stub_script="${SCRIPT_DIR}/documentdb_install_getparameter_stub.sh"
+    fi
+    [[ -f "${stub_script}" ]] || die "Cannot find the getParameter rejection helper; reinstall documentdb-common."
+
+    run_as_user "${PG_OWNER}" env "PGHOST=${PG_SOCKET_DIR}" "PGUSER=${PG_OWNER}" \
+        bash "${stub_script}" "${PG_PORT}" "${PSQL}" \
+        || die "Failed to install the getParameter rejection stub."
 }
 
 _create_extended_rum_extension_inline() {
@@ -3326,6 +3448,19 @@ stop_gateway_process() {
         log_warn "Process ${pid} did not stop even after SIGKILL."
         return 1
     fi
+}
+
+# stop_recorded_nohup_gateway <port> — stop the gateway the nohup fallback
+# recorded for <port>, if that record still names a live gateway on the port,
+# and drop the record. Returns 1 only when a recorded gateway would not stop.
+stop_recorded_nohup_gateway() {
+    local port="$1" pid=""
+    pid="$(nohup_gateway_pid_for_port "${port}" || true)"
+    if [[ -n "${pid}" ]]; then
+        log_info "Stopping the non-systemd gateway on port ${port} (pid ${pid})."
+        stop_gateway_process "${pid}" "${port}" || return 1
+    fi
+    rm -f "$(nohup_gateway_pidfile "${port}")" 2>/dev/null || true
 }
 
 verify_gateway_unit_active() {
@@ -3598,8 +3733,15 @@ start_gateway() {
     # always-readable boot_id would land in the STARTTIME slot and the record
     # would be the malformed "PID BOOT_ID". Result is exactly one of "PID",
     # "PID STARTTIME", or "PID STARTTIME BOOT_ID"; the reader honours all three.
+    # setsid puts the daemon in its own session so a Ctrl-C or CI timeout
+    # aimed at the wizard's process group does not take the gateway down too.
+    # With job control off (an inherited SHELLOPTS can turn it on) the
+    # backgrounded child is never a group leader, so setsid execs in place and
+    # $! stays the daemon's PID.
+    local setsid_clause=""
+    command_exists setsid && setsid_clause="set +m; setsid "
     run_as_user_shell documentdb-gateway \
-        "cd /var/lib/documentdb-gateway && ${env_source_clause}{ nohup ${escaped_binary} ${escaped_config} > /var/lib/documentdb-gateway/gateway.log 2>&1 & { _gwp=\$!; _gws=\$(awk '{n=split(\$0,a,\")\"); split(a[n],f); print f[20]}' /proc/\$_gwp/stat 2>/dev/null | tr -dc '0-9'); _gwb=\$(tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null); printf '%s' \"\$_gwp\${_gws:+ \$_gws\${_gwb:+ \$_gwb}}\" > ${escaped_pidfile}; } 2>/dev/null || true; }"
+        "cd /var/lib/documentdb-gateway && ${env_source_clause}{ ${setsid_clause}nohup ${escaped_binary} ${escaped_config} > /var/lib/documentdb-gateway/gateway.log 2>&1 & { _gwp=\$!; _gws=\$(awk '{n=split(\$0,a,\")\"); split(a[n],f); print f[20]}' /proc/\$_gwp/stat 2>/dev/null | tr -dc '0-9'); _gwb=\$(tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null); printf '%s' \"\$_gwp\${_gws:+ \$_gws\${_gwb:+ \$_gwb}}\" > ${escaped_pidfile}; } 2>/dev/null || true; }"
     GW_STARTED_VIA="nohup"
     # nohup path has no systemd unit; empty argument switches the hint
     # to the log file path instead of journalctl.
@@ -3721,8 +3863,12 @@ print_completion_message() {
     # newbie running `db.coll.insertOne(...)` operated on the default `test`
     # DB silently. Make the example explicit by including /test in the path
     # and pointing out how to switch DBs.
+    # URI-encode, and encode ' too (jq 1.6's @uri keeps it) so nothing can
+    # close the single quotes.
+    local encoded_user
+    encoded_user="$(jq -rn --arg u "${USERNAME}" '$u | @uri' | sed "s/'/%27/g")"
     connect_uri="mongosh 'mongodb://"
-    connect_uri+="${USERNAME}:<your-password>@${connect_host}/mydb?${connect_opts}'"
+    connect_uri+="${encoded_user}:<your-password>@${connect_host}/mydb?${connect_opts}'"
     log_success "DocumentDB is ready."
     echo "Connect with:"
     echo "  ${connect_uri}"
@@ -3807,6 +3953,15 @@ print_completion_message() {
         fi
     fi
 
+    if [[ -z "${TARGET_CLUSTER}" && -f "${DATA_DIR}/current_logfiles" ]]; then
+        local log_destination log_file collector_logs=""
+        while IFS=' ' read -r log_destination log_file; do
+            [[ "${log_file}" == /* ]] || log_file="${DATA_DIR}/${log_file}"
+            collector_logs+="${collector_logs:+, }${log_file}"
+        done < "${DATA_DIR}/current_logfiles"
+        [[ -z "${collector_logs}" ]] || pg_log_hint="${collector_logs}"
+    fi
+
     local gw_log_hint="journalctl -u ${gw_unit}"
     [[ "${gw_systemd_managed}" == "true" ]] || gw_log_hint="/var/lib/documentdb-gateway/gateway.log"
 
@@ -3877,6 +4032,9 @@ parse_arguments() {
         case "$1" in
             --username|--admin-user)
                 [[ $# -ge 2 ]] || die "--admin-user requires a value."
+                # `--admin-user --yes` would otherwise take --yes as the name
+                # and silently drop the flag.
+                [[ "$2" != -* ]] || die "--admin-user requires a value, but got the option '$2'."
                 USERNAME="$2"
                 shift 2
                 ;;
@@ -3913,6 +4071,7 @@ parse_arguments() {
                 ;;
             --pg-version)
                 [[ $# -ge 2 ]] || die "--pg-version requires a value."
+                [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--pg-version requires a single numeric PostgreSQL major such as 17 (got '$2')."
                 PG_VERSION="$2"
                 PG_VERSION_EXPLICIT=true
                 shift 2
@@ -3930,8 +4089,10 @@ parse_arguments() {
                 shift 2
                 ;;
             --data-dir)
-                [[ $# -ge 2 ]] || die "--data-dir requires a value."
-                DATA_DIR="$2"
+                [[ $# -ge 2 && -n "$2" ]] || die "--data-dir requires a value."
+                # Absolute and normalized as pg_ctl does, so the persisted path
+                # names this cluster from any cwd and matches the postmaster's -D.
+                DATA_DIR="$(realpath -m -s -- "$2")"
                 DATA_DIR_EXPLICIT=true
                 shift 2
                 ;;
@@ -4149,6 +4310,35 @@ REPORT
 # does not modify anything, does not call register-gateway, does not
 # initdb. Exit 0 if a healthy install is found, non-zero otherwise so
 # scripts can gate on it.
+# status_extension_versions <major> <pg-url file> — "name version" for each
+# DocumentDB extension in the database the gateway serves, flagging any that
+# lag the installed package. Queried as the gateway's own role.
+status_extension_versions() {
+    local major="$1" url_file="$2" psql_bin="" bindir url="" rows=""
+    if [[ "$(id -u)" -ne 0 ]]; then
+        printf '<run as root to query>'
+        return 0
+    fi
+    while IFS= read -r bindir; do
+        [[ -x "${bindir}/psql" ]] && { psql_bin="${bindir}/psql"; break; }
+    done < <(documentdb_pg_bindir_candidates "${major}")
+    [[ -n "${psql_bin}" && -r "${url_file}" ]] && url="$(head -n 1 "${url_file}")"
+    if [[ -n "${url}" ]]; then
+        # -w and env: never prompt for a password, and keep the timeouts across a sudo fallback.
+        rows="$(run_as_user documentdb-gateway env PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=5000' \
+            "${psql_bin}" -X -w -A -t -q -F ' ' -d "${url}" -c \
+            "SELECT name, coalesce(installed_version, '-'), default_version FROM pg_available_extensions WHERE name IN ('documentdb_core', 'documentdb', 'documentdb_extended_rum') ORDER BY name = 'documentdb_extended_rum', name <> 'documentdb_core', name" \
+            2>/dev/null || true)"
+    fi
+    if [[ -z "${rows}" ]]; then
+        printf '<unavailable: could not query PostgreSQL>'
+        return 0
+    fi
+    awk '$2 == "-" { next }
+         { out = out sep $1 " " $2 (($2 != $3) ? " (package has " $3 "; re-run documentdb-setup)" : ""); sep = ", " }
+         END { print (out == "" ? "<none created>" : out) }' <<< "${rows}"
+}
+
 status_only() {
     local v="${PG_VERSION:-}"
     if [[ -z "${v}" ]]; then
@@ -4233,11 +4423,17 @@ EOF
         listening_port="<unable to probe listeners (install iproute2)>"
     fi
 
-    # If listener is up but systemctl said inactive, the wizard most
-    # likely fell back to nohup mode (no systemd). Reflect that
-    # accurately instead of a false "inactive".
+    # Listener up but no active unit: the wizard may have fallen back to nohup.
+    # Only the recorded, live gateway PID proves the listener is ours; any
+    # other process on the port must not read as a healthy install.
     if [[ "${listening_port}" == "${effective_gateway_port}" && "${gw_active}" == "inactive" ]]; then
-        gw_active="active (nohup; no systemd)"
+        if nohup_gateway_pid_for_port "${effective_gateway_port}" >/dev/null 2>&1; then
+            gw_active="active (nohup; no systemd)"
+        elif [[ "$(id -u)" -ne 0 ]]; then
+            gw_active="unknown (port ${effective_gateway_port} is in use; run as root to check it is this install's gateway)"
+        else
+            gw_active="inactive (port ${effective_gateway_port} is held by a process that is not this install's recorded gateway)"
+        fi
     fi
     if [[ "${listening_port}" == "${effective_gateway_port}" && "${pg_active}" == "inactive" && "${has_systemd}" == "0" ]]; then
         # Probe PG socket as a proxy when systemd is absent.
@@ -4254,6 +4450,20 @@ EOF
         fi
     fi
 
+    local bind_addr="" ext_versions=""
+    if [[ -r "/etc/documentdb/local/${v}/gateway.env" ]]; then
+        bind_addr="$(persisted_listen_addr "${v}")"
+        bind_addr="${bind_addr:-:${effective_gateway_port}}"
+        [[ "${bind_addr}" =~ ^:[0-9]+$ ]] && bind_addr+=" (all interfaces)"
+    elif [[ -e "/etc/documentdb/local/${v}/gateway.env" ]]; then
+        bind_addr="<run as root to read /etc/documentdb/local/${v}/gateway.env>"
+    else
+        bind_addr="<not configured>"
+    fi
+    if [[ "${mode}" != "<not configured>" ]]; then
+        ext_versions="$(status_extension_versions "${v}" "${connection_file}")"
+    fi
+
     cat <<EOF
 documentdb-setup status (PG ${v}):
 
@@ -4264,7 +4474,9 @@ connection URL file:           ${connection_file}
 ${pg_unit}: ${pg_active}
 ${gw_unit}: ${gw_active}
 gateway listener:              ${listening_port}
+gateway bind address:          ${bind_addr}
 EOF
+    [[ -z "${ext_versions}" ]] || printf 'extensions:                    %s\n' "${ext_versions}"
 
     # The design doc (§5 line 284)
     # promises "--status … exit 0 if a healthy install is found", and
@@ -4282,6 +4494,12 @@ EOF
     if [[ "${mode}" == "<not configured>" ]]; then
         return 1
     fi
+    # Active units are not proof: PostgreSQL must answer the gateway's own
+    # connection, and an admin the gateway can authenticate must still exist.
+    local db_check
+    db_check="$(status_database_check "${v}" "${connection_file}")"
+    printf 'database:                      %s\n' "${db_check}"
+    [[ "${db_check}" == ok* || "${db_check}" == unknown* ]] || return 1
     if [[ "${gw_active}" != "active" && "${gw_active}" != active* ]]; then
         return 1
     fi
@@ -4292,6 +4510,38 @@ EOF
         return 1
     fi
     return 0
+}
+
+# status_database_check <major> <pg-url file> — "ok (...)" when PostgreSQL
+# answers as the gateway's role and a DocumentDB admin login role exists,
+# "unknown (...)" when not run as root, otherwise what is wrong.
+status_database_check() {
+    local major="$1" url_file="$2" psql_bin="" bindir url="" admins=""
+    if [[ "$(id -u)" -ne 0 ]]; then
+        printf 'unknown (run as root to query PostgreSQL)'
+        return 0
+    fi
+    while IFS= read -r bindir; do
+        [[ -x "${bindir}/psql" ]] && { psql_bin="${bindir}/psql"; break; }
+    done < <(documentdb_pg_bindir_candidates "${major}")
+    [[ -r "${url_file}" ]] && url="$(head -n 1 "${url_file}")"
+    if [[ -z "${psql_bin}" || -z "${url}" ]]; then
+        printf 'cannot connect (no psql for PostgreSQL %s or no %s)' "${major}" "${url_file}"
+        return 0
+    fi
+    # -w and the timeouts: a status probe must never prompt or hang.
+    if ! admins="$(run_as_user documentdb-gateway env PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=5000' \
+            "${psql_bin}" -X -w -A -t -q -d "${url}" -c \
+            "SELECT coalesce(string_agg(r.rolname, ' ' ORDER BY r.rolname), '') FROM pg_roles r JOIN pg_auth_members m ON m.member = r.oid JOIN pg_roles g ON g.oid = m.roleid WHERE g.rolname = 'documentdb_admin_role' AND r.rolcanlogin AND r.rolname !~* '^(documentdb|citus|pg|internal_role)'" \
+            2>/dev/null)"; then
+        printf 'not answering (PostgreSQL refused or did not answer the gateway connection in %s)' "${url_file}"
+        return 0
+    fi
+    if [[ -z "${admins}" ]]; then
+        printf 'no DocumentDB admin user (create one with: sudo documentdb-gateway-admin create-user --username <name> --password-file <file>)'
+        return 0
+    fi
+    printf 'ok (admin users: %s)' "${admins}"
 }
 
 # Probe whether the documentdb extension is available for PostgreSQL major $1
@@ -4440,17 +4690,18 @@ main() {
             if ! [[ "${USERNAME}" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
                 die "Admin username '${USERNAME}' is invalid. Use letters, digits, '_' or '-' (must start with a letter or '_')."
             fi
-            # Same gateway reserved-prefix policy as the flag path above:
-            # catch it at the prompt rather than after a full install.
-            if declare -F documentdb_validate_gateway_username >/dev/null 2>&1; then
-                documentdb_validate_gateway_username "${USERNAME}" \
-                    || die "Admin username '${USERNAME}' is rejected by the gateway's reserved-prefix policy (see above). Re-run and choose another name."
-            fi
         else
             echo "error: --admin-user is required for non-interactive setup (running without a usable TTY, or with --yes/--print-config/--status, so the wizard cannot prompt for it). Pass --admin-user NAME." >&2
             usage
             exit 1
         fi
+    fi
+
+    # Before the dry-run preview and any mutation: a name PostgreSQL or the
+    # gateway refuses used to install fully and leave an admin that can't log in.
+    if [[ "${RESTORE}" != "true" ]]; then
+        documentdb_validate_username "${USERNAME}" \
+            || die "Admin username '${USERNAME}' is not allowed (see above). Choose a different --admin-user."
     fi
 
     # Handle --restore early: strip all managed blocks, remove state, exit.
@@ -4491,7 +4742,7 @@ main() {
         # `documentdb-setup --restore` as the way to detach the install
         # just created — on a multi-major host the unscoped sweep would
         # also strip, stop, and de-state every OTHER major's install.
-        local restore_scope=""
+        local restore_scope="" scoped_gateway_port=""
         if [[ "${PG_VERSION_EXPLICIT}" == "true" ]]; then
             # The scope is expanded into globs and unit names below; a
             # non-numeric value ('*', '17 18') would silently widen the
@@ -4500,6 +4751,9 @@ main() {
                 || die "--restore --pg-version requires a single numeric PostgreSQL major (got '${PG_VERSION}')."
             restore_scope="${PG_VERSION}"
             log_info "Restoring: removing documentdb-setup managed configuration for PostgreSQL major ${restore_scope}."
+            # Read before the state files go: it is the only key to this
+            # major's nohup gateway record.
+            scoped_gateway_port="$(persisted_gateway_port "${restore_scope}")"
         else
             log_info "Restoring: removing all documentdb-setup managed configuration."
             # Enumerate affected majors and confirm before an unscoped
@@ -4525,6 +4779,20 @@ main() {
                     die "Refusing an unscoped multi-major restore without confirmation (no TTY). Re-run with --pg-version N to scope to one major, or --yes to proceed against all majors."
                 fi
             fi
+        fi
+
+        # The unscoped sweep below needs pgrep; refuse before changing anything.
+        if [[ -z "${restore_scope}" ]] && ! command_exists pgrep; then
+            die "pgrep is required to stop gateways started without systemd. Install procps (procps-ng on RHEL), then re-run --restore."
+        fi
+
+        # Stop this major's own nohup gateway before any state goes, so a
+        # failure leaves the install intact for a retry.
+        if [[ -n "${scoped_gateway_port}" && "${DRY_RUN}" == "true" ]]; then
+            log_info "[dry-run] Would stop the non-systemd gateway recorded for port ${scoped_gateway_port}"
+        elif [[ -n "${scoped_gateway_port}" ]]; then
+            stop_recorded_nohup_gateway "${scoped_gateway_port}" \
+                || die "The gateway on port ${scoped_gateway_port} did not stop. Nothing was removed; stop it, then re-run."
         fi
 
         # The legacy env file predates per-major state; it records the
@@ -4816,8 +5084,11 @@ main() {
         # the same as a stand-alone gateway, so cwd cannot distinguish them)
         # while never killing a running systemd-managed gateway.
         _kill_nohup_gateway_orphans() {
-            local _signal="$1" _pid _cg _hit=1
-            for _pid in $(pgrep -f /usr/lib/documentdb-gateway/documentdb-gateway-daemon 2>/dev/null); do
+            local _signal="$1" _pid _cg _hit=1 _pids="" _rc=0
+            # pgrep exits 1 for "no match"; anything else means the sweep saw nothing.
+            _pids="$(pgrep -f /usr/lib/documentdb-gateway/documentdb-gateway-daemon)" || _rc=$?
+            (( _rc <= 1 )) || die "Could not search for non-systemd gateway processes (pgrep exit ${_rc}). Install procps (procps-ng on RHEL), then re-run --restore."
+            for _pid in ${_pids}; do
                 _cg="$(cat "/proc/${_pid}/cgroup" 2>/dev/null || true)"
                 case "${_cg}" in
                     *documentdb-gateway.service*|*documentdb-gateway-local@*) continue ;;
@@ -5032,6 +5303,7 @@ main() {
             log_info "[dry-run]     - Print 'systemctl reload postgresql@${preview_pg_version}-${preview_cluster_name}' for the operator to run"
         fi
         log_info "[dry-run]     - psql: CREATE EXTENSION documentdb CASCADE${_ext_note}"
+        log_info "[dry-run]     - psql: install temporary getParameter rejection stub if the backend function is missing"
         log_info "[dry-run]     - psql: bootstrap admin user '${USERNAME}' via documentdb_api.create_user()${_admin_note}"
         log_info "[dry-run]     - systemctl enable documentdb-gateway-local@${preview_pg_version}.service"
         log_info "[dry-run]     - systemctl start  documentdb-gateway-local@${preview_pg_version}.service"

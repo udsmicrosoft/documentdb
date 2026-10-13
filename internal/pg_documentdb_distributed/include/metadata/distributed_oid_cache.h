@@ -32,4 +32,10 @@ Oid CitusWorkerPartialAggregateFunctionOid(void);
  */
 Oid CitusWorkerBinaryPartialAggregateFunctionOid(void);
 
+/*
+ * Oid of pg_catalog.get_shard_id_for_distribution_column(regclass, "any").
+ * Raises an error if the function is unavailable.
+ */
+Oid CitusShardIdForDistributionColumnFunctionOid(void);
+
 #endif

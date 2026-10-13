@@ -209,7 +209,6 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_AGGREGATE_GROUP_BOTTOM_N] = "group_bottom_n",
 	[FEATURE_AGGREGATE_GROUP_CONCAT_ARRAYS] = "group_concat_arrays",
 	[FEATURE_AGGREGATE_GROUP_COUNT] = "group_count",
-	[FEATURE_AGGREGATE_GROUP_COUNT_WITH_ARG] = "group_count_with_arg",
 	[FEATURE_AGGREGATE_GROUP_DECOMPOSED_GROUP_BY] = "group_decomposed_group_by",
 	[FEATURE_AGGREGATE_GROUP_FIRST] = "group_first",
 	[FEATURE_AGGREGATE_GROUP_FIRST_N] = "group_first_n",
@@ -548,6 +547,10 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_STAGE_UNWIND] = "unwind",
 	[FEATURE_STAGE_VECTOR_SEARCH_KNN] = "vector_search_knn",
 	[FEATURE_STAGE_VECTOR_SEARCH_NATIVE] = "vector_search_native",
+
+	/* Feature Mapping region - Unique shard key path */
+	[FEATURE_UNIQUE_SHARD_KEY_MISMATCH_SUPPRESSED_CONFLICT] =
+		"unique_shard_key_mismatch_suppressed_conflict",
 
 	/* Feature Mapping region - Update operators / options */
 	[FEATURE_UPDATE_MANY] = "update_many",

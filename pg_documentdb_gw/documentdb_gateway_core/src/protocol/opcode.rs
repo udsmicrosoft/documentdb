@@ -56,3 +56,38 @@ impl OpCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[expect(deprecated, reason = "legacy opcodes remain part of wire decoding")]
+    fn known_values_decode_to_expected_opcodes() {
+        let cases = [
+            (1, OpCode::Reply),
+            (2001, OpCode::Update),
+            (2002, OpCode::Insert),
+            (2003, OpCode::Reserved),
+            (2004, OpCode::Query),
+            (2005, OpCode::GetMore),
+            (2006, OpCode::Delete),
+            (2007, OpCode::KillCursors),
+            (2010, OpCode::Command),
+            (2011, OpCode::CommandReply),
+            (2012, OpCode::Compressed),
+            (2013, OpCode::Msg),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(OpCode::from_value(value), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_values_decode_as_invalid() {
+        for value in [i32::MIN, -1, 0, 2, 2000, 2008, i32::MAX] {
+            assert_eq!(OpCode::from_value(value), OpCode::Invalid);
+        }
+    }
+}

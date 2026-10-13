@@ -37,5 +37,12 @@
 #define SortPathKeyStrategy(pathKey) ((pathKey)->pk_strategy)
 
 #endif
+#if PG_VERSION_NUM >= 180000
+#define AnalyzeDelayPointCompat() \
+	vacuum_delay_point(true);
+#else
+#define AnalyzeDelayPointCompat() \
+	vacuum_delay_point();
+#endif
 
 #endif

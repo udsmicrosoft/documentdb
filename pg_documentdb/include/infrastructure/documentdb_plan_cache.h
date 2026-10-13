@@ -125,6 +125,14 @@
 
 #define QUERY_ID_IS_CUSTOM_ROLE (59L << 32)
 
+/* Write plans that pass a possibly compressed document as a bson parameter */
+#define QUERY_ID_INSERT_COMPRESSED (60L << 32)
+#define QUERY_ID_INSERT_OR_REPLACE_COMPRESSED (61L << 32)
+#define QUERY_ID_UPDATE_BY_TID_COMPRESSED (62L << 32)
+
+/* Plan ID for the per-op update worker dispatch */
+#define QUERY_CALL_UPDATE_WORKER (63L << 32)
+
 /*
  * Compile-time plan cache ID collision detection.
  *
@@ -217,6 +225,14 @@ pg_attribute_unused() =
 
 	/* Role catalog lookup (59) */
 	PlanCacheIdEntry(QUERY_ID_IS_CUSTOM_ROLE),
+
+	/* Compressed document writes (60-62) */
+	PlanCacheIdEntry(QUERY_ID_INSERT_COMPRESSED),
+	PlanCacheIdEntry(QUERY_ID_INSERT_OR_REPLACE_COMPRESSED),
+	PlanCacheIdEntry(QUERY_ID_UPDATE_BY_TID_COMPRESSED),
+
+	/* Update worker dispatch (63) */
+	PlanCacheIdEntry(QUERY_CALL_UPDATE_WORKER),
 };
 /* *INDENT-ON* */
 

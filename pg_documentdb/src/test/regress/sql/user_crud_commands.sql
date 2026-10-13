@@ -18,6 +18,57 @@ SELECT documentdb_api.create_user('{"createUser":"newBlock2_user", "pwd":"test_p
 
 RESET documentdb.blockedRolePrefixList;
 
+-- Passwords that fail SASLprep must not create or change native users.
+
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_emoji", "pwd":"Valid\ud83e\uddeaPass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+\echo :SQLSTATE
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_private_use", "pwd":"Valid\ue000Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_bidi", "pwd":"Valid\u05d0Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_empty", "pwd":"\u00ad", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Raw BSON reaches password validation without the JSON decoder rejecting UTF-8.
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"createUser":"saslprep_rejected_utf8", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}') AS command
+)
+SELECT documentdb_api.create_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+\echo :SQLSTATE
+
+SELECT count(*) AS rejected_users_created
+FROM pg_authid
+WHERE rolname LIKE 'saslprep_rejected_%';
+
+SET client_min_messages TO WARNING;
+DROP ROLE IF EXISTS saslprep_rejected_emoji, saslprep_rejected_private_use,
+    saslprep_rejected_bidi, saslprep_rejected_empty, saslprep_rejected_utf8;
+RESET client_min_messages;
+
+SELECT documentdb_api.create_user('{"createUser":"saslprep_update_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT rolpassword AS saslprep_original_password
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user' \gset
+
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ud83e\uddeaPass123!", "$db":"admin"}');
+\echo :SQLSTATE
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ue000Pass123!", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\u05d0Pass123!", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"\u00ad", "$db":"admin"}');
+
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"updateUser":"saslprep_update_user", "pwd":"test_password", "$db":"admin"}') AS command
+)
+SELECT documentdb_api.update_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+\echo :SQLSTATE
+
+SELECT rolpassword = :'saslprep_original_password' AS password_unchanged
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user';
+SELECT pg_has_role('saslprep_update_user', 'documentdb_readonly_role', 'MEMBER') AS membership_unchanged;
+SELECT documentdb_api.drop_user('{"dropUser":"saslprep_update_user", "$db":"admin"}');
+
 --Enable DB admin requirement feature flag
 SET documentdb.enableUsersAdminDBCheck TO ON;
 

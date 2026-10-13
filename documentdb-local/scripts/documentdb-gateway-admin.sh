@@ -60,11 +60,14 @@ log_verbose() { if [[ "${VERBOSE}" == "true" ]]; then echo "[${PROG}] $*" >&2; f
 # Source the shared tools library for the PostgreSQL bin-directory candidate
 # helper (documentdb_pg_bindir_candidates), so find_psql shares one Debian/RHEL
 # layout list with documentdb-tune / documentdb-register-gateway / documentdb-
-# setup instead of hardcoding it. The library ships beside this script in a dev
+# setup instead of hardcoding it, and for the shared index-extension recipe and
+# resolver used by cmd_check. The library ships beside this script in a dev
 # checkout and at /usr/share/documentdb/scripts/ from the documentdb-postgresql-
 # tools package (both files ship together). Sourced after die is defined so a
-# missing library fails with a clear message; the only helper used here
-# (documentdb_pg_bindir_candidates) is a pure printf that needs no host hooks.
+# missing library fails with a clear message. Its readers run psql through
+# run_as_user when they are given an OS-user argument, which this script
+# defines below; callers that only render advice (documentdb-tune) need no such
+# hook.
 _DDB_TOOLS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for _ddb_cand in "${_DDB_TOOLS_LIB_DIR}/documentdb-tools-lib.sh" \
                  "/usr/share/documentdb/scripts/documentdb-tools-lib.sh"; do
@@ -378,7 +381,9 @@ Common options:
   --username NAME         User name (required for create/drop/reset)
   --password-file FILE    Password file (one of: --password-file, --password-stdin;
                           required for create-user and reset-password)
-  --password-stdin        Read the password from stdin (single line). Best
+                          The file must hold one line of printable ASCII;
+                          one trailing newline (LF or CRLF) is removed.
+  --password-stdin        Read the password from stdin (same rules). Best
                           practice for piping a secret without touching disk:
                             printf '%s' "$PW" | sudo documentdb-gateway-admin \
                               reset-password --username admin --password-stdin
@@ -452,9 +457,9 @@ find_psql() {
 # `RESOLVED_PASSWORD_FILE` to that path. The caller passes that path
 # to jq's `--rawfile` (which only reads from a real file). Resolution:
 #
-#  * `--password-file FILE` → use the operator-supplied file verbatim
-#  * `--password-stdin` → read one line from stdin, write to a
-#  tmpfile registered for trap cleanup
+#  * `--password-file FILE` or `--password-stdin` → read and check the
+#  password under the shared one-line contract (documentdb_read_password),
+#  then write it to a tmpfile registered for trap cleanup
 #  * neither → die with usage
 #
 # `--password-file` and `--password-stdin` are mutually exclusive — an
@@ -480,33 +485,16 @@ resolve_password_to_file() {
         if [[ -n "${file_perms}" && "${file_perms}" != "600" && "${file_perms}" != "400" ]]; then
             log "WARNING: Password file ${PASSWORD_FILE} has permissions ${file_perms} (recommended: 0600)."
         fi
-        # Echo "secret" > pwfile adds a
-        # trailing newline that gets stored verbatim as part of the
-        # password. Client login then fails with a server error (Invalid
-        # key) — and the user has no idea why. Materialize the
-        # password into a tmpfile with exactly one trailing newline
-        # stripped (the common shell-redirection artifact). A genuinely
-        # newline-suffixed password is still expressable via stdin or
-        # --password-stdin with an explicit \n.
-        local stripped
+        # `echo secret > pwfile` adds a trailing newline (CRLF from a
+        # Windows editor) that, stored verbatim, fails every login with
+        # "Invalid key"; the shared contract drops exactly that.
+        local raw="" stripped
+        documentdb_read_password raw "Password file ${PASSWORD_FILE}" < "${PASSWORD_FILE}" \
+            || die "Cannot use --password-file ${PASSWORD_FILE} (see above)."
         stripped="$(mktemp)" || die "Cannot create temp file."
         _TEMP_FILES+=("${stripped}")
         chmod 600 "${stripped}"
-        # Read whole file; strip single trailing \n if present.
-        local raw
-        raw="$(cat "${PASSWORD_FILE}")"
-        # bash command substitution already strips trailing newlines, so
-        # `raw` lost ALL trailing newlines. Writing it back without a
-        # trailing newline yields a clean password value.
         printf '%s' "${raw}" > "${stripped}"
-        # Warn if the original file ended with multiple newlines (likely
-        # an editor artifact) so the operator can fix the source file.
-        local file_size raw_len
-        file_size="$(stat -c '%s' "${PASSWORD_FILE}" 2>/dev/null || echo 0)"
-        raw_len=${#raw}
-        if (( file_size > raw_len + 1 )); then
-            log "WARNING: ${PASSWORD_FILE} ends with $((file_size - raw_len)) trailing newline/whitespace bytes; using the stripped value. Use printf %s \"\$PW\" > file or --password-stdin to avoid this."
-        fi
         if [[ -n "${PG_OWNER}" ]] && id -u "${PG_OWNER}" >/dev/null 2>&1; then
             chown "${PG_OWNER}" "${stripped}" 2>/dev/null || true
         fi
@@ -519,13 +507,11 @@ resolve_password_to_file() {
             die "--password-stdin requires the password on stdin (e.g. 'printf %s \"\$PW\" | documentdb-gateway-admin ... --password-stdin'). Stdin is a TTY."
         fi
         local tmp line=""
+        documentdb_read_password line "The password on stdin" \
+            || die "Cannot use the password from --password-stdin (see above)."
         tmp="$(mktemp)" || die "Cannot create temp file for stdin password."
         _TEMP_FILES+=("${tmp}")
         chmod 600 "${tmp}"
-        # Read a single line preserving leading/trailing whitespace
-        # except the trailing newline. Tolerate the no-trailing-newline
-        # case from `printf '%s' "$PW" |` style invocations.
-        IFS= read -r line || true
         printf '%s' "${line}" > "${tmp}"
         # If the caller's PG_OWNER differs from the current user, make
         # sure the run_as_user'd psql process can read the file.
@@ -543,15 +529,13 @@ resolve_password_to_file() {
 
 cmd_create_user() {
     [[ -n "${USERNAME}" ]] || die "--username is required."
-    # Refuse a name the gateway blocks at authentication rather than
-    # creating a role that reports success and then fails every login with
-    # "Username is invalid" (the gateway blocks the documentdb / citus / pg /
-    # internal_role prefixes). Checked before the dry-run branch so a preview
-    # surfaces the same rejection an apply would.
-    if declare -F documentdb_validate_gateway_username >/dev/null 2>&1; then
-        documentdb_validate_gateway_username "${USERNAME}" \
-            || die "Refusing to create user '${USERNAME}' (see above)."
-    fi
+    # Refuse a name PostgreSQL truncates or reserves, or the gateway blocks at
+    # authentication, rather than create a user that reports success and can
+    # never log in. Names like first.last stay allowed: the backend quotes
+    # them. Checked before the dry-run branch so a preview surfaces the same
+    # rejection an apply would.
+    documentdb_validate_username "${USERNAME}" \
+        || die "Refusing to create user '${USERNAME}' (see above)."
     if [[ "${DRY_RUN}" == "true" ]]; then
         log "[dry-run] would create DocumentDB user '${USERNAME}' in database '${TARGET_DB}' (no changes made)."
         return 0
@@ -784,6 +768,17 @@ SQL
     log "Password reset for user '${USERNAME}'."
 }
 
+# The remedy for a database missing extensions: the targeted psql command plus
+# whatever caveat this host needs. Shared by both cmd_check call sites so the
+# base-extension and index-handler advice cannot drift apart.
+print_extension_remedy() {
+    local required_ext="${1:-}" line=""
+    while IFS= read -r line; do
+        log "  ${line}"
+    done < <(documentdb_create_extension_advice "${PG_OWNER}" "${TARGET_DB}" \
+                "${required_ext}" -h "${SOCKET_DIR}" -p "${PG_PORT}")
+}
+
 cmd_check() {
     local psql_bin ext_check
     psql_bin="$(find_psql)"
@@ -795,6 +790,42 @@ cmd_check() {
     fi
     log "PostgreSQL connectivity: OK"
 
+    # The config may pin an alternate index access method, satisfied only by a
+    # per-database extension. Resolved from the live GUC, falling back to the
+    # installed control file pre-restart so the advice never degrades to the
+    # single-statement recipe. Status captured explicitly: under set -e a bare
+    # assignment would abort here, and status 2 is an answer, not a failure.
+    local pg_major="" required_ext="" handler_name="" resolution_rc=0
+    pg_major="$(documentdb_read_pg_major "${psql_bin}" "${SOCKET_DIR}" \
+        "${PG_PORT}" "${TARGET_DB}" "${PG_OWNER}")"
+    required_ext="$(documentdb_required_index_extension "${psql_bin}" "${SOCKET_DIR}" \
+        "${PG_PORT}" "${TARGET_DB}" "${PG_OWNER}" "${pg_major}")" || resolution_rc=$?
+    case "${resolution_rc}" in
+        0|2) ;;
+        *) die "Cannot determine which index extension database '${TARGET_DB}' requires (status ${resolution_rc})." ;;
+    esac
+    handler_name="$(documentdb_index_handler_for_extension "${required_ext}")"
+
+    # Status 2: the server did not answer, so this is an inference from the
+    # installed control file — and with nothing to infer from, empty means
+    # "unknown", not "nothing else needed". Say which one, before any remedy.
+    if (( resolution_rc == 2 )); then
+        if [[ -n "${required_ext}" ]]; then
+            log "Index handler: '${handler_name}' (${required_ext}) per the installed control file."
+            # Report the observation, not a cause: status 2 covers a GUC that
+            # does not exist yet AND a read that simply failed, so naming the
+            # first would send an operator to restart a healthy server on the
+            # strength of a query that did not answer.
+            log "  documentdb.alternate_index_handler_name could not be read from this server,"
+            log "  so this requirement is inferred from installed files. If PostgreSQL has not"
+            log "  restarted since documentdb-tune ran, restart it before creating extensions."
+        else
+            log "WARNING: cannot tell which index extension this database needs: the server did not"
+            log "  answer for documentdb.alternate_index_handler_name and the installed extensions"
+            log "  could not be probed. Any command below may be incomplete."
+        fi
+    fi
+
     log "Checking DocumentDB extension..."
     ext_check="$(run_as_user "${PG_OWNER}" "${psql_bin}" -h "${SOCKET_DIR}" -p "${PG_PORT}" \
         -d "${TARGET_DB}" -X -tA -c "SELECT 1 FROM pg_extension WHERE extname = 'documentdb';" 2>/dev/null || true)"
@@ -802,7 +833,43 @@ cmd_check() {
     if [[ "${ext_check}" == "1" ]]; then
         log "DocumentDB extension: loaded"
     else
-        log "DocumentDB extension: NOT loaded (run CREATE EXTENSION documentdb CASCADE;)"
+        log "DocumentDB extension: NOT loaded"
+        print_extension_remedy "${required_ext}"
+        return 1
+    fi
+
+    # Reported separately: 'documentdb' being present says nothing about whether
+    # indexes work, and a database missing this extension cannot build a new
+    # index at all.
+    if [[ -n "${required_ext}" ]]; then
+        local am_ext_check am_err_file
+        am_err_file="$(mktemp)" || die "Cannot create a temporary file for the extension probe."
+        _TEMP_FILES+=("${am_err_file}")
+        # Fail closed: with 2>/dev/null || true a permission error or dropped
+        # connection is indistinguishable from a missing extension, and we would
+        # report the extension MISSING in a healthy database. Same
+        # reasoning as the users_info pre-check in cmd_reset_password.
+        if ! am_ext_check="$(run_as_user "${PG_OWNER}" "${psql_bin}" -h "${SOCKET_DIR}" -p "${PG_PORT}" \
+                -d "${TARGET_DB}" -X -tA -v ON_ERROR_STOP=1 \
+                -c "SELECT 1 FROM pg_extension WHERE extname = '${required_ext}';" 2>"${am_err_file}")"; then
+            die "Cannot probe for the '${required_ext}' extension in database '${TARGET_DB}': $(cat "${am_err_file}")"
+        fi
+        if [[ "${am_ext_check}" == "1" ]]; then
+            log "Index access method '${handler_name}' (${required_ext}): available"
+        elif [[ "${ext_check}" == "1" ]]; then
+            log "Index access method '${handler_name}' (${required_ext}): MISSING"
+            if (( resolution_rc == 0 )); then
+                # PGC_USERSET: this is the setting in effect for the connection
+                # and database just probed, not a proven cluster-wide pin.
+                log "  documentdb.alternate_index_handler_name is '${handler_name}' for this"
+                log "  connection, but '${required_ext}' is not created in database '${TARGET_DB}'."
+            else
+                log "  '${required_ext}' is installed on this host but not created in database"
+                log "  '${TARGET_DB}'."
+            fi
+            log "  New index builds fail with \"Index access method ${handler_name} is not available\"."
+            print_extension_remedy "${required_ext}"
+        fi
     fi
 }
 

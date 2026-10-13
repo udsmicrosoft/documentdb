@@ -52,6 +52,19 @@ if { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }; then
         systemctl stop "documentdb-local@%{pg_version}.target" || true
         systemctl disable "documentdb-local@%{pg_version}.target" || true
     fi
+elif [ "$1" -eq 0 ]; then
+    # No systemd: documentdb-setup started this major's gateway under nohup and
+    # PostgreSQL with pg_ctl. Stop both; like the systemd branch, warn rather
+    # than block the erase. Mirrors the DEB prerm.
+    lib=/usr/share/documentdb/scripts/documentdb-tools-lib.sh
+    if [ -r "${lib}" ]; then
+        bash -c 'die() { echo "$*" >&2; exit 1; }; log_warn() { echo "$*" >&2; }; . "$1"; documentdb_stop_local_major "$2"' \
+                _ "${lib}" "%{pg_version}" || {
+            echo "documentdb-%{pg_version}: warning: DocumentDB for PostgreSQL %{pg_version} is still running from the erased files; stop it." >&2
+        }
+    else
+        echo "documentdb-%{pg_version}: ${lib} is missing; cannot stop a gateway or PostgreSQL started without systemd." >&2
+    fi
 fi
 
 %postun

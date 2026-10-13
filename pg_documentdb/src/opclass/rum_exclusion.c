@@ -39,6 +39,7 @@
 
 #include <postgres.h>
 #include <fmgr.h>
+#include <utils/builtins.h>
 #include <access/stratnum.h>
 #include <access/reloptions.h>
 #include <catalog/pg_type.h>
@@ -55,12 +56,15 @@
 #include "opclass/bson_gin_private.h"
 #include "opclass/bson_gin_index_mgmt.h"
 #include "metadata/metadata_cache.h"
+#include "index_am/documentdb_rum_opclass.h"
+#include "utils/feature_counter.h"
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
 /* --------------------------------------------------------- */
 
 extern int DefaultUniqueIndexKeyhashOverride;
+extern bool EnableUniqueNullMissingEquivalence;
 
 static pgbson * GetShardKeyAndDocument(HeapTupleHeader input, int64_t *shardKey);
 static IndexTraverseOption GetExclusionIndexTraverseOption(void *contextOptions,
@@ -73,13 +77,33 @@ static void GenerateTermsForExclusion(pgbson *document, int64_t shardKey,
 									  GinEntryPathData *pathData,
 									  bool generateRootTerm);
 static void ValidateExclusionPathSpec(const char *prefix);
+
+/*
+ * A path written into a unique shard document, whether it holds a null
+ * equivalent term, and (when probing) whether one of its terms matched.
+ */
+typedef struct UniqueShardDocumentPath
+{
+	StringView path;
+	bool hasNullTerm;
+	bool hasTermMatch;
+} UniqueShardDocumentPath;
+
+typedef struct UniqueShardDocumentPaths
+{
+	UniqueShardDocumentPath paths[INDEX_MAX_KEYS];
+	int32_t numPaths;
+} UniqueShardDocumentPaths;
+
 static bool ProcessUniqueShardDocumentKeysNew(pgbson *uniqueShardDocument,
 											  int64_t *shardKeyComparison,
-											  bool *hasShardKey,
-											  HTAB *termsHashSet, HASHACTION hashAction);
+											  HTAB *termsHashSet, HASHACTION hashAction,
+											  UniqueShardDocumentPaths *documentPaths);
 static HTAB * GetUniqueShardDocumentTermsHTABNew(pgbson *uniqueShardDocument,
 												 int64_t *shardKeyValue,
-												 bool *hasShardKeyValue);
+												 UniqueShardDocumentPaths *documentPaths);
+static bool AreUniqueShardDocumentPathsConflicting(UniqueShardDocumentPaths *leftPaths,
+												   UniqueShardDocumentPaths *rightPaths);
 
 typedef struct IndexBounds
 {
@@ -101,6 +125,14 @@ typedef struct
 	const char *collationString;
 } UniqueIndexTermHashEntry;
 
+typedef struct
+{
+	uint64_t shardKeyValue;
+	int32_t numTerms;
+	int32_t numPaths;
+	const char *collation;
+} UniqueShardDocumentMetadata;
+
 /* --------------------------------------------------------- */
 /* Top level exports */
 /* --------------------------------------------------------- */
@@ -119,6 +151,7 @@ PG_FUNCTION_INFO_V1(gin_bson_unique_shard_consistent);
 PG_FUNCTION_INFO_V1(bson_unique_shard_path_index_equal);
 PG_FUNCTION_INFO_V1(bson_unique_index_term_equal);
 PG_FUNCTION_INFO_V1(bson_unique_shard_path_options);
+PG_FUNCTION_INFO_V1(gin_bson_unique_shard_rum_config);
 
 /*
  * Runs the preconsistent function for the exclusion operator class
@@ -326,6 +359,7 @@ generate_unique_shard_document(PG_FUNCTION_ARGS)
 
 	bool sparse = PG_GETARG_BOOL(3);
 	bool generateCompositeTerms = PG_NARGS() > 4 ? PG_GETARG_BOOL(4) : false;
+	text *collation = PG_NARGS() > 5 ? PG_GETARG_TEXT_PP(5) : NULL;
 
 	Datum *termArray[INDEX_MAX_KEYS] = { 0 };
 	int32_t numTermArray[INDEX_MAX_KEYS] = { 0 };
@@ -342,7 +376,13 @@ generate_unique_shard_document(PG_FUNCTION_ARGS)
 	{
 		StringView pathIter = bson_iter_key_string_view(&specIter);
 
-		char *buffer = palloc0(sizeof(BsonGinSinglePathOptions) + 5 + pathIter.length);
+		uint32_t requiredLength = sizeof(BsonGinSinglePathOptions) + 5 + pathIter.length;
+		if (collation != NULL)
+		{
+			requiredLength += 5 + VARSIZE_ANY_EXHDR(collation);
+		}
+
+		char *buffer = palloc0(requiredLength);
 		BsonGinSinglePathOptions *singlePathOptions = (BsonGinSinglePathOptions *) buffer;
 		singlePathOptions->isWildcard = false;
 		singlePathOptions->generateNotFoundTerm = !sparse;
@@ -350,7 +390,6 @@ generate_unique_shard_document(PG_FUNCTION_ARGS)
 		singlePathOptions->base.type = IndexOptionsType_SinglePath;
 		singlePathOptions->base.version = IndexOptionsVersion_V0;
 
-		/* TODO(Collation): what should be put here? */
 		singlePathOptions->base.collation = 0;
 		singlePathOptions->path = sizeof(BsonGinSinglePathOptions);
 		char *pathPrefix = buffer + sizeof(BsonGinSinglePathOptions);
@@ -358,6 +397,16 @@ generate_unique_shard_document(PG_FUNCTION_ARGS)
 		memcpy(pathPrefix, &pathLength, sizeof(uint32_t));
 		pathPrefix += 4;
 		memcpy(pathPrefix, pathIter.string, pathIter.length);
+		pathPrefix += pathIter.length + 1;
+		if (collation != NULL)
+		{
+			singlePathOptions->base.collation = sizeof(BsonGinSinglePathOptions) + 5 +
+												pathIter.length;                                        /* offset to collation string */
+			uint32_t collationLength = VARSIZE_ANY_EXHDR(collation);
+			memcpy(pathPrefix, &collationLength, sizeof(uint32_t));
+			pathPrefix += 4;
+			memcpy(pathPrefix, VARDATA_ANY(collation), collationLength);
+		}
 
 		GenerateTermsContext context = { 0 };
 		GinEntryPathData pathData = { 0 };
@@ -404,6 +453,17 @@ generate_unique_shard_document(PG_FUNCTION_ARGS)
 	pgbson_writer writer;
 	PgbsonWriterInit(&writer);
 	PgbsonWriterAppendInt64(&writer, "$shard_key_value", 16, shardKeyValue);
+
+	/* Add optional fields here so that the required paths can be validated after */
+	if (collation != NULL)
+	{
+		bson_value_t collationValue = { 0 };
+		collationValue.value_type = BSON_TYPE_UTF8;
+		collationValue.value.v_utf8.str = VARDATA_ANY(collation);
+		collationValue.value.v_utf8.len = VARSIZE_ANY_EXHDR(collation);
+		PgbsonWriterAppendValue(&writer, "$collation", 10, &collationValue);
+	}
+
 	PgbsonWriterAppendInt32(&writer, "$numTerms", 9, numTerms);
 	PgbsonWriterAppendInt32(&writer, "$numPaths", 9, indexColumn);
 
@@ -458,33 +518,41 @@ bson_unique_shard_path_equal(PG_FUNCTION_ARGS)
 	pgbson *right = PG_GETARG_PGBSON_PACKED(1);
 
 
-	/* Build HTAB with every pair of { <path> : <term> } */
+	/* Build HTAB with every pair of { <path> : <term> } and collect the paths */
 	int64_t leftShardKey = 0;
-	bool hasLeftShardKey = false;
+	UniqueShardDocumentPaths leftPaths = { 0 };
 	HTAB *leftHashTable = GetUniqueShardDocumentTermsHTABNew(left, &leftShardKey,
-															 &hasLeftShardKey);
+															 &leftPaths);
 
 	/*
 	 * Iterate through pgbson on the right to check if every path (key) has
-	 * a term match on the left.
+	 * a term match on the left, then reconcile paths present on only one side.
 	 */
 	int64_t rightShardKey = 0;
-	bool hasRightShardKey = false;
+	UniqueShardDocumentPaths rightPaths = { 0 };
 	bool uniquenessConflict = ProcessUniqueShardDocumentKeysNew(right, &rightShardKey,
-																&hasRightShardKey,
-																leftHashTable, HASH_FIND);
+																leftHashTable, HASH_FIND,
+																&rightPaths) &&
+							  (!EnableUniqueNullMissingEquivalence ||
+							   AreUniqueShardDocumentPathsConflicting(&leftPaths,
+																	  &rightPaths));
 
 	hash_destroy(leftHashTable);
 	PG_FREE_IF_COPY(left, 0);
 	PG_FREE_IF_COPY(right, 1);
 
-	if (!hasLeftShardKey || !hasRightShardKey)
-	{
-		ereport(ERROR, (errmsg("Required field $shard_key_value is missing")));
-	}
-
 	if (leftShardKey != rightShardKey)
 	{
+		if (uniquenessConflict)
+		{
+			/*
+			 * The terms matched, so this would have been a uniqueness conflict,
+			 * but the documents live on different shard key values, so it is
+			 * suppressed. Track how often this happens.
+			 */
+			ReportFeatureUsage(FEATURE_UNIQUE_SHARD_KEY_MISMATCH_SUPPRESSED_CONFLICT);
+		}
+
 		uniquenessConflict = false;
 	}
 
@@ -748,80 +816,117 @@ GenerateCompositeHashTerms(bson_iter_t *specIter, uint32_t numTerms,
 }
 
 
+static bool
+TryGetOptionalCollectionId(const BsonShardPathExclusionOptions *options,
+						   int64_t *collectionId)
+{
+	const char *pathDefinition = GET_STRING_RELOPTION(options, optionalCollectionId);
+	if (pathDefinition == NULL)
+	{
+		*collectionId = 0;
+		return false;
+	}
+	else
+	{
+		memcpy(collectionId, pathDefinition, sizeof(uint64_t));
+		return true;
+	}
+}
+
+
+static void
+ParseUniqueShardMetadata(bson_iter_t *specIter, UniqueShardDocumentMetadata *metadata)
+{
+	int numRequiredFlags = 0;
+	while (bson_iter_next(specIter))
+	{
+		const char *key = bson_iter_key(specIter);
+		if (strcmp(key, "$shard_key_value") == 0)
+		{
+			numRequiredFlags++;
+			metadata->shardKeyValue = bson_iter_int64(specIter);
+		}
+		else if (strcmp(key, "$numTerms") == 0)
+		{
+			numRequiredFlags++;
+			metadata->numTerms = bson_iter_int32(specIter);
+		}
+		else if (strcmp(key, "$numPaths") == 0)
+		{
+			/* This is the last known metadata path */
+			numRequiredFlags++;
+			metadata->numPaths = bson_iter_int32(specIter);
+			break;
+		}
+		else if (strcmp(key, "$collation") == 0)
+		{
+			metadata->collation = bson_iter_utf8(specIter, NULL);
+		}
+	}
+
+	if (numRequiredFlags < 3)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("Missing required fields for unique shard key path"),
+						errdetail_log(
+							"Required fields: $shard_key_value=%ld, $numTerms=%d, $numPaths=%d",
+							metadata->shardKeyValue, metadata->numTerms,
+							metadata->numPaths)));
+	}
+}
+
+
 static Datum *
 ExtractUniqueShardTermsFromInput(pgbson *input, int32_t *nentries, Pointer **extraData,
-								 BsonShardPathExclusionOptions *options)
+								 BsonShardPathExclusionOptions *options,
+								 int32 *searchMode)
 {
 	bson_iter_t specIter;
-	int64_t shardKeyValue = 0;
-	int32_t numTerms = 0;
-	int32_t numPaths = 0;
+	UniqueShardDocumentMetadata metadata = { 0 };
 	PgbsonInitIterator(input, &specIter);
+	ParseUniqueShardMetadata(&specIter, &metadata);
 
-	/* First field is the shard key value */
-	if (!bson_iter_next(&specIter))
+	int64_t optionalCollectionId = 0;
+	if (TryGetOptionalCollectionId(options, &optionalCollectionId) &&
+		(uint64_t) optionalCollectionId == metadata.shardKeyValue)
 	{
-		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-						errmsg(
-							"$shard_key_value is a required field for unique shard key path")));
-	}
+		/*
+		 * A sparse unique document with no terms is missing every indexed path and
+		 * must never conflict, so it generates no entries and matches nothing. This
+		 * has to precede the optional key short circuit below: matching everything
+		 * there would defer the conflict decision to the path column, which still
+		 * generates terms for the missing paths.
+		 * Unsharded collection and we're matching the collection id, skip generating hash
+		 * terms.
+		 */
+		if (searchMode && metadata.numTerms > 0)
+		{
+			*searchMode = RUM_SEARCH_MODE_DEFAULT_TRUE;
+		}
 
-	if (strcmp(bson_iter_key(&specIter), "$shard_key_value") == 0)
-	{
-		shardKeyValue = bson_iter_int64(&specIter);
-	}
-	else
-	{
-		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-						errmsg(
-							"$shard_key_value must be the first field in the document")));
-	}
-
-	/* next field is numTerms */
-	if (!bson_iter_next(&specIter))
-	{
-		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-						errmsg(
-							"$numTerms is a required field for unique shard key path")));
+		*nentries = 0;
+		return NULL;
 	}
 
-	if (strcmp(bson_iter_key(&specIter), "$numTerms") == 0)
+	if (metadata.collation != NULL)
 	{
-		numTerms = bson_iter_int32(&specIter);
-	}
-	else
-	{
+		/* We do not support collation for unique indexes for sharded collections.
+		 * TODO: Add support for this.
+		 */
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-						errmsg(
-							"$numTerms should always appear as the second field within the document.")));
-	}
-
-	/* next field is numTerms */
-	if (!bson_iter_next(&specIter))
-	{
-		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-						errmsg(
-							"$numPaths is a required field for unique shard key path")));
-	}
-
-	if (strcmp(bson_iter_key(&specIter), "$numPaths") == 0)
-	{
-		numPaths = bson_iter_int32(&specIter);
-	}
-	else
-	{
-		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
-						errmsg("$numPaths must be the third field in the document")));
+						errmsg("Collation is not supported for unique shard key path")));
 	}
 
 	if (options->enableCompositeHashGeneration)
 	{
-		return GenerateCompositeHashTerms(&specIter, numTerms, numPaths, shardKeyValue,
+		return GenerateCompositeHashTerms(&specIter, metadata.numTerms, metadata.numPaths,
+										  metadata.shardKeyValue,
 										  nentries, extraData);
 	}
 	else
 	{
-		return GenerateNonCompositeHashTerms(&specIter, numTerms, numPaths, shardKeyValue,
+		return GenerateNonCompositeHashTerms(&specIter, metadata.numTerms,
+											 metadata.numPaths, metadata.shardKeyValue,
 											 nentries, extraData);
 	}
 }
@@ -842,8 +947,9 @@ gin_bson_unique_shard_extract_value(PG_FUNCTION_ARGS)
 		optionsPtr = (BsonShardPathExclusionOptions *) PG_GET_OPCLASS_OPTIONS();
 	}
 
+	int32 searchMode = RUM_SEARCH_MODE_DEFAULT_TRUE;
 	Datum *indexEntries = ExtractUniqueShardTermsFromInput(input, nentries, extraData,
-														   optionsPtr);
+														   optionsPtr, &searchMode);
 	PG_FREE_IF_COPY(input, 0);
 	PG_RETURN_POINTER(indexEntries);
 }
@@ -856,6 +962,7 @@ gin_bson_unique_shard_extract_query(PG_FUNCTION_ARGS)
 	int32 *nentries = (int32 *) PG_GETARG_POINTER(1);
 	StrategyNumber strategy = PG_GETARG_UINT16(2);
 	Pointer **extraData = (Pointer **) PG_GETARG_POINTER(4);
+	int32 *searchMode = (int32 *) (PG_NARGS() > 6 ? PG_GETARG_POINTER(6) : NULL);
 
 	if (strategy != 1)
 	{
@@ -870,7 +977,7 @@ gin_bson_unique_shard_extract_query(PG_FUNCTION_ARGS)
 	}
 
 	Datum *indexEntries = ExtractUniqueShardTermsFromInput(input, nentries, extraData,
-														   optionsPtr);
+														   optionsPtr, searchMode);
 
 	PG_FREE_IF_COPY(input, 0);
 	PG_RETURN_POINTER(indexEntries);
@@ -1045,27 +1152,24 @@ GenerateTermsForExclusion(pgbson *document,
 /*
  * Utility function that iterates on all keys of a unique shard document and takes action
  * against a terms hash set. In case of a HASH_FIND action, this function also returns a
- * boolean indicating an uniqueness conflict.
+ * boolean indicating an uniqueness conflict. It also records each path and whether it
+ * holds a null term so that paths present on only one side can be reconciled after.
  */
 static bool
 ProcessUniqueShardDocumentKeysNew(pgbson *uniqueShardDocument,
-								  int64_t *shardKeyComparison, bool *hasShardKey,
-								  HTAB *termsHashSet, HASHACTION hashAction)
+								  int64_t *shardKeyComparison,
+								  HTAB *termsHashSet, HASHACTION hashAction,
+								  UniqueShardDocumentPaths *documentPaths)
 {
 	bson_iter_t specIter;
+	UniqueShardDocumentMetadata metadata = { 0 };
 	PgbsonInitIterator(uniqueShardDocument, &specIter);
+	ParseUniqueShardMetadata(&specIter, &metadata);
 
+	*shardKeyComparison = metadata.shardKeyValue;
+	documentPaths->numPaths = 0;
 	while (bson_iter_next(&specIter))
 	{
-		const char *key = bson_iter_key(&specIter);
-		if (strcmp(key, "$shard_key_value") == 0)
-		{
-			int64_t shardKeyValue = BsonValueAsInt64(bson_iter_value(&specIter));
-			*shardKeyComparison = shardKeyValue;
-			*hasShardKey = true;
-			continue;
-		}
-
 		/*
 		 * This skips the loop until we reach the keys that contain arrays. These are the ones
 		 * that store the terms we need to process.
@@ -1075,44 +1179,59 @@ ProcessUniqueShardDocumentKeysNew(pgbson *uniqueShardDocument,
 			continue;
 		}
 
-		uint32_t keyPathLength = strlen(key);
+		if (documentPaths->numPaths >= INDEX_MAX_KEYS)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("Unique shard document has more paths than "
+								   "supported")));
+		}
+
+		UniqueShardDocumentPath *documentPath =
+			&documentPaths->paths[documentPaths->numPaths++];
+		documentPath->path = bson_iter_key_string_view(&specIter);
+		documentPath->hasNullTerm = false;
+		documentPath->hasTermMatch = false;
+
 		bson_iter_t arrayIter;
 		bson_iter_recurse(&specIter, &arrayIter);
-
-		bool keyTermMatch = false;
 		while (bson_iter_next(&arrayIter))
 		{
 			UniqueIndexTermHashEntry searchEntry = { 0 };
-			searchEntry.element.path = key;
-			searchEntry.element.pathLength = keyPathLength;
+			searchEntry.element.path = documentPath->path.string;
+			searchEntry.element.pathLength = documentPath->path.length;
 			searchEntry.element.bsonValue = *bson_iter_value(&arrayIter);
+			searchEntry.collationString = metadata.collation;
+
+			if (searchEntry.element.bsonValue.value_type == BSON_TYPE_NULL ||
+				searchEntry.element.bsonValue.value_type == BSON_TYPE_UNDEFINED)
+			{
+				documentPath->hasNullTerm = true;
+			}
 
 			/* Query hash table with given action. */
 			bool found;
 			hash_search(termsHashSet, &searchEntry, hashAction, &found);
 
-			if (found)
+			if (found && hashAction == HASH_FIND)
 			{
 				/* keyTerm pair on the document was found on the hash table. */
-				keyTermMatch = true;
+				documentPath->hasTermMatch = true;
 				break;
 			}
 		}
 
-		if (!keyTermMatch && hashAction == HASH_FIND)
+		if (hashAction == HASH_FIND && !documentPath->hasTermMatch &&
+			!(EnableUniqueNullMissingEquivalence && documentPath->hasNullTerm))
 		{
 			/*
-			 * No term for this key was found on the hash table, meaning the unique shard
-			 * documents don't have a uniqueness conflict. We return early if action is HASH_FIND.
+			 * No term for this key was found on the hash table and the path cannot
+			 * match a missing path on the left either, meaning the unique shard
+			 * documents don't have a uniqueness conflict.
 			 */
 			return false;
 		}
 	}
 
-	/*
-	 * Each path (key) on the document has a term match on the hash table, meaning
-	 * there's a uniqueness conflict.
-	 */
 	return true;
 }
 
@@ -1185,17 +1304,153 @@ CreateUniqueIndexTermHashSet(void)
 
 /*
  * Utility function that receives a unique shard document (i.e. document returned from the generate_unique_shard_document function),
- * inserts all terms in a hash table and returns it to the caller.
+ * inserts all terms in a hash table and returns it to the caller along with its paths.
  */
 static HTAB *
 GetUniqueShardDocumentTermsHTABNew(pgbson *uniqueShardDocument, int64_t *shardKeyValue,
-								   bool *hasShardKeyValue)
+								   UniqueShardDocumentPaths *documentPaths)
 {
 	HTAB *termsHashSet = CreateUniqueIndexTermHashSet();
 	ProcessUniqueShardDocumentKeysNew(uniqueShardDocument, shardKeyValue,
-									  hasShardKeyValue,
-									  termsHashSet, HASH_ENTER);
+									  termsHashSet, HASH_ENTER, documentPaths);
 	return termsHashSet;
+}
+
+
+static int
+CompareUniqueShardDocumentPath(const void *left, const void *right)
+{
+	const UniqueShardDocumentPath *leftPath = (const UniqueShardDocumentPath *) left;
+	const UniqueShardDocumentPath *rightPath = (const UniqueShardDocumentPath *) right;
+	return CompareStringView(&leftPath->path, &rightPath->path);
+}
+
+
+/*
+ * Given the paths of the left and right unique shard documents, where every path
+ * on the right has already been probed against the terms on the left, checks
+ * whether the documents conflict.
+ *
+ * A sparse unique shard document omits the paths missing from the source
+ * document. A missing path is the same key as a literal null, so a path present
+ * on only one side matches only when that side holds a null term for it, which
+ * keeps the check symmetric regardless of which document was inserted first. A
+ * document missing every path is not indexed and never conflicts. Non sparse
+ * documents always carry every path, so this reduces to a term match per path.
+ */
+static bool
+AreUniqueShardDocumentPathsConflicting(UniqueShardDocumentPaths *leftPaths,
+									   UniqueShardDocumentPaths *rightPaths)
+{
+	if (leftPaths->numPaths == 0 || rightPaths->numPaths == 0)
+	{
+		return false;
+	}
+
+	qsort(leftPaths->paths, leftPaths->numPaths, sizeof(UniqueShardDocumentPath),
+		  CompareUniqueShardDocumentPath);
+	qsort(rightPaths->paths, rightPaths->numPaths, sizeof(UniqueShardDocumentPath),
+		  CompareUniqueShardDocumentPath);
+
+	int32_t leftIndex = 0;
+	int32_t rightIndex = 0;
+	while (leftIndex < leftPaths->numPaths || rightIndex < rightPaths->numPaths)
+	{
+		int comparison;
+		if (leftIndex >= leftPaths->numPaths)
+		{
+			comparison = 1;
+		}
+		else if (rightIndex >= rightPaths->numPaths)
+		{
+			comparison = -1;
+		}
+		else
+		{
+			comparison = CompareUniqueShardDocumentPath(&leftPaths->paths[leftIndex],
+														&rightPaths->paths[rightIndex]);
+		}
+
+		if (comparison == 0)
+		{
+			/* Path on both sides: a right term must have matched a left term */
+			if (!rightPaths->paths[rightIndex].hasTermMatch)
+			{
+				return false;
+			}
+
+			leftIndex++;
+			rightIndex++;
+		}
+		else if (comparison < 0)
+		{
+			/* Path missing on the right: it matches only a null term on the left */
+			if (!leftPaths->paths[leftIndex].hasNullTerm)
+			{
+				return false;
+			}
+
+			leftIndex++;
+		}
+		else
+		{
+			/* Path missing on the left: it matches only a null term on the right */
+			if (!rightPaths->paths[rightIndex].hasNullTerm)
+			{
+				return false;
+			}
+
+			rightIndex++;
+		}
+	}
+
+	return true;
+}
+
+
+Datum
+gin_bson_unique_shard_rum_config(PG_FUNCTION_ARGS)
+{
+	RumConfig *config = (RumConfig *) PG_GETARG_POINTER(0);
+	config->skipGenerateEmptyEntries = true;
+	PG_RETURN_VOID();
+}
+
+
+static void
+ValidateOptionalCollectionId(const char *prefix)
+{
+	if (prefix == NULL)
+	{
+		/* validate can be called with the default value NULL. */
+		return;
+	}
+
+	int64_t collectionId = pg_strtoint64(prefix);
+	if (collectionId < 1)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE), errmsg(
+							"Optional collection id must be a valid positive int64")));
+	}
+}
+
+
+static Size
+FillOptionalCollectionId(const char *prefix, void *buffer)
+{
+	if (prefix == NULL)
+	{
+		return 0;
+	}
+
+	int64_t collectionId = pg_strtoint64(prefix);
+	if (buffer != NULL)
+	{
+		char *collectionIdBuffer = (char *) &collectionId;
+		memcpy(buffer, collectionIdBuffer, sizeof(collectionId));
+	}
+
+	return sizeof(collectionId) + 1;
 }
 
 
@@ -1226,6 +1481,17 @@ bson_unique_shard_path_options(PG_FUNCTION_ARGS)
 							 false,
 							 offsetof(BsonShardPathExclusionOptions,
 									  enableCompositeHashGeneration));
+
+	/* This needs to be a string option since collection_id is an uint64 and
+	 * and reloption can only be an int32. we can't use double since it may lose precision for uint64 values.
+	 */
+	add_local_string_reloption(relopts, "optsk",
+							   "The optional collection id for the unique shard path",
+							   NULL,
+							   ValidateOptionalCollectionId,
+							   FillOptionalCollectionId,
+							   offsetof(BsonShardPathExclusionOptions,
+										optionalCollectionId));
 
 	PG_RETURN_VOID();
 }

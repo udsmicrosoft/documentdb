@@ -33,6 +33,7 @@
 #include "background_worker/background_worker_private.h"
 #include "utils/error_utils.h"
 #include "utils/roaring_bitmap_utils.h"
+#include "query/bson_dollar_selectivity.h"
 
 /* --------------------------------------------------------- */
 /* Data Types & Enum values */
@@ -132,6 +133,9 @@ InstallDocumentDBApiPostgresHooks(void)
 
 	/* Register Roaring bitmap memory alloc hooks */
 	RegisterDocumentDBRoaringBitmapUtilHooks();
+
+	/* Register hooks that control how bson statistics are collected */
+	RegisterBsonStatisticsHooks();
 
 	SetupCursorStorage();
 }

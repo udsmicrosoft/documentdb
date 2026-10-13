@@ -271,6 +271,7 @@ run_invalid_data_test() {
         --name $CONTAINER_NAME \
         -p $DOCUMENTDB_PORT:$DOCUMENTDB_PORT \
         -e PASSWORD=$PASSWORD \
+        -e DOCUMENTDB_USAGE_TELEMETRY=false \
         -v "$temp_dir:/init_doc_db.d" \
         $IMAGE_NAME \
         --password $PASSWORD \

@@ -17,6 +17,12 @@ CREATE OR REPLACE FUNCTION __API_SCHEMA_INTERNAL_V2__.cursor_state(__CORE_SCHEMA
  IMMUTABLE STRICT
 AS 'MODULE_PATHNAME', $function$command_cursor_state$function$;
 
+CREATE OR REPLACE FUNCTION __API_SCHEMA_INTERNAL_V2__.cursor_tracker_support(internal)
+ RETURNS internal
+ LANGUAGE c
+ IMMUTABLE STRICT PARALLEL SAFE
+AS 'MODULE_PATHNAME', $function$command_cursor_tracker_support$function$;
+
 -- PARALLEL SAFE so the continuation qual it injects onto the base scan does
 -- not disable parallel query plans. It performs a deterministic, side-effect
 -- free comparison against a constant cursor-state argument.
@@ -24,6 +30,7 @@ CREATE OR REPLACE FUNCTION __API_SCHEMA_INTERNAL_V2__.cursor_tracker(__CORE_SCHE
  RETURNS bool
  LANGUAGE c
  IMMUTABLE STRICT PARALLEL SAFE
+ SUPPORT __API_SCHEMA_INTERNAL_V2__.cursor_tracker_support
 AS 'MODULE_PATHNAME', $function$command_cursor_tracker$function$;
 
 -- Worker-side UDF for remote dynamic cursor pushdown.
@@ -79,5 +86,6 @@ CREATE OR REPLACE FUNCTION documentdb_api_internal_readonly.cursor_tracker(__COR
  RETURNS bool
  LANGUAGE c
  IMMUTABLE STRICT PARALLEL SAFE
+ SUPPORT __API_SCHEMA_INTERNAL_V2__.cursor_tracker_support
 AS 'MODULE_PATHNAME', $function$command_cursor_tracker$function$;
 #endif

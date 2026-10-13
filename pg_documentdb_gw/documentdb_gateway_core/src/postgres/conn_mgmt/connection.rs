@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_core/src/postgres/conn_mgmt/connection.rs
  *
@@ -18,8 +19,6 @@ use tokio_postgres::{
 };
 
 use crate::postgres::{conn_mgmt::PoolConnection, PgDocument};
-#[cfg(feature = "postgres-sql-commenter")]
-use crate::telemetry::sql_commenter;
 
 /// Failure executing a SQL statement against the backend: either the backend
 /// rejected the statement or the connection's deadline expired first.
@@ -226,27 +225,6 @@ impl Connection {
         parameter_types: &[Type],
         params: &[&(dyn ToSql + Sync)],
     ) -> std::result::Result<Vec<Row>, StatementError> {
-        #[cfg(feature = "postgres-sql-commenter")]
-        if parameter_types.len() == params.len() {
-            if let Some(comment) = sql_commenter::current_comment() {
-                // A per-request comment changes the statement text, so execute it
-                // as an ephemeral unnamed statement rather than caching it. This
-                // keeps the prepared-statement cache free of high-cardinality,
-                // single-use entries while still binding parameters by type.
-                let commented = format!("{query} {comment}");
-                let typed_params: Vec<(&(dyn ToSql + Sync), Type)> = params
-                    .iter()
-                    .copied()
-                    .zip(parameter_types.iter().cloned())
-                    .collect();
-                return self
-                    .client()
-                    .query_typed(&commented, &typed_params)
-                    .await
-                    .map_err(StatementError::Postgres);
-            }
-        }
-
         let statement = self
             .client()
             .prepare_typed_cached(query, parameter_types)

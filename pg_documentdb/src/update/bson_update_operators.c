@@ -20,12 +20,7 @@
 #include "io/bson_traversal.h"
 #include "utils/hashset_utils.h"
 #include "utils/sort_utils.h"
-
-/* --------------------------------------------------------- */
-/* Forward declaration */
-/* --------------------------------------------------------- */
-
-extern bool EnableStrictAddToSetModifierValidation;
+#include "collation/collation.h"
 
 typedef enum
 {
@@ -110,7 +105,8 @@ static void ValidateAddToSetWithDollarEach(const bson_value_t *updateValue,
 static void AddToSetWriteFinalArray(UpdateOperatorWriter *writer,
 									const bson_value_t *existingValue,
 									const bson_value_t *elementsToAdd,
-									const bool isEach);
+									const bool isEach,
+									const char *collationString);
 static void ValidateUpdateSpecAndSetPushUpdateState(const bson_value_t *fieldUpdateValue,
 													DollarPushUpdateState *pushState);
 static void ApplyDollarPushModifiers(const bson_value_t *bsonArray,
@@ -281,8 +277,9 @@ HandleUpdateDollarMin(const bson_value_t *existingValue,
 		/* value is unset - set it to the value. */
 		UpdateWriterWriteModifiedValue(writer, updateValue);
 	}
-	else if (CompareBsonValueAndType(updateValue, existingValue,
-									 &isComparisonValid) < 0 &&
+	else if (CompareBsonValueAndTypeWithCollation(updateValue, existingValue,
+												  &isComparisonValid,
+												  state->collationString) < 0 &&
 			 isComparisonValid)
 	{
 		/* update value is less than current field value, update it. */
@@ -310,8 +307,9 @@ HandleUpdateDollarMax(const bson_value_t *existingValue,
 		/* value is unset - set it to the value. */
 		UpdateWriterWriteModifiedValue(writer, updateValue);
 	}
-	else if (CompareBsonValueAndType(updateValue, existingValue,
-									 &isComparisonValid) > 0 &&
+	else if (CompareBsonValueAndTypeWithCollation(updateValue, existingValue,
+												  &isComparisonValid,
+												  state->collationString) > 0 &&
 			 isComparisonValid)
 	{
 		/* update value is greater than current field value, update it. */
@@ -801,7 +799,8 @@ HandleUpdateDollarAddToSet(const bson_value_t *existingValue,
 	AddToSetWriteFinalArray(writer,
 							existingValue,
 							isEach ? &elementsToAdd : updateValue,
-							isEach);
+							isEach,
+							state->collationString);
 }
 
 
@@ -861,8 +860,9 @@ HandleUpdateDollarPullAll(const bson_value_t *existingValue,
 
 		while (bson_iter_next(&pullAllIterCopy))
 		{
-			if (BsonValueEquals(bson_iter_value(&currentArrayIter),
-								bson_iter_value(&pullAllIterCopy)))
+			if (BsonValueEqualsWithCollation(bson_iter_value(&currentArrayIter),
+											 bson_iter_value(&pullAllIterCopy),
+											 state->collationString))
 			{
 				found = true;
 				break;
@@ -901,6 +901,10 @@ HandleUpdateDollarPush(const bson_value_t *existingValue,
 	DollarPushUpdateState pushState;
 	memset(&pushState, 0, sizeof(pushState));
 	ValidateUpdateSpecAndSetPushUpdateState(updateValue, &pushState);
+	if (pushState.sortContext != NULL)
+	{
+		pushState.sortContext->collationString = state->collationString;
+	}
 
 	bson_value_t currentValue = *existingValue;
 	if (currentValue.value_type == BSON_TYPE_EOD)
@@ -1287,7 +1291,7 @@ ValidateAddToSetWithDollarEach(const bson_value_t *updateValue,
 		}
 	}
 
-	if (EnableStrictAddToSetModifierValidation && *isEach && unexpectedKey != NULL)
+	if (*isEach && unexpectedKey != NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
 						errmsg(
@@ -1306,12 +1310,15 @@ static void
 AddToSetWriteFinalArray(UpdateOperatorWriter *writer,
 						const bson_value_t *existingValue,
 						const bson_value_t *elementsToAdd,
-						const bool isEach)
+						const bool isEach,
+						const char *collationString)
 {
 	bson_iter_t currentArrayIter;
 
 	UpdateArrayWriter *arrayWriter = UpdateWriterGetArrayWriter(writer);
-	HTAB *existingElementsHash = CreateBsonValueHashSet();
+	HTAB *existingElementsHash = IsCollationApplicable(collationString) ?
+								 CreateBsonValueWithCollationHashSet(0) :
+								 CreateBsonValueHashSet();
 
 	if (existingValue->value_type != BSON_TYPE_EOD)
 	{
@@ -1325,7 +1332,7 @@ AddToSetWriteFinalArray(UpdateOperatorWriter *writer,
 
 			BsonValueHashEntry hashEntry = {
 				.bsonValue = *value,
-				.collationString = NULL
+				.collationString = collationString
 			};
 
 			hash_search(existingElementsHash, &hashEntry, HASH_ENTER,
@@ -1348,7 +1355,7 @@ AddToSetWriteFinalArray(UpdateOperatorWriter *writer,
 			const bson_value_t *newValue = bson_iter_value(&newElementsIter);
 			BsonValueHashEntry searchEntry = {
 				.bsonValue = *newValue,
-				.collationString = NULL
+				.collationString = collationString
 			};
 
 			bool found = false;
@@ -1364,7 +1371,7 @@ AddToSetWriteFinalArray(UpdateOperatorWriter *writer,
 	{
 		BsonValueHashEntry searchEntry = {
 			.bsonValue = *elementsToAdd,
-			.collationString = NULL
+			.collationString = collationString
 		};
 
 		bool found = false;

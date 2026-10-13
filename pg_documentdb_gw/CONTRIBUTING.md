@@ -36,3 +36,13 @@ Or via the standard OpenTelemetry environment variables (`OTEL_EXPORTER_OTLP_END
 Tracing emits a `gateway.request` root span per request with `db.system.name`, `db.operation.name`, `db.collection.name`, `db.namespace`, `connection.id`, `network.protocol`, and `network.transport.tls` attributes, plus nested spans (`gateway.read_request`, `gateway.format_request`, `gateway.auth`, `gateway.process_request`, `postgres.transaction`, `postgres.acquire_connection`, `postgres.execute`, `gateway.write_response`) that mirror the metric phase breakdown.
 
 Sampling defaults to `ParentBased(TraceIdRatioBased(1.0))` — once tracing is enabled, every root span is sampled. Lower `SamplerRatio` to ratio-sample in production. The `OTEL_TRACES_SAMPLER` env var is intentionally ignored; only the ratio is configurable in v1.
+
+#### SQLCommenter migration
+
+The gateway no longer appends trace comments to PostgreSQL statements.
+Parameterized query calls use the cached prepared-statement path regardless
+of tracing. Gateway spans and incoming parent-context extraction are unchanged.
+
+Remove the `postgres-sql-commenter` feature from custom build commands.
+The retired `TelemetryOptions.Tracing.SqlCommenterEnabled` and
+`DOCUMENTDB_SQL_COMMENTER_ENABLED` settings are ignored.

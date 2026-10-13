@@ -25,5 +25,6 @@ typedef struct
 	((pgbsonsequence *) PG_DETOAST_DATUM(PG_GETARG_DATUM(n)))
 
 List * PgbsonSequenceGetDocumentBsonValues(const pgbsonsequence *bsonSequence);
+bool PgbsonSequenceHasSingleDocument(const pgbsonsequence *bsonSequence);
 
 #endif

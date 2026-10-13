@@ -44,15 +44,12 @@
  #include "opclass/bson_gin_composite_scan.h"
  #include "opclass/bson_gin_composite_private.h"
  #include "opclass/bson_gin_composite.h"
+ #include "index_am/documentdb_rum_opclass.h"
 
 #define BSON_TREE_PRIVATE
 #include "aggregation/bson_tree_private.h"
 #undef BSON_TREE_PRIVATE
 #include "aggregation/bson_tree.h"
-
-/* CodeSync: pg_documentdb_rum.h */
-#define RUM_SEARCH_MODE_ORDERED 4
-#define RUM_SEARCH_MODE_ORDERED_REVERSE 5
 
 /*
  * Ordered-any requests require ordered execution but leave the direction for
@@ -146,24 +143,6 @@ typedef struct IndexProjectionCache
 	 * against the term count in the per-row index term. */
 	int numPaths;
 } IndexProjectionCache;
-
-
-#define MAX_STRATEGIES (8)
-PGDLLIMPORT typedef struct RumConfig
-{
-	Oid addInfoTypeOid;
-
-	struct
-	{
-		StrategyNumber strategy;
-		ScanDirection direction;
-	}       strategyInfo[MAX_STRATEGIES];
-
-	bool skipGenerateEmptyEntries;
-	bool compareFunctionHasRecheck;
-	bool enableOpClassMetadataStorage;
-	bool enableHighKeyOptimization;
-}   RumConfig;
 
 /*
  * Metadata blob reservation for the composite index.
@@ -5910,6 +5889,7 @@ GenerateCompositedUniqueEqualQueryValues(Datum *indexEntries, bool *partialMatch
 		int termIndex = i;
 		bool hasTruncationInEntry = false;
 		bool hasNullsInEntry = false;
+		bool hasMaybeUndefinedInEntry = false;
 		CompositeQueryRunData *runDataForEntry = runData;
 		partialMatch[i] = false;
 		for (uint32_t j = 0; j < pathCount; j++)
@@ -5986,10 +5966,20 @@ GenerateCompositedUniqueEqualQueryValues(Datum *indexEntries, bool *partialMatch
 				runDataForEntry->indexBounds[j].upperBound.isBoundInclusive = true;
 				runDataForEntry->indexBounds[j].lowerBound.isBoundInclusive = true;
 				runDataForEntry->indexBounds[j].isEqualityBound = true;
+
+				/*
+				 * A path missing from some elements under an array ancestor is
+				 * not necessarily a key (e.g. sparse indexes skip it), so an
+				 * equal term here must be rechecked against the unique key.
+				 */
+				if (IsIndexTermMaybeUndefined(&indexTerm))
+				{
+					hasMaybeUndefinedInEntry = true;
+				}
 			}
 		}
 
-		if (hasTruncationInEntry || hasNullsInEntry)
+		if (hasTruncationInEntry || hasNullsInEntry || hasMaybeUndefinedInEntry)
 		{
 			/* TODO: We can do better here and only do runtime recheck if that term matches */
 			runDataForEntry->metaInfo->requiresRuntimeRecheck = true;

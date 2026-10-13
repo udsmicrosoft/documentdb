@@ -312,10 +312,12 @@ documentdb_extension_create_user(PG_FUNCTION_ARGS)
 		"JOIN pg_auth_members am ON parent.oid = am.roleid "
 		"JOIN pg_roles child ON am.member = child.oid "
 		"WHERE child.rolcanlogin = true "
-		"  AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s');",
+		"  AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s');",
 		ApiAdminRole, ApiAdminRoleV2, ApiAdminRoleV3,
 		ApiBgWorkerRole, ApiBgWorkerRoleV3,
-		ApiReplicationRole, ApiSettingsManagerRole);
+		ApiReplicationRole, ApiSettingsManagerRole,
+		API_RBAC_API_COLLECTION_OWNER_ROLE,
+		API_RBAC_API_COLLECTION_CREATE_ROLE);
 
 	bool readOnly = true;
 	bool isNull = false;
@@ -1433,9 +1435,10 @@ ParseConnectionStatusSpec(pgbson *connectionStatusSpec)
 
 
 /*
- * This method is mostly copied from pg_be_scram_build_secret in PG. The only substantial change
- * is that we use a default salt length of 28 as opposed to 16 used by PG. This is to ensure
- * compatiblity with drivers that expect a salt length of 28.
+ * This method is mostly copied from pg_be_scram_build_secret in PG. However,
+ * unlike pg_be_scram_build_secret, reject passwords that fail SASLprep so
+ * wire-protocol clients can use the resulting credentials. The default salt
+ * length is 28 rather than 16 for driver compatibility.
  */
 static char *
 PrehashPassword(const char *password)
@@ -1455,15 +1458,31 @@ PrehashPassword(const char *password)
 						errmsg("Salt length value is invalid.")));
 	}
 
-	/*
-	 * Normalize the password with SASLprep.  If that doesn't work, because
-	 * the password isn't valid UTF-8 or contains prohibited characters, just
-	 * proceed with the original password.  (See comments at top of file.)
-	 */
 	rc = pg_saslprep(password, &prep_password);
-	if (rc == SASLPREP_SUCCESS)
+	switch (rc)
 	{
-		password = (const char *) prep_password;
+		case SASLPREP_SUCCESS:
+		{
+			password = (const char *) prep_password;
+			break;
+		}
+
+		case SASLPREP_INVALID_UTF8:
+		case SASLPREP_PROHIBITED:
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+							errmsg(
+								"Password contains prohibited characters. Use a different password.")));
+			break;
+		}
+
+		case SASLPREP_OOM:
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"An unexpected internal error has occurred, please try again.")));
+			break;
+		}
 	}
 
 	/* Generate random salt */
@@ -1854,13 +1873,14 @@ GetAllUsersInfo(void)
 		"  JOIN pg_roles child ON am.member = child.oid "
 		"  WHERE child.rolcanlogin = true "
 		MEMBERSHIP_CONFERS_ROLE_CLAUSE
-		"    AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s') "
+		"    AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s') "
 		") "
 		"SELECT ARRAY_AGG(%s.row_get_bson(r) ORDER BY r.child_role, r.parent_role) "
 		"FROM r;",
 		ApiRootInternalRole, ApiRootRole,
 		ApiAdminRole, ApiAdminRoleV2, ApiBgWorkerRole, ApiReplicationRole,
-		ApiSettingsManagerRole,
+		ApiSettingsManagerRole, API_RBAC_API_COLLECTION_OWNER_ROLE,
+		API_RBAC_API_COLLECTION_CREATE_ROLE,
 		CoreSchemaName);
 
 	bool readOnly = true;
@@ -1900,13 +1920,14 @@ GetSingleUserInfo(const char *userName, bool returnDocuments)
 			"  WHERE child.rolcanlogin = true "
 			MEMBERSHIP_CONFERS_ROLE_CLAUSE
 			"    AND child.rolname = $1"
-			"    AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s') "
+			"    AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s') "
 			") "
 			"SELECT ARRAY_AGG(%s.row_get_bson(r) ORDER BY r.parent_role) "
 			"FROM r;",
 			ApiRootInternalRole, ApiRootRole,
 			ApiAdminRole, ApiAdminRoleV2, ApiBgWorkerRole, ApiReplicationRole,
-			ApiSettingsManagerRole,
+			ApiSettingsManagerRole, API_RBAC_API_COLLECTION_OWNER_ROLE,
+			API_RBAC_API_COLLECTION_CREATE_ROLE,
 			CoreSchemaName);
 	}
 	else
@@ -1922,12 +1943,13 @@ GetSingleUserInfo(const char *userName, bool returnDocuments)
 			"WHERE child.rolcanlogin = true "
 			MEMBERSHIP_CONFERS_ROLE_CLAUSE
 			"  AND child.rolname = $1 "
-			"  AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s') "
+			"  AND child.rolname NOT IN ('%s', '%s', '%s', '%s', '%s', '%s', '%s') "
 			"ORDER BY parent.rolname "
 			"LIMIT 1;",
 			ApiRootInternalRole, ApiRootRole,
 			ApiAdminRole, ApiAdminRoleV2, ApiBgWorkerRole, ApiReplicationRole,
-			ApiSettingsManagerRole);
+			ApiSettingsManagerRole, API_RBAC_API_COLLECTION_OWNER_ROLE,
+			API_RBAC_API_COLLECTION_CREATE_ROLE);
 	}
 
 	int argCount = 1;

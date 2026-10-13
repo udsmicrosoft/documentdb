@@ -1,6 +1,42 @@
 SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog,documentdb_api_internal;
 SET documentdb.next_collection_id TO 27120000;
 SET documentdb.next_collection_index_id TO 27120000;
+SELECT bson_dollar_project('{"a": null}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found null
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found missing
+SELECT bson_dollar_project('{"a": {"$numberDecimal": "1"}}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found decimal
+SELECT bson_dollar_project('{"a": 1}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found int
+SELECT bson_dollar_project('{"a": {"$numberLong": "1"}}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found long
+SELECT bson_dollar_project('{"a": 1.5}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found double
+SELECT bson_dollar_project('{"a": true}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found bool
+SELECT bson_dollar_project('{"a": []}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found array
+SELECT bson_dollar_project('{"a": {}}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found object
+SELECT bson_dollar_project('{"a": {"$binary": {"base64": "YWJj", "subType": "00"}}}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found binData
+SELECT bson_dollar_project('{"a": {"$date": {"$numberLong": "0"}}}', '{"r": {"$meta": "$a"}}');
+ERROR:  $meta expected value of type text, found date
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "$$ROOT"}}');
+ERROR:  $meta expected value of type text, found object
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "$$REMOVE"}}');
+ERROR:  $meta expected value of type text, found missing
+SELECT bson_dollar_project('{"a": {"$numberDecimal": "1"}}', '{"r": {"$let": {"vars": {"kind": "$a"}, "in": {"$meta": "$$kind"}}}}');
+ERROR:  $meta expected value of type text, found decimal
+SELECT bson_dollar_project('{"a": "CONTROL_STRING"}', '{"r": {"$meta": "$a"}}');
+ERROR:  Argument provided to the $meta is not supported: CONTROL_STRING
+SELECT bson_dollar_project('{"a": "textScore"}', '{"r": {"$meta": "$a"}}');
+ERROR:  The query needs text score metadata, but this required information is currently unavailable.
+SELECT bson_dollar_project('{}', '{"r": {"$meta": "indexKey"}}');
+ERROR:  Returning indexKey for $meta not supported
+SELECT bson_dollar_project('{}', '{"r": {"$meta": 1}}');
+ERROR:  $meta expected value of type text, found int
 SELECT documentdb_api.create_collection('text_meta_state_db', 'docs');
 NOTICE:  creating collection
  create_collection 

@@ -33,14 +33,14 @@ pub async fn handle(
             return Ok(());
         }
 
-        let caller = connection_context.auth_state.principal()?;
+        let caller = connection_context.user().principal()?;
 
-        let lsid = request
-            .lsid()
-            .cloned()
-            .ok_or(DocumentDBError::internal_error(
-                "Session Id is missing. Transactions must be associated with a session.".to_owned(),
-            ))?;
+        let lsid = request.lsid().cloned().ok_or_else(|| {
+            DocumentDBError::documentdb_error(
+                ErrorCode::InvalidOptions,
+                "Transaction number requires a session ID to also be specified.".to_owned(),
+            )
+        })?;
 
         let store = connection_context.service_context.transaction_store();
         let transaction_result = store
@@ -93,7 +93,7 @@ pub async fn handle(
 pub async fn process_commit(context: &ConnectionContext, activity_id: &str) -> Result<Response> {
     if let Some((lsid, _)) = context.transaction.as_ref() {
         let store = context.service_context.transaction_store();
-        let caller = context.auth_state.principal()?;
+        let caller = context.user().principal()?;
         let is_replica_cluster = context.dynamic_configuration().is_replica_cluster();
 
         store
@@ -122,7 +122,7 @@ pub async fn process_abort(context: &ConnectionContext, activity_id: &str) -> Re
         ));
     };
 
-    let caller = context.auth_state.principal()?;
+    let caller = context.user().principal()?;
     let store = context.service_context.transaction_store();
     let is_replica_cluster = context.dynamic_configuration().is_replica_cluster();
 

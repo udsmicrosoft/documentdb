@@ -242,6 +242,19 @@ case "\$1" in
         if { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }; then
             systemctl stop "documentdb-local@${PG_VERSION}.target" 2>/dev/null || true
             systemctl disable "documentdb-local@${PG_VERSION}.target" 2>/dev/null || true
+        else
+            # No systemd: documentdb-setup started this major's gateway under
+            # nohup and PostgreSQL with pg_ctl. Stop both; like the systemd
+            # branch, warn rather than block the removal.
+            lib=/usr/share/documentdb/scripts/documentdb-tools-lib.sh
+            if [ -r "\${lib}" ]; then
+                bash -c 'die() { echo "\$*" >&2; exit 1; }; log_warn() { echo "\$*" >&2; }; . "\$1"; documentdb_stop_local_major "\$2"' \\
+                        _ "\${lib}" "${PG_VERSION}" || {
+                    echo "documentdb-${PG_VERSION}: warning: DocumentDB for PostgreSQL ${PG_VERSION} is still running from the removed files; stop it." >&2
+                }
+            else
+                echo "documentdb-${PG_VERSION}: \${lib} is missing; cannot stop a gateway or PostgreSQL started without systemd." >&2
+            fi
         fi
         ;;
 esac

@@ -374,12 +374,12 @@ ROLLBACK;
 -- SECTION: update document selection with collation on sharded collections
 -- ======================================================================
 
-SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_select_d', '{ "_id": "cat", "name": "cat", "bucket": 1, "rank": 10 }');
-SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_select_d', '{ "_id": "CAT", "name": "CAT", "bucket": 1, "rank": 1 }');
-SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_select_d', '{ "_id": "dog", "name": "dog", "bucket": 2, "rank": 5 }');
+SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_select_d', '{ "_id": "cat", "name": "cat", "bucket": 1, "rank": 10, "tags": [ "cat" ], "pipelineValue": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_select_d', '{ "_id": "CAT", "name": "CAT", "bucket": 1, "rank": 1, "tags": [ "CAT" ], "pipelineValue": "CAT" }');
+SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_select_d', '{ "_id": "dog", "name": "dog", "bucket": 2, "rank": 5, "tags": [ "dog" ], "pipelineValue": "dog" }');
 SELECT documentdb_api.shard_collection('coll_q_dist_db', 'coll_update_select_d', '{ "name": "hashed" }', false);
 
-SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_worker_one_d', '{ "_id": 1, "shard": 1, "name": "cat" }');
+SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_worker_one_d', '{ "_id": 1, "shard": 1, "name": "cat", "values": [ "cat", "CAT", "dog" ] }');
 SELECT documentdb_api.insert_one('coll_q_dist_db', 'coll_update_worker_one_d', '{ "_id": 2, "shard": 2, "name": "dog" }');
 SELECT documentdb_api.shard_collection('coll_q_dist_db', 'coll_update_worker_one_d', '{ "shard": "hashed" }', false);
 
@@ -418,6 +418,25 @@ BEGIN;
 SET LOCAL documentdb_core.enableCollation TO on;
 SET LOCAL documentdb.enable_update_many_worker_pushdown TO on;
 SELECT documentdb_api.update('coll_q_dist_db', '{ "update": "coll_update_select_d", "updates": [ { "q": { "name": "CaT" }, "u": { "$set": { "selected": "worker" } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_dist_db', 'coll_update_select_d') ORDER BY object_id;
+ROLLBACK;
+
+-- Both update-many execution paths propagate collation into update effects.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enable_update_many_worker_pushdown TO off;
+SELECT documentdb_api.update(
+  'coll_q_dist_db',
+  '{ "update": "coll_update_select_d", "updates": [ { "q": { "name": "CaT" }, "u": [ { "$set": { "pipelineEqual": { "$eq": [ "$pipelineValue", "CAT" ] } } } ], "multi": true, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_dist_db', 'coll_update_select_d') ORDER BY object_id;
+ROLLBACK;
+
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SET LOCAL documentdb.enable_update_many_worker_pushdown TO on;
+SELECT documentdb_api.update(
+  'coll_q_dist_db',
+  '{ "update": "coll_update_select_d", "updates": [ { "q": { "name": "CaT" }, "u": { "$addToSet": { "tags": "cAt" } }, "multi": true, "collation": { "locale": "en", "strength": 2 } } ] }');
 SELECT document FROM documentdb_api.collection('coll_q_dist_db', 'coll_update_select_d') ORDER BY object_id;
 ROLLBACK;
 
@@ -514,6 +533,23 @@ SELECT documentdb_api.update('coll_q_dist_db', '{ "update": "coll_update_worker_
 SELECT document FROM documentdb_api.collection('coll_q_dist_db', 'coll_update_worker_one_d') ORDER BY object_id;
 ROLLBACK;
 
+-- Single-worker updates and upserts propagate collation into update effects.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.update(
+  'coll_q_dist_db',
+  '{ "update": "coll_update_worker_one_d", "updates": [ { "q": { "shard": 1, "name": "CAT" }, "u": { "$pull": { "values": "cAt" } }, "multi": false, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_dist_db', 'coll_update_worker_one_d') ORDER BY object_id;
+ROLLBACK;
+
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.update(
+  'coll_q_dist_db',
+  '{ "update": "coll_update_worker_one_d", "updates": [ { "q": { "_id": 3, "shard": 3, "seed": "cat" }, "u": [ { "$set": { "pipelineEqual": { "$eq": [ "$seed", "CAT" ] } } } ], "multi": false, "upsert": true, "collation": { "locale": "en", "strength": 2 } } ] }');
+SELECT document FROM documentdb_api.collection('coll_q_dist_db', 'coll_update_worker_one_d') ORDER BY object_id;
+ROLLBACK;
+
 -- A non-string _id uses exact routing even when the operation also supplies
 -- a collation and sort.
 BEGIN;
@@ -592,3 +628,74 @@ SELECT documentdb_api.drop_collection('coll_q_dist_db', 'coll_update_duplicate_i
 SELECT documentdb_api.drop_collection('coll_q_dist_db', 'coll_update_unsharded_d');
 SELECT documentdb_api.drop_collection('coll_q_dist_db', 'coll_update_worker_one_d');
 SELECT documentdb_api.drop_collection('coll_q_dist_db', 'single_field_d');
+
+-- ======================================================================
+-- findAndModify with collation
+-- ======================================================================
+
+-- Unsharded execution preserves collation for matching, sorting, and projection.
+SELECT documentdb_api.insert_one(
+  'coll_q_dist_db', 'coll_find_modify_d',
+  '{"_id": 1, "group": "pet", "name": "Zulu", "state": "old"}');
+SELECT documentdb_api.insert_one(
+  'coll_q_dist_db', 'coll_find_modify_d',
+  '{"_id": 2, "group": "PET", "name": "alpha", "state": "old"}');
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_dist_db',
+  '{"findAndModify": "coll_find_modify_d", "query": {"group": "PeT"}, "sort": {"name": 1}, "update": {"$set": {"state": "updated"}}, "new": true, "fields": {"_id": 1, "name": 1, "state": 1}, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+
+-- A numeric shard-key equality routes to one worker with the command collation.
+SELECT documentdb_api.insert_one(
+  'coll_q_dist_db', 'coll_find_modify_sharded_d',
+  '{"_id": 1, "tenant": 1, "name": "cat", "state": "old"}');
+SELECT documentdb_api.insert_one(
+  'coll_q_dist_db', 'coll_find_modify_sharded_d',
+  '{"_id": 2, "tenant": 1, "name": "dog", "state": "old"}');
+SELECT documentdb_api.shard_collection(
+  'coll_q_dist_db', 'coll_find_modify_sharded_d', '{"tenant":"hashed"}', false);
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_dist_db',
+  '{"findAndModify": "coll_find_modify_sharded_d", "query": {"tenant": 1, "name": "CAT"}, "update": {"$set": {"state": "updated"}}, "new": true, "fields": {"_id": 1, "name": 1, "state": 1}, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_dist_db',
+  '{"findAndModify": "coll_find_modify_sharded_d", "query": {"tenant": 1, "name": "DOG"}, "remove": true, "fields": {"_id": 1, "name": 1}, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+
+-- A non-simple collation cannot route through a string shard-key hash.
+SELECT documentdb_api.insert_one(
+  'coll_q_dist_db', 'coll_find_modify_string_shard_d',
+  '{"_id": 1, "tenant": "alpha", "state": "old"}');
+SELECT documentdb_api.shard_collection(
+  'coll_q_dist_db', 'coll_find_modify_string_shard_d', '{"tenant":"hashed"}', false);
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_dist_db',
+  '{"findAndModify": "coll_find_modify_string_shard_d", "query": {"tenant": "ALPHA"}, "update": {"$set": {"state": "updated"}}, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_dist_db',
+  '{"findAndModify": "coll_find_modify_string_shard_d", "query": {"tenant": "ALPHA"}, "remove": true, "collation": {"locale": "en", "strength": 1}}');
+ROLLBACK;
+
+-- Explicit simple collation retains exact string shard-key routing.
+BEGIN;
+SET LOCAL documentdb_core.enableCollation TO on;
+SELECT documentdb_api.find_and_modify(
+  'coll_q_dist_db',
+  '{"findAndModify": "coll_find_modify_string_shard_d", "query": {"tenant": "alpha"}, "update": {"$set": {"state": "simple"}}, "new": true, "fields": {"_id": 1, "tenant": 1, "state": 1}, "collation": {"locale": "simple"}}');
+ROLLBACK;
+
+SELECT documentdb_api.drop_collection('coll_q_dist_db', 'coll_find_modify_d');
+SELECT documentdb_api.drop_collection('coll_q_dist_db', 'coll_find_modify_sharded_d');
+SELECT documentdb_api.drop_collection('coll_q_dist_db', 'coll_find_modify_string_shard_d');

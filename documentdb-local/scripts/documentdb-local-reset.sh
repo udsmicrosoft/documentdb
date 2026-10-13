@@ -141,11 +141,13 @@ main() {
     # only durable copy of that port lives in this state file — which the
     # cleanup below deletes. Read it FIRST, or the record (and the gateway it
     # names) becomes unfindable the moment config_dir is removed.
-    local recorded_gw_port=""
+    local recorded_gw_port="" pg_port=""
     if [[ -r "${setup_conf}" ]]; then
         recorded_gw_port="$(grep -E '^GATEWAY_PORT=' "${setup_conf}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
         [[ "${recorded_gw_port}" =~ ^[0-9]+$ ]] || recorded_gw_port=""
+        pg_port="$(grep -E '^PG_PORT=' "${setup_conf}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
     fi
+    [[ "${pg_port}" =~ ^[0-9]+$ ]] || pg_port="$(documentdb_default_pg_port "${PG_VERSION}")"
     if [[ -r "${setup_conf}" ]]; then
         local _recorded_data_dir _recorded_mode _recorded_managed
         _recorded_data_dir="$(grep -E '^DATA_DIR=' "${setup_conf}" | head -1 | cut -d= -f2- || true)"
@@ -162,6 +164,19 @@ main() {
                 die "${setup_conf} records DATA_DIR=${_recorded_data_dir} but does not mark it as a package-managed greenfield cluster (DOCUMENTDB_MANAGED_POSTGRES=true + DOCUMENTDB_MODE=greenfield). Refusing to delete a data directory this package cannot prove it owns — it may belong to an adopted (operator-owned) PostgreSQL instance from an earlier install. Run 'documentdb-setup --restore' to detach non-destructively, or remove the stale state file manually if you are certain."
             fi
         fi
+    fi
+
+    # Its socket lock names the postmaster even after the data directory is gone.
+    local pg_lock="${run_dir}/postgresql/.s.PGSQL.${pg_port}.lock"
+
+    local _pm_pids _path _anything=false
+    _pm_pids="$(documentdb_postmaster_pids "${data_dir}" "${pg_lock}")"
+    for _path in "${data_dir}" "${gw_dir}" "${backup_dir}" "${log_dir}" "${config_dir}" "${run_dir}"; do
+        [[ -e "${_path}" ]] && _anything=true
+    done
+    if [[ "${_anything}" != "true" && -z "${_pm_pids}" ]]; then
+        log "Nothing to reset for PostgreSQL ${PG_VERSION}: no greenfield DocumentDB Local install or running server found."
+        exit 0
     fi
 
     # Stop services
@@ -193,7 +208,9 @@ main() {
                 log "Stopping nohup gateway for port ${recorded_gw_port} (pid ${gw_pid})..."
                 kill "${gw_pid}" 2>/dev/null || true
                 sleep 1
-                kill -0 "${gw_pid}" 2>/dev/null && { kill -KILL "${gw_pid}" 2>/dev/null || true; }
+                kill -0 "${gw_pid}" 2>/dev/null && { kill -KILL "${gw_pid}" 2>/dev/null || true; sleep 1; }
+                ! documentdb_pid_running "${gw_pid}" \
+                    || die "The gateway for port ${recorded_gw_port} (pid ${gw_pid}) did not stop. Nothing was deleted; stop it, then re-run."
             else
                 log "Not signalling any process for port ${recorded_gw_port}: the recorded PID did not pass identity checks (missing/recycled/foreign). Removing the stale record only."
             fi
@@ -229,7 +246,8 @@ main() {
         _pg_ctl="$(command -v pg_ctl)"
     fi
 
-    if [[ -f "${data_dir}/postmaster.pid" ]] && [[ -n "${_pg_ctl}" ]]; then
+    # Only for a postmaster identified above: a stale postmaster.pid may name another cluster.
+    if [[ -n "${_pm_pids}" && -f "${data_dir}/postmaster.pid" && -n "${_pg_ctl}" ]]; then
         local _dd_owner
         _dd_owner="$(stat -c '%U' "${data_dir}" 2>/dev/null || echo postgres)"
         log "Attempting pg_ctl fast stop for ${data_dir} (as ${_dd_owner}, via ${_pg_ctl})..."
@@ -242,11 +260,22 @@ main() {
     elif [[ -f "${data_dir}/postmaster.pid" ]]; then
         log "No pg_ctl found for PostgreSQL ${PG_VERSION}; skipping the direct stop attempt."
     fi
-    if [[ -f "${data_dir}/postmaster.pid" ]]; then
-        _pm_pid="$(head -n 1 "${data_dir}/postmaster.pid" 2>/dev/null || true)"
-        if [[ -n "${_pm_pid}" ]] && kill -0 "${_pm_pid}" 2>/dev/null; then
-            die "PostgreSQL still appears to be running for ${data_dir} (pid ${_pm_pid}). Refusing to delete a live data directory. Stop it first (e.g. 'sudo systemctl stop documentdb-local@${PG_VERSION}.target' or 'sudo -u ${_dd_owner:-postgres} pg_ctl -D ${data_dir} stop'), then re-run."
-        fi
+    # pg_ctl needs postmaster.pid. A postmaster whose data directory is already
+    # gone (or that pg_ctl failed to stop) is signalled directly: fast
+    # shutdown, then immediate. The data is being destroyed either way.
+    _pm_pids="$(documentdb_postmaster_pids "${data_dir}" "${pg_lock}")"
+    if [[ -n "${_pm_pids}" ]]; then
+        log "Stopping PostgreSQL ${PG_VERSION} (pid ${_pm_pids//$'\n'/ })..."
+        _pm_pids="$(documentdb_stop_postmaster "${data_dir}" "${pg_lock}")"
+    fi
+    # A postmaster not started with -D is only named by its pid file; refuse, never signal.
+    if [[ -z "${_pm_pids}" && -f "${data_dir}/postmaster.pid" ]]; then
+        _pm_pids="$(head -n 1 "${data_dir}/postmaster.pid" 2>/dev/null || true)"
+        _pm_pids="${_pm_pids#-}"   # a single-user backend records -PID
+        [[ "${_pm_pids}" =~ ^[0-9]+$ ]] && kill -0 "${_pm_pids}" 2>/dev/null || _pm_pids=""
+    fi
+    if [[ -n "${_pm_pids}" ]]; then
+        die "PostgreSQL ${PG_VERSION} is still running for ${data_dir} (pid ${_pm_pids//$'\n'/ }). Refusing to delete a live data directory. Stop it (e.g. 'sudo kill -KILL ${_pm_pids//$'\n'/ }'), then re-run."
     fi
 
     # Remove data

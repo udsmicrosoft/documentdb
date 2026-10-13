@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/index_am/rum.c
  *
@@ -54,6 +55,8 @@ extern bool EnableExplainScanIndexCosts;
 extern bool EnableOrderByIndexTerm;
 extern bool EnableMergeSortForInPrefix;
 extern bool EnableDynamicCursorDedupTracking;
+extern bool EnableCompositeRangeSelectivity;
+extern int MaxExplainIndexCosts;
 
 bool RumHasMultiKeyPaths = false;
 
@@ -103,8 +106,6 @@ static bool ValidateMatchForOrderbyQuals(IndexPath *path);
 static bool IsTextIndexMatch(IndexPath *path);
 
 
-#define MAX_EXPLAIN_COSTS_SIZE 100
-#define MAX_LOGGED_PLANS 8
 static IndexCostsData IndexExplainCosts[MAX_EXPLAIN_COSTS_SIZE] = { 0 };
 static int IndexExplainCostsIndex = 0;
 
@@ -197,8 +198,8 @@ extension_rumcostestimate_core(PlannerInfo *root, IndexPath *path, double loop_c
 	if (enableCompositePlannerCosts &&
 		orderedCostEstimateCoreFunc != NULL && isCompositeOpFamily)
 	{
-		LOCAL_FCINFO(fcinfo, 13);
-		memset(fcinfo->args, 0, sizeof(NullableDatum) * 13);
+		LOCAL_FCINFO(fcinfo, 14);
+		memset(fcinfo->args, 0, sizeof(NullableDatum) * 14);
 		fcinfo->args[0].value = PointerGetDatum(root);
 		fcinfo->args[1].value = PointerGetDatum(path);
 		fcinfo->args[2].value = Float8GetDatum(loop_count);
@@ -213,7 +214,15 @@ extension_rumcostestimate_core(PlannerInfo *root, IndexPath *path, double loop_c
 		fcinfo->args[11].value = PointerGetDatum(&dataPagesProportionFetched);
 		fcinfo->args[12].value = PointerGetDatum(ExtractBoundaryQualsForOrderedIndexPath);
 
-		InitFunctionCallInfoData(*fcinfo, NULL, 13, InvalidOid, NULL, NULL);
+		int numArgs = 13;
+		if (EnableCompositeRangeSelectivity)
+		{
+			fcinfo->args[13].value = PointerGetDatum(
+				GetModifiedClauseListForOrderedIndexPath);
+			numArgs++;
+		}
+
+		InitFunctionCallInfoData(*fcinfo, NULL, numArgs, InvalidOid, NULL, NULL);
 		orderedCostEstimateCoreFunc(fcinfo);
 
 		/* if possible also record correlation via stats if available */
@@ -1771,7 +1780,7 @@ LogReportedIndexCosts(Oid relOid, struct ExplainState *es)
 	initStringInfo(&buf);
 	int numPlansLogged = 0;
 	for (int i = 0; i < IndexExplainCostsIndex && i < MAX_EXPLAIN_COSTS_SIZE &&
-		 numPlansLogged < MAX_LOGGED_PLANS; i++)
+		 numPlansLogged < MaxExplainIndexCosts; i++)
 	{
 		if (IndexExplainCosts[i].indexOid == InvalidOid)
 		{

@@ -23,4 +23,13 @@ extern ShouldEnableBtreeBsonSelectivityFromStatsFunc
 
 bool IsBtreeBsonSelectivityFromStatsEnabled(void);
 
+/*
+ * Hook that lets a higher layer decide whether ANALYZE on bson expression
+ * statistics unpacks array values into their elements. When not set, the
+ * bson_stats_enable_array_value_unpack GUC is used.
+ */
+typedef bool (*ShouldEnableBsonStatsArrayValueUnpackFunc)(void);
+extern ShouldEnableBsonStatsArrayValueUnpackFunc
+	should_enable_bson_stats_array_value_unpack_hook;
+
 #endif

@@ -14,10 +14,6 @@ default = []
 runtime-benchmarks = []
 # Compiles request span creation and inbound W3C parent extraction.
 request-tracing = []
-# Compiles outbound PostgreSQL SQLCommenter generation.
-postgres-sql-commenter = [
-	"request-tracing",
-]
 
 [dependencies]
 arc-swap.workspace = true
@@ -29,7 +25,6 @@ bytes.workspace = true
 dashmap.workspace = true
 deadpool.workspace = true
 deadpool-postgres.workspace = true
-documentdb_macros.workspace = true
 dyn-clone.workspace = true
 either.workspace = true
 hex.workspace = true
@@ -52,8 +47,16 @@ tracing.workspace = true
 uuid.workspace = true
 whoami.workspace = true
 
+[build-dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
 
 [[bench]]
 name = "runtime_hot_path"

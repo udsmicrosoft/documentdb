@@ -3932,25 +3932,28 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
 SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
 EXPLAIN (COSTS OFF, VERBOSE ON) SELECT document FROM bson_aggregation_pipeline('coll_q_db', '{ "aggregate": "coll_merge_src", "pipeline": [{"$merge" : { "into": "coll_merge_dst", "on": "k", "whenMatched" : "replace", "whenNotMatched": "insert" }} ], "cursor": {} }')
 $cmd$);
-                                                                                                                              run_explain_and_trim                                                                                                                               
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                               run_explain_and_trim                                                                                                                               
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Merge on documentdb_data.documents_8815
    ->  Nested Loop Left Join
-         Output: documents_8815.ctid, collection.document, collection.ctid
-         ->  Custom Scan (DocumentDBApiExplainQueryScan)
-               Output: collection.document, collection.ctid
-               namespaceName: coll_q_db.coll_merge_src
-               indexName: _id_
-               ->  Bitmap Heap Scan on documentdb_data.documents_8814 collection
-                     Output: collection.document, collection.ctid
-                     Recheck Cond: (collection.shard_key_value = '8814'::bigint)
-                     ->  Bitmap Index Scan on _id_
-                           Index Cond: (collection.shard_key_value = '8814'::bigint)
+         Output: documents_8815.ctid, agg_stage_0.document, agg_stage_0.generated_object_id, agg_stage_0.*
+         ->  Subquery Scan on agg_stage_0
+               Output: agg_stage_0.document, agg_stage_0.generated_object_id, agg_stage_0.*
+               Filter: (agg_stage_0.document IS NOT NULL)
+               ->  Custom Scan (DocumentDBApiExplainQueryScan)
+                     Output: collection.document, '8815'::bigint, documentdb_api_internal.bson_dollar_merge_generate_object_id(collection.document)
+                     namespaceName: coll_q_db.coll_merge_src
+                     indexName: _id_
+                     ->  Bitmap Heap Scan on documentdb_data.documents_8814 collection
+                           Output: collection.document
+                           Recheck Cond: (collection.shard_key_value = '8814'::bigint)
+                           ->  Bitmap Index Scan on _id_
+                                 Index Cond: (collection.shard_key_value = '8814'::bigint)
          ->  Index Scan using uq_merge_k on documentdb_data.documents_8815
                Output: documents_8815.ctid, documents_8815.document
-               Index Cond: (documents_8815.document @= documentdb_api_internal.bson_dollar_extract_merge_filter(collection.document, 'k'::text))
-               Filter: ((documents_8815.shard_key_value OPERATOR(pg_catalog.=) '8815'::bigint) AND documentdb_api_internal.bson_dollar_merge_join(documents_8815.document, documentdb_api_internal.bson_dollar_extract_merge_filter(collection.document, 'k'::text), 'k'::text))
-(16 rows)
+               Index Cond: (documents_8815.document @= documentdb_api_internal.bson_dollar_extract_merge_filter(agg_stage_0.document, 'k'::text))
+               Filter: ((documents_8815.shard_key_value OPERATOR(pg_catalog.=) '8815'::bigint) AND documentdb_api_internal.bson_dollar_merge_join(documents_8815.document, documentdb_api_internal.bson_dollar_extract_merge_filter(agg_stage_0.document, 'k'::text), 'k'::text))
+(19 rows)
 
 SELECT documentdb_api.drop_collection('coll_q_db','coll_merge_src');
  drop_collection 
@@ -4525,8 +4528,7 @@ SELECT documentdb_api.insert_one('coll_q_db', 'coll_update_explain_idx', '{ "_id
 (1 row)
 
 -- multi:true with a matching collation uses the collated index for its bounds.
--- The collation drives document selection only; the rewrite keeps binary
--- semantics.
+-- The rewrite passes the same collation to the update expression.
 SELECT regexp_replace(
   documentdb_test_helpers.run_explain_and_trim($cmd$
 EXPLAIN (COSTS OFF, VERBOSE ON)
@@ -4535,15 +4537,15 @@ SELECT document FROM bson_aggregation_update(
   '{ "update": "coll_update_explain_idx", "updates": [ { "q": { "a": "CaT" }, "u": { "$set": { "b": 1 } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }')
 $cmd$),
   'documents_[0-9]+', 'documents_x', 'g');
-                                                                                                                                                            regexp_replace                                                                                                                                                            
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                  regexp_replace
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: bson_build_document('n'::text, count(*), 'nModified'::text, sum(u.updated), 'ok'::text, '1'::double precision)
    CTE u
      ->  Update on documentdb_data.documents_x
            Output: documentdb_api_internal.bson_update_returned_value(documents_x.shard_key_value)
            ->  Custom Scan (DocumentDBApiExplainQueryScan)
-                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, NULL::text), documents_x.document), documents_x.ctid
+                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, 'en-u-ks-level1'::text), documents_x.document), documents_x.ctid
                  namespaceName: coll_q_db.coll_update_explain_idx
                  indexName: idx_update_a_en_s1
                  indexKey: {"a": 1}
@@ -4791,15 +4793,15 @@ SELECT document FROM bson_aggregation_update(
   '{ "update": "coll_update_explain_idx", "updates": [ { "q": { "a": { "$gte": "CAT" } }, "u": { "$set": { "b": 1 } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }')
 $cmd$),
   'documents_[0-9]+', 'documents_x', 'g');
-                                                                                                                                                                  regexp_replace                                                                                                                                                                   
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                        regexp_replace
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: bson_build_document('n'::text, count(*), 'nModified'::text, sum(u.updated), 'ok'::text, '1'::double precision)
    CTE u
      ->  Update on documentdb_data.documents_x
            Output: documentdb_api_internal.bson_update_returned_value(documents_x.shard_key_value)
            ->  Custom Scan (DocumentDBApiExplainQueryScan)
-                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : { "$gte" : "CAT" } }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, NULL::text), documents_x.document), documents_x.ctid
+                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : { "$gte" : "CAT" } }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, 'en-u-ks-level1'::text), documents_x.document), documents_x.ctid
                  namespaceName: coll_q_db.coll_update_explain_idx
                  indexName: idx_update_a_en_s1
                  indexKey: {"a": 1}
@@ -4880,15 +4882,15 @@ SELECT document FROM bson_aggregation_update(
   '{ "update": "coll_update_explain_idx", "updates": [ { "q": { "simpleA": "cat" }, "u": { "$set": { "b": 1 } }, "multi": true, "collation": { "locale": "simple" } } ] }')
 $cmd$),
   'documents_[0-9]+', 'documents_x', 'g');
-                                                                                                                                                               regexp_replace                                                                                                                                                               
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                              regexp_replace
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: bson_build_document('n'::text, count(*), 'nModified'::text, sum(u.updated), 'ok'::text, '1'::double precision)
    CTE u
      ->  Update on documentdb_data.documents_x
            Output: documentdb_api_internal.bson_update_returned_value(documents_x.shard_key_value)
            ->  Custom Scan (DocumentDBApiExplainQueryScan)
-                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "simpleA" : "cat" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, NULL::text), documents_x.document), documents_x.ctid
+                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "simpleA" : "cat" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, ''::text), documents_x.document), documents_x.ctid
                  namespaceName: coll_q_db.coll_update_explain_idx
                  indexName: idx_update_simple_a_binary
                  indexKey: {"simpleA": 1}
@@ -4913,15 +4915,15 @@ SELECT document FROM bson_aggregation_update(
   '{ "update": "coll_update_explain_idx", "updates": [ { "q": { "a": "CaT" }, "u": { "$set": { "b": 1 } }, "multi": true, "collation": { "locale": "en", "strength": 2 } } ] }')
 $cmd$),
   'documents_[0-9]+', 'documents_x', 'g');
-                                                                                                                                                            regexp_replace                                                                                                                                                            
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                  regexp_replace
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: bson_build_document('n'::text, count(*), 'nModified'::text, sum(u.updated), 'ok'::text, '1'::double precision)
    CTE u
      ->  Update on documentdb_data.documents_x
            Output: documentdb_api_internal.bson_update_returned_value(documents_x.shard_key_value)
            ->  Custom Scan (DocumentDBApiExplainQueryScan)
-                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, NULL::text), documents_x.document), documents_x.ctid
+                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, 'en-u-ks-level2'::text), documents_x.document), documents_x.ctid
                  namespaceName: coll_q_db.coll_update_explain_idx
                  indexName: _id_
                  ->  Bitmap Heap Scan on documentdb_data.documents_x
@@ -4943,15 +4945,15 @@ SELECT document FROM bson_aggregation_update(
   '{ "update": "coll_update_explain_idx", "updates": [ { "q": { "a": "CaT" }, "u": { "$set": { "b": 1 } }, "multi": true } ] }')
 $cmd$),
   'documents_[0-9]+', 'documents_x', 'g');
-                                                                                                                                                            regexp_replace                                                                                                                                                            
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                           regexp_replace
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: bson_build_document('n'::text, count(*), 'nModified'::text, sum(u.updated), 'ok'::text, '1'::double precision)
    CTE u
      ->  Update on documentdb_data.documents_x
            Output: documentdb_api_internal.bson_update_returned_value(documents_x.shard_key_value)
            ->  Custom Scan (DocumentDBApiExplainQueryScan)
-                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, NULL::text), documents_x.document), documents_x.ctid
+                 Output: COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, ''::text), documents_x.document), documents_x.ctid
                  namespaceName: coll_q_db.coll_update_explain_idx
                  indexName: _id_
                  ->  Bitmap Heap Scan on documentdb_data.documents_x
@@ -4983,13 +4985,13 @@ SELECT document FROM bson_aggregation_update(
   '{ "update": "coll_update_explain_idx", "updates": [ { "q": { "a": "CaT" }, "u": { "$set": { "b": 1 } }, "multi": true, "collation": { "locale": "en", "strength": 1 } } ] }')
 $cmd$),
   'documents_[0-9]+', 'documents_x', 'g');
-                                                                                                                                                                                     regexp_replace                                                                                                                                                                                     
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                           regexp_replace
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: (InitPlan 4).col1, sum(u.updated)
    CTE filtered_documents
      ->  Custom Scan (DocumentDBApiExplainQueryScan)
-           Output: documents_x.object_id, documents_x.shard_key_value, documents_x.document, COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, NULL::text), documents_x.document)
+           Output: documents_x.object_id, documents_x.shard_key_value, documents_x.document, COALESCE(documentdb_api_internal.update_bson_document(documents_x.document, '{ "" : { "$set" : { "b" : { "$numberInt" : "1" } } } }'::bson, '{ "a" : "CaT" }'::bson, NULL::bson, '{ "now" : NOW_SYS_VARIABLE }'::bson, 'en-u-ks-level1'::text), documents_x.document)
            namespaceName: coll_q_db.coll_update_explain_idx
            indexName: idx_update_a_en_s1
            indexKey: {"a": 1}
@@ -5033,7 +5035,7 @@ SELECT documentdb_api.drop_collection('coll_q_db', 'coll_update_explain_idx');
 -- SECTION: binary $expr index pushdown
 -- ======================================================================
 SELECT documentdb_api.insert_one('coll_q_db', 'single_field_binary', '{"_id": 1, "a": "apple", "b": "apple"}');
-psql:sql/bson_collation_query_tests_explain_index.sql:1362: NOTICE:  creating collection
+psql:sql/bson_collation_query_tests_explain_index.sql:1361: NOTICE:  creating collection
                               insert_one                              
 ----------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -5283,13 +5285,13 @@ $cmd$);
 
 SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
   '{ "createIndexes": "single_field_binary", "indexes": [{ "key": {"a": 1, "b": 1}, "name": "gate_disabled_support", "collation": {"locale": "simple"} }] }', TRUE);
-psql:sql/bson_collation_query_tests_explain_index.sql:1416: ERROR:  Error in specification { "key" : { "a" : 1, "b" : 1 }, "name" : "gate_disabled_support", "collation" : { "locale" : "simple" } }:createIndex.collation is not implemented yet
+psql:sql/bson_collation_query_tests_explain_index.sql:1415: ERROR:  Error in specification { "key" : { "a" : 1, "b" : 1 }, "name" : "gate_disabled_support", "collation" : { "locale" : "simple" } }:createIndex.collation is not implemented yet
 SET documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
 -- With collation disabled, a stored collation option remains a pushdown barrier.
 SET documentdb_core.enableCollation TO off;
 SET documentdb.skipFailOnCollation TO off;
 SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "single_field_binary", "filter": {"b": "apple"}, "collation": {"locale": "simple"} }');
-psql:sql/bson_collation_query_tests_explain_index.sql:1422: ERROR:  collation is not supported in the find command yet.
+psql:sql/bson_collation_query_tests_explain_index.sql:1421: ERROR:  collation is not supported in the find command yet.
 SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
 EXPLAIN (COSTS OFF, VERBOSE ON) SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "single_field_binary", "filter": {"$expr": {"$eq": ["$a", "apple"]}} }')
 $cmd$);
@@ -5319,7 +5321,7 @@ SELECT documentdb_api.drop_collection('coll_q_db', 'single_field_binary');
 -- Simple must not bypass unsupported single-path, hashed, or wildcard indexes.
 SET documentdb.defaultUseCompositeOpClass TO off;
 SELECT documentdb_api.insert_one('coll_q_db', 'simple_gate_single', '{"_id": 1, "a": "apple"}');
-psql:sql/bson_collation_query_tests_explain_index.sql:1433: NOTICE:  creating collection
+psql:sql/bson_collation_query_tests_explain_index.sql:1432: NOTICE:  creating collection
                               insert_one                              
 ----------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -5339,7 +5341,7 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
 (1 row)
 
 SELECT documentdb_api.insert_one('coll_q_db', 'simple_gate_hashed', '{"_id": 1, "a": "apple"}');
-psql:sql/bson_collation_query_tests_explain_index.sql:1437: NOTICE:  creating collection
+psql:sql/bson_collation_query_tests_explain_index.sql:1436: NOTICE:  creating collection
                               insert_one                              
 ----------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -5359,7 +5361,7 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
 (1 row)
 
 SELECT documentdb_api.insert_one('coll_q_db', 'simple_gate_wildcard', '{"_id": 1, "a": "apple"}');
-psql:sql/bson_collation_query_tests_explain_index.sql:1441: NOTICE:  creating collection
+psql:sql/bson_collation_query_tests_explain_index.sql:1440: NOTICE:  creating collection
                               insert_one                              
 ----------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
@@ -5380,13 +5382,13 @@ SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
 
 SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
   '{ "createIndexes": "simple_gate_single", "indexes": [{ "key": {"a": 1}, "name": "gate_single_collation", "collation": {"locale": "simple"} }] }', TRUE);
-psql:sql/bson_collation_query_tests_explain_index.sql:1446: ERROR:  Index already exists with a different name: gate_single
+psql:sql/bson_collation_query_tests_explain_index.sql:1445: ERROR:  Index already exists with a different name: gate_single
 SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
   '{ "createIndexes": "simple_gate_hashed", "indexes": [{ "key": {"a": "hashed"}, "name": "gate_hashed_collation", "collation": {"locale": "simple"} }] }', TRUE);
-psql:sql/bson_collation_query_tests_explain_index.sql:1448: ERROR:  Index already exists with a different name: gate_hashed
+psql:sql/bson_collation_query_tests_explain_index.sql:1447: ERROR:  Index already exists with a different name: gate_hashed
 SELECT documentdb_api_internal.create_indexes_non_concurrently('coll_q_db',
   '{ "createIndexes": "simple_gate_wildcard", "indexes": [{ "key": {"$**": 1}, "name": "gate_wildcard_collation", "wildcardProjection": {"a": 1}, "collation": {"locale": "simple"} }] }', TRUE);
-psql:sql/bson_collation_query_tests_explain_index.sql:1450: ERROR:  Index already exists with a different name: gate_wildcard
+psql:sql/bson_collation_query_tests_explain_index.sql:1449: ERROR:  Index already exists with a different name: gate_wildcard
 SET documentdb.defaultUseCompositeOpClass TO on;
 SELECT documentdb_test_helpers.run_explain_and_trim($cmd$
 EXPLAIN (COSTS OFF, VERBOSE ON) SELECT document FROM bson_aggregation_find('coll_q_db', '{ "find": "simple_gate_single", "filter": {"a": "apple"} }')

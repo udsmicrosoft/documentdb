@@ -1,11 +1,13 @@
 test: multinode/basic_crud
 test: multinode/roles_reference_table
 test: multinode/schema_validation_update_multi
-test: multinode/commands_update_many_worker_multinode
+test: multinode/bson_collation_write_multinode
 test: multinode/shard_commands_worker_validation
 test: multinode/nonblocking_unique_index_hook
+test: multinode/commands_collmod_hidden
 test: multinode/dynamic_cursor_remote_unsharded_tests_mini 
 test: multinode/dynamic_cursor_remote_unsharded_tests
+test: multinode/dynamic_cursor_collation_tests
 test: multinode/reservoir_sample_unsharded
 test: multinode/reservoir_sample_heap_skip
 test: multinode/move_collection_local_execution
@@ -14,3 +16,4 @@ test: multinode/bson_composite_rct_planner_pruning_tests
 test: multinode/bson_collation_group_decomposed
 test: multinode/collstats_nested_distribution
 test: multinode/commands_update_remote!PG16_OR_LOWER!
+test: multinode/commands_collmod_hidden_no_placement

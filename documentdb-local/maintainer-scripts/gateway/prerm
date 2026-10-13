@@ -7,6 +7,49 @@ has_working_systemd() {
     [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
 }
 
+# Alive and not a zombie (a container PID 1 may never reap it).
+pid_alive() {
+    local state
+    kill -0 "$1" 2>/dev/null || return 1
+    state="$(awk '{n=split($0,a,")"); split(a[n],f," "); print f[1]}' "/proc/$1/stat" 2>/dev/null)"
+    [[ "${state}" != "Z" ]]
+}
+
+# Without systemd, documentdb-setup runs each gateway under nohup and records
+# it in /run/documentdb-gateway/gateway-<port>.pid. Stop every recorded gateway
+# that still matches its record (start time and binary name), or it keeps
+# serving from the deleted binary. Kept inline: the tools library may already
+# be gone when this runs. Returns 1 if one would not stop.
+stop_recorded_nohup_gateways() {
+    local rec pid start cur argv0 i rc=0
+    for rec in /run/documentdb-gateway/gateway-*.pid; do
+        [[ -r "${rec}" ]] || continue
+        pid="" start=""
+        # Non-blocking bounded read: the gateway user can fill this directory with FIFOs or /dev/zero links.
+        read -r pid start _ <<< "$(dd if="${rec}" bs=256 count=1 iflag=nonblock 2>/dev/null | tr -d '\0')" || true
+        if [[ "${pid}" =~ ^[0-9]+$ ]] && (( pid > 1 )) && pid_alive "${pid}"; then
+            cur="$(awk '{n=split($0,a,")"); split(a[n],f," "); print f[20]}' "/proc/${pid}/stat" 2>/dev/null)"
+            argv0="$(tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | head -n 1)"
+            if [[ ( -z "${start}" || "${start}" == "${cur}" ) && "${argv0##*/}" == documentdb[-_]gateway* ]]; then
+                echo "documentdb-gateway: stopping the gateway started without systemd (pid ${pid})."
+                kill "${pid}" 2>/dev/null || true
+                for (( i = 0; i < 50; i++ )); do pid_alive "${pid}" || break; sleep 0.2; done
+                if pid_alive "${pid}"; then
+                    kill -KILL "${pid}" 2>/dev/null || true
+                    sleep 1
+                fi
+                if pid_alive "${pid}"; then
+                    echo "documentdb-gateway: gateway pid ${pid} did not stop." >&2
+                    rc=1
+                    continue
+                fi
+            fi
+        fi
+        rm -f "${rec}" 2>/dev/null || true
+    done
+    return "${rc}"
+}
+
 # Stop on "remove" only, and never disable here.
 #
 # "deconfigure" is dpkg's TEMPORARY deconfiguration during dependency or
@@ -28,6 +71,9 @@ case "$1" in
             for unit in $(systemctl list-units 'documentdb-gateway-local@*.service' --state=active --plain --no-legend 2>/dev/null | awk '{print $1}'); do
                 systemctl stop "${unit}" 2>/dev/null || true
             done
+        elif ! stop_recorded_nohup_gateways; then
+            # Like the systemd branch: report it, never block the removal.
+            echo "documentdb-gateway: warning: a gateway is still running from the removed files; kill it." >&2
         fi
         ;;
 esac

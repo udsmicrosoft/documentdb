@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/consts.rs
  *
@@ -18,8 +19,6 @@ pub mod span_fields {
 
 // Environment variables used for configuration
 pub mod env_vars {
-    #[cfg(feature = "postgres-sql-commenter")]
-    pub const DOCUMENTDB_SQL_COMMENTER_ENABLED: &str = "DOCUMENTDB_SQL_COMMENTER_ENABLED";
     pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_METRICS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT";

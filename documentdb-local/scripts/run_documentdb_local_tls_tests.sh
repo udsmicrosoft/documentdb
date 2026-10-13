@@ -5,6 +5,7 @@ set -euo pipefail
 IMAGE_NAME="${1:-documentdb-local:test-tls}"
 LOG_DIR="${2:-documentdb-local-logs}"
 CONTAINER_SUFFIX="$$"
+EXPECTED_STORES=41505
 
 DEFAULT_CONTAINER="docdb-default-${CONTAINER_SUFFIX}"
 ENFORCE_CONTAINER="docdb-enforce-${CONTAINER_SUFFIX}"
@@ -62,7 +63,7 @@ wait_for_sample_data() {
         args=(--tls --tlsAllowInvalidCertificates)
     fi
 
-    for attempt in {1..90}; do
+    for attempt in {1..240}; do
         count="$(docker exec "$container" mongosh \
             --host localhost \
             --port 10260 \
@@ -71,9 +72,9 @@ wait_for_sample_data() {
             --authenticationDatabase admin \
             "${args[@]}" \
             --quiet \
-            --eval 'db.getSiblingDB("sampledb").users.countDocuments()' 2>/dev/null || true)"
+            --eval 'db.getSiblingDB("StoreData").stores.countDocuments()' 2>/dev/null || true)"
 
-        if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt 0 ]; then
+        if [ "$count" = "$EXPECTED_STORES" ]; then
             return 0
         fi
         sleep 2
@@ -88,7 +89,7 @@ wait_for_sample_data() {
 # rejects plain connections.
 echo "=== Test: Default mode (allowTLS - plain and TLS both accepted) ==="
 
-docker run -d --name "$DEFAULT_CONTAINER" "$IMAGE_NAME" --password mypassword --init-data true
+docker run -d --name "$DEFAULT_CONTAINER" -e DOCUMENTDB_USAGE_TELEMETRY=false "$IMAGE_NAME" --password mypassword --init-data true
 wait_for_ping "$DEFAULT_CONTAINER" true
 wait_for_sample_data "$DEFAULT_CONTAINER" true
 
@@ -126,8 +127,8 @@ count="$(docker exec "$DEFAULT_CONTAINER" mongosh \
     --tls \
     --tlsAllowInvalidCertificates \
     --quiet \
-    --eval 'db.getSiblingDB("sampledb").users.countDocuments()')"
-if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt 0 ]; then
+    --eval 'db.getSiblingDB("StoreData").stores.countDocuments()')"
+if [ "$count" = "$EXPECTED_STORES" ]; then
     echo "  PASSED (count=$count)"
 else
     echo "  FAILED: Sample data not found."
@@ -139,7 +140,7 @@ docker rm -f "$DEFAULT_CONTAINER" >/dev/null
 echo ""
 echo "=== Test: --tlsMode requireTLS ==="
 
-docker run -d --name "$ENFORCE_CONTAINER" "$IMAGE_NAME" \
+docker run -d --name "$ENFORCE_CONTAINER" -e DOCUMENTDB_USAGE_TELEMETRY=false "$IMAGE_NAME" \
     --password mypassword --tlsMode requireTLS --init-data true
 wait_for_ping "$ENFORCE_CONTAINER" true
 wait_for_sample_data "$ENFORCE_CONTAINER" true
@@ -181,8 +182,8 @@ count="$(docker exec "$ENFORCE_CONTAINER" mongosh \
     --tls \
     --tlsAllowInvalidCertificates \
     --quiet \
-    --eval 'db.getSiblingDB("sampledb").users.countDocuments()')"
-if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt 0 ]; then
+    --eval 'db.getSiblingDB("StoreData").stores.countDocuments()')"
+if [ "$count" = "$EXPECTED_STORES" ]; then
     echo "  PASSED (count=$count)"
 else
     echo "  FAILED: Sample data not found."
@@ -195,7 +196,7 @@ echo ""
 echo "=== Test: Environment variable path ==="
 
 echo "Test 7: -e TLS_MODE=requireTLS - TLS-only behavior..."
-docker run -d --name "$ENVVAR_CONTAINER" -e TLS_MODE=requireTLS \
+docker run -d --name "$ENVVAR_CONTAINER" -e TLS_MODE=requireTLS -e DOCUMENTDB_USAGE_TELEMETRY=false \
     "$IMAGE_NAME" --password mypassword
 wait_for_ping "$ENVVAR_CONTAINER" true
 

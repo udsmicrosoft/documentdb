@@ -261,6 +261,7 @@ start_managed_documentdb() {
     docker run -d \
         --name "$DOCUMENTDB_CONTAINER" \
         -p "$DOCUMENTDB_PORT:10260" \
+        -e DOCUMENTDB_USAGE_TELEMETRY=false \
         "$DOCUMENTDB_IMAGE" \
         --username "$DOCUMENTDB_USER" \
         --password "$DOCUMENTDB_PASSWORD" \

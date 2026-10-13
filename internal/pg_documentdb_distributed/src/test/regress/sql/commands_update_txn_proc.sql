@@ -772,3 +772,83 @@ CALL documentdb_api.update_txn_proc('db1', '{"update":"subtransupdate", "updates
 select document from documentdb_api.collection('db1', 'subtransupdate');
 
 RESET client_min_messages;
+
+-- Single update pushed whole to the update worker, with the worker side
+-- sub-transaction skipped. 'db' has native colocation off, so the collection is
+-- unsharded and treated as remote and the batch is pushed to update_worker.
+SELECT documentdb_api.insert('db', '{"insert":"nosubtxn", "documents":[{"_id":1, "b":1}]}');
+
+SET documentdb.enable_update_worker_single_write_no_sub_transaction TO on;
+SET client_min_messages TO 'DEBUG1';
+
+-- Single update without a transaction id: the worker runs it without a
+-- sub-transaction, so no "Using single update with subtransaction" is reported.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxn", "updates":[{"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false}]}');
+
+-- A transaction id still requires the retryable write path, so the worker keeps
+-- using a sub-transaction.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxn", "updates":[{"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false}]}', NULL, 'nosubtxn-test');
+
+-- More than one update is not eligible, so the worker keeps handling errors itself.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxn", "updates":[{"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false},{"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false}]}');
+
+RESET client_min_messages;
+
+-- A failing single update must still be reported as a write error rather than
+-- raising out of the procedure, and must not apply.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxn", "updates":[{"q":{"_id":1}, "u":{"_id":999, "a":1}}]}');
+
+-- The failed update rolled back, the successful ones did not.
+select document from documentdb_api.collection('db', 'nosubtxn');
+
+-- Writes still work after the rolled back update.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxn", "updates":[{"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false}]}');
+select document from documentdb_api.collection('db', 'nosubtxn');
+
+-- An ordered multi update where only the second fails still reports the right index.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxn", "updates":[{"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false},{"q":{"_id":1},"u":{"_id":999,"a":1}}]}');
+select document from documentdb_api.collection('db', 'nosubtxn');
+
+RESET documentdb.enable_update_worker_single_write_no_sub_transaction;
+
+-- The same single update optimization, but with the updates supplied through the
+-- procedure's bsonsequence argument instead of inside the command document. This
+-- is the shape wire-protocol requests use, and it takes the updateSequence branch
+-- of the batch size check.
+SELECT documentdb_api.insert('db', '{"insert":"nosubtxnseq", "documents":[{"_id":1, "b":1}]}');
+
+SET documentdb.enable_update_worker_single_write_no_sub_transaction TO on;
+SET client_min_messages TO 'DEBUG1';
+
+-- A sequence holding exactly one update is eligible, so no sub-transaction is
+-- reported.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxnseq"}', '{ "": [ {"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false} ] }'::documentdb_core.bsonsequence);
+
+-- A sequence holding two updates is not eligible, so the worker keeps handling
+-- errors itself.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxnseq"}', '{ "": [ {"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false},{"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false} ] }'::documentdb_core.bsonsequence);
+
+-- A single update sequence with a transaction id still takes the retryable write
+-- path, so the worker keeps using a sub-transaction.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxnseq"}', '{ "": [ {"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false} ] }'::documentdb_core.bsonsequence, 'nosubtxnseq-test');
+
+RESET client_min_messages;
+
+-- All four updates applied.
+select document from documentdb_api.collection('db', 'nosubtxnseq');
+
+-- A failing single update sequence is reported as a write error at index 0 and
+-- must not apply.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxnseq"}', '{ "": [ {"q":{"_id":1},"u":{"_id":999,"a":1}} ] }'::documentdb_core.bsonsequence);
+select document from documentdb_api.collection('db', 'nosubtxnseq');
+
+-- Writes still work after the rolled back update.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxnseq"}', '{ "": [ {"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false} ] }'::documentdb_core.bsonsequence);
+select document from documentdb_api.collection('db', 'nosubtxnseq');
+
+-- A two update sequence where only the second fails still reports index 1 and
+-- keeps the first update, proving the fallback path is unchanged.
+CALL documentdb_api.update_txn_proc('db', '{"update":"nosubtxnseq"}', '{ "": [ {"q":{"_id":1},"u":{"$inc":{"b":1}},"multi":false},{"q":{"_id":1},"u":{"_id":999,"a":1}} ] }'::documentdb_core.bsonsequence);
+select document from documentdb_api.collection('db', 'nosubtxnseq');
+
+RESET documentdb.enable_update_worker_single_write_no_sub_transaction;

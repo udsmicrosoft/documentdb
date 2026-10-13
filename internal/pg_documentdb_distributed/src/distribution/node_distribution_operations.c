@@ -1,5 +1,7 @@
 /*-------------------------------------------------------------------------
- * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
  *
  * src/distribution/node_distribution_operations.c
  *
@@ -14,6 +16,7 @@
 #include <nodes/makefuncs.h>
 #include <catalog/namespace.h>
 #include <utils/lsyscache.h>
+#include <utils/regproc.h>
 
 #include "utils/query_utils.h"
 #include "utils/documentdb_errors.h"
@@ -22,6 +25,8 @@
 #include "metadata/metadata_cache.h"
 #include "node_distributed_operations.h"
 #include "api_hooks.h"
+#include "utils/hashset_utils.h"
+#include "utils/string_view.h"
 
 
 static ArrayType *
@@ -50,15 +55,45 @@ ChooseShardNamesForTable(const char *distributedTableName)
 }
 
 
-static bool
-CoordinatorHasShardsForTable(const char *distributedTableName)
+bool
+IsSingleNodeCluster(void)
 {
+	bool readOnly = true;
+	bool isNull = false;
+	Datum result = ExtensionExecuteQueryViaSPI(
+		"SELECT COUNT(*)::int4 FROM pg_dist_node "
+		"WHERE nodecluster = 'default' AND noderole = 'primary' AND isactive",
+		readOnly, SPI_OK_SELECT, &isNull);
+
+	if (isNull)
+	{
+		ereport(ERROR, (errmsg(
+							"could not determine the number of active primary nodes")));
+	}
+
+	return DatumGetInt32(result) <= 1;
+}
+
+
+static ArrayType *
+GetTablesNamesPerNode(void)
+{
+	/* Implementation to find nodes without placement for the shards
+	 * TODO: we can just exclude the changes table by oid directly whenever we migrate
+	 * the legacy retry distributed table to the per-node local retry table to avoid doing the starts_with
+	 * expensive check and the JOIN with pg_class.
+	 */
 	const char *query =
-		"select COUNT(1) from citus_shards cs join pg_dist_node pd on cs.nodename = pd.nodename and cs.nodeport = pd.nodeport where cs.table_name = $1::regclass and pd.groupid = 0";
+		"WITH r1 AS (SELECT dn.groupid AS groupid, MIN(sh.logicalrelid::regclass::text) FILTER (WHERE replicationfactor != -1 "
+		"AND relation.relnamespace = $1 AND starts_with(relation.relname, 'documents_')) AS table_ids "
+		"FROM pg_dist_node dn LEFT OUTER JOIN pg_dist_placement pl on dn.groupid = pl.groupid JOIN pg_dist_shard sh "
+		"ON pl.shardid = sh.shardid JOIN pg_dist_partition pt on pt.logicalrelid = sh.logicalrelid "
+		"JOIN pg_dist_colocation cl on pt.colocationid = cl.colocationid JOIN pg_class relation on relation.oid = sh.logicalrelid GROUP BY dn.groupid) "
+		"SELECT array_agg(table_ids ORDER BY groupid) FROM r1;";
 
 	int nargs = 1;
-	Oid argTypes[1] = { TEXTOID };
-	Datum argValues[1] = { CStringGetTextDatum(distributedTableName) };
+	Oid argTypes[1] = { OIDOID };
+	Datum argValues[1] = { ObjectIdGetDatum(ApiDataNamespaceOid()) };
 	bool isReadOnly = true;
 	bool isNull = true;
 	Datum result = ExtensionExecuteQueryWithArgsViaSPI(query, nargs, argTypes, argValues,
@@ -67,16 +102,16 @@ CoordinatorHasShardsForTable(const char *distributedTableName)
 
 	if (isNull)
 	{
-		return false;
+		return NULL;
 	}
 
-	return DatumGetInt32(result) > 0;
+	return DatumGetArrayTypeP(result);
 }
 
 
-List *
-ExecutePerNodeCommand(Oid nodeFunction, pgbson *nodeFunctionArg, bool readOnly, const
-					  char *distributedTableName, bool backFillCoordinator)
+static List *
+ExecutePerNodeCommandCore(Oid nodeFunction, pgbson *nodeFunctionArg, bool readOnly,
+						  const char *distributedTableName)
 {
 	ArrayType *chosenShards = ChooseShardNamesForTable(distributedTableName);
 	if (chosenShards == NULL)
@@ -111,16 +146,19 @@ ExecutePerNodeCommand(Oid nodeFunction, pgbson *nodeFunctionArg, bool readOnly, 
 	StringInfoData s;
 	initStringInfo(&s);
 	appendStringInfo(&s,
-					 "SELECT %s.command_node_worker($1::oid, $2::%s.bson, 0, $3::text[], TRUE, NULL) FROM %s",
+					 "SELECT %s.command_node_worker($1::oid, $2::%s.bson, 0, $3::text[], TRUE, $4::text) FROM %s",
 					 ApiInternalSchemaNameV2, CoreSchemaNameV2, distributedTableName);
-	int nargs = 3;
-	Oid argTypes[3] = { OIDOID, BsonTypeId(), TEXTARRAYOID };
-	Datum argValues[3] = {
+
+	/* Function OIDs are node-local; send a qualified signature for worker lookup. */
+	int nargs = 4;
+	Oid argTypes[4] = { OIDOID, BsonTypeId(), TEXTARRAYOID, TEXTOID };
+	Datum argValues[4] = {
 		ObjectIdGetDatum(nodeFunction),
 		PointerGetDatum(nodeFunctionArg),
-		PointerGetDatum(chosenShards)
+		PointerGetDatum(chosenShards),
+		CStringGetTextDatum(format_procedure_qualified(nodeFunction))
 	};
-	char argNulls[3] = { ' ', ' ', ' ' };
+	char argNulls[4] = { ' ', ' ', ' ', ' ' };
 
 	List *resultList = NIL;
 
@@ -152,17 +190,108 @@ ExecutePerNodeCommand(Oid nodeFunction, pgbson *nodeFunctionArg, bool readOnly, 
 
 	SPI_finish();
 
+	return resultList;
+}
+
+
+List *
+ExecutePerNodeCommand(Oid nodeFunction, pgbson *nodeFunctionArg, bool readOnly, const
+					  char *distributedTableName, bool backFillCoordinator)
+{
+	if (IsSingleNodeCluster())
+	{
+		Datum result = OidFunctionCall1(nodeFunction, PointerGetDatum(nodeFunctionArg));
+		return list_make1(DatumGetPgBson(result));
+	}
+
+	ArrayType *chosenTables = GetTablesNamesPerNode();
+	if (chosenTables == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("Failed to get shards for table per node"),
+						errdetail_log(
+							"Failed to get shard names for distributed table %s",
+							distributedTableName)));
+	}
+
+	Datum *perNodeTables;
+	bool *perNodeNulls;
+	int numNodes = 0;
+	deconstruct_array(chosenTables, TEXTOID, -1, false, TYPALIGN_INT, &perNodeTables,
+					  &perNodeNulls, &numNodes);
+
+	if (numNodes == 0)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("No nodes found for distributed table"),
+						errdetail_log(
+							"No nodes found for distributed table %s",
+							distributedTableName)));
+	}
+
+	HTAB *tableNames = CreateStringViewHashSet();
+
+	List *finalResults = NIL;
+	bool coordinatorHasNoPlacements = false;
+	for (int i = 0; i < numNodes; i++)
+	{
+		if (perNodeNulls[i])
+		{
+			if (i == 0)
+			{
+				coordinatorHasNoPlacements = true;
+			}
+			else
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+								errmsg("Node %d has no placements for distributed table",
+									   i),
+								errdetail_log(
+									"Node %d has no placements for distributed table %s",
+									i, distributedTableName)));
+			}
+
+			/* There is no table to dispatch over for this node. */
+			continue;
+		}
+
+		text *tableName = DatumGetTextP(perNodeTables[i]);
+		StringView tableNameView = CreateStringViewFromText(tableName);
+
+		bool foundKey = false;
+		hash_search(tableNames, &tableNameView, HASH_FIND, &foundKey);
+
+		if (foundKey)
+		{
+			/* We already handled this node via this table, move on */
+			continue;
+		}
+
+		hash_search(tableNames, &tableNameView, HASH_ENTER, &foundKey);
+
+		char *tableNameCStr = text_to_cstring(tableName);
+		List *nodeLevelResults = ExecutePerNodeCommandCore(nodeFunction, nodeFunctionArg,
+														   readOnly, tableNameCStr);
+		pfree(tableNameCStr);
+		finalResults = list_concat(finalResults, nodeLevelResults);
+	}
+
+	pfree(perNodeTables);
+	pfree(perNodeNulls);
+	pfree(chosenTables);
+	hash_destroy(tableNames);
+
 	/* If requested, also run on the coordinator if it doesn't have shards for the table as the command_node_worker
 	 * only runs on nodes with shards for the given table. We need to ensure metadata and system catalog are consistent in the coordinator
 	 * specially for management operations like add node, rebalancing, etc. */
-	if (backFillCoordinator && IsMetadataCoordinator() && !CoordinatorHasShardsForTable(
-			distributedTableName))
+	if (backFillCoordinator && IsMetadataCoordinator() &&
+		coordinatorHasNoPlacements)
 	{
 		Datum result = OidFunctionCall1(nodeFunction,
 										PointerGetDatum(nodeFunctionArg));
 		pgbson *resultBson = DatumGetPgBson(result);
-		resultList = lappend(resultList, resultBson);
+		finalResults = lappend(finalResults, resultBson);
 	}
 
-	return resultList;
+	return finalResults;
 }

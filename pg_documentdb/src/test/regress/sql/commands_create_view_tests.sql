@@ -117,6 +117,12 @@ SELECT documentdb_api.create_collection_view('db', FORMAT('{ "create": "create_v
 SELECT documentdb_api.insert_one('db', 'targetCollection', '{ "_id" : 1, "a" : 2, "b" : 3 }', NULL);
 SELECT documentdb_api.insert_one('db', 'targetCollection', '{ "_id" : 2, "a" : 1, "b" : 2 }', NULL);
 SELECT documentdb_api.insert_one('db', 'targetCollection', '{ "_id" : 3, "a" : 3, "b" : 1 }', NULL);
+
+-- The find filter must run above the view's group stage.
+SELECT documentdb_api.create_collection_view('db', '{ "create": "targetGroupedView", "viewOn": "targetCollection", "pipeline": [ { "$group": { "_id": "$b", "count": { "$sum": 1 } } } ] }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_find('db', '{ "find": "targetGroupedView", "filter": { "_id": 1 } }');
+SELECT documentdb_api.drop_collection('db', 'targetGroupedView');
+
 SELECT documentdb_api.create_collection_view('db', '{ "create": "targetViewToSort", "viewOn": "targetCollection", "pipeline": [ { "$sort": { "_id": 1 } } ] }');
 SELECT document FROM documentdb_api_catalog.bson_aggregation_find('db', '{ "find": "targetViewToSort", "projection": {}, "sort": { "$natural": 1 }}');
 SELECT document FROM documentdb_api_catalog.bson_aggregation_find('db', '{ "find": "targetViewToSort", "projection": {}, "sort": { "$natural": -1 }}');
@@ -127,3 +133,15 @@ SELECT document FROM documentdb_api_catalog.bson_aggregation_pipeline('db', '{ "
 SELECT document FROM documentdb_api_catalog.bson_aggregation_pipeline('db', '{ "aggregate": "targetViewToSort", "pipeline": [ { "$project": { "sum": { "$add": ["$a", "$b"] } } }, { "$sort": { "$natural": 1 } } ] }');
 SELECT document FROM documentdb_api_catalog.bson_aggregation_pipeline('db', '{ "aggregate": "targetViewToSort", "pipeline": [ { "$project": { "sum": { "$add": ["$a", "$b"] } } }, { "$sort": { "$natural": -1 } } ] }');
 SELECT drop_collection('db','targetCollection');
+
+-- Find filters apply after a view's terminal grouping stage.
+SELECT documentdb_api.insert_one('db', 'grouped_orders_source', '{ "_id": 1, "regionCode": "region_west" }');
+SELECT documentdb_api.insert_one('db', 'grouped_orders_source', '{ "_id": 2, "regionCode": "region_west" }');
+SELECT documentdb_api.insert_one('db', 'grouped_orders_source', '{ "_id": 3, "regionCode": "region_east" }');
+SELECT documentdb_api.create_collection_view('db', '{ "create": "grouped_orders_view", "viewOn": "grouped_orders_source", "pipeline": [ { "$group": { "_id": "$regionCode", "totalDocuments": { "$count": {} } } } ] }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_find('db', '{ "find": "grouped_orders_view", "filter": { "_id": "region_west" } }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_pipeline('db', '{ "aggregate": "grouped_orders_view", "pipeline": [ { "$match": { "_id": "region_west" } } ] }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_count('db', '{ "count": "grouped_orders_view", "query": { "_id": "region_west" } }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_count('db', '{ "count": "grouped_orders_view" }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_distinct('db', '{ "distinct": "grouped_orders_view", "key": "_id", "query": { "_id": "region_west" } }');
+SELECT document FROM documentdb_api_catalog.bson_aggregation_distinct('db', '{ "distinct": "grouped_orders_view", "key": "_id" }');

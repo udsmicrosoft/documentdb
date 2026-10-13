@@ -63,7 +63,7 @@ scenario_external_connections() {
     # Runtime-generated so no credential literal lives in source (CredScan).
     local pw; pw="$(openssl rand -hex 12)Aa1!"
     docker run -d --name "${c}" -P \
-        -e USERNAME=admin -e PASSWORD="${pw}" \
+        -e USERNAME=admin -e PASSWORD="${pw}" -e DOCUMENTDB_USAGE_TELEMETRY=false \
         "${IMAGE}" >/dev/null 2>&1 || { fail "C1: container failed to start"; return; }
     if ! wait_for_ready "${c}" 240; then
         docker logs --tail 30 "${c}" 2>&1 | tail -20 >&2
@@ -127,7 +127,7 @@ scenario_gateway_self_exit() {
     # user persisted in the volume still authenticates.
     local pw; pw="$(openssl rand -hex 12)Aa1!"
     docker run -d --name "${c}" -v "${vol}:/data" \
-        -e USERNAME=admin -e PASSWORD="${pw}" \
+        -e USERNAME=admin -e PASSWORD="${pw}" -e DOCUMENTDB_USAGE_TELEMETRY=false \
         "${IMAGE}" >/dev/null 2>&1 || { fail "C3: container failed to start"; return; }
     if ! wait_for_ready "${c}" 240; then
         docker logs --tail 30 "${c}" 2>&1 | tail -20 >&2
@@ -174,7 +174,7 @@ scenario_gateway_self_exit() {
     CONTAINERS+=("${c2}")
     docker rm -f "${c2}" >/dev/null 2>&1
     docker run -d --name "${c2}" -v "${vol}:/data" \
-        -e USERNAME=admin -e PASSWORD="${pw}" \
+        -e USERNAME=admin -e PASSWORD="${pw}" -e DOCUMENTDB_USAGE_TELEMETRY=false \
         "${IMAGE}" >/dev/null 2>&1 || { fail "C3: restart container failed to start"; return; }
     if wait_for_ready "${c2}" 240; then
         pass "C3: second boot on the same volume became ready"
@@ -199,7 +199,7 @@ scenario_password_handling() {
     local special='pa"ss'\''w0rd\!x'
     log "C4: starting with a special-character admin password"
     docker run -d --name "${c}" \
-        -e USERNAME=admin -e PASSWORD="${special}" \
+        -e USERNAME=admin -e PASSWORD="${special}" -e DOCUMENTDB_USAGE_TELEMETRY=false \
         "${IMAGE}" >/dev/null 2>&1 || { fail "C4: container failed to start"; return; }
     if ! wait_for_ready "${c}" 240; then
         docker logs --tail 40 "${c}" 2>&1 | tail -25 >&2
@@ -277,6 +277,7 @@ echo "$verdict"
     log "C4: starting with a blocked username (create_user must fail the run)"
     docker run -d --name "${c2}" \
         -e USERNAME=documentdb_blocked -e PASSWORD="$(openssl rand -hex 12)Aa1!" \
+        -e DOCUMENTDB_USAGE_TELEMETRY=false \
         "${IMAGE}" >/dev/null 2>&1 || { fail "C4: blocked-user container failed to start"; return; }
     local waited=0 state=""
     while (( waited < 240 )); do

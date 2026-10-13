@@ -1,18 +1,23 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+-- SPDX-License-Identifier: MIT
 -- Tests for dynamic cursor behavior with index scans: validates that streaming
 -- cursors are used for simple ordered index scans with filters, and that
--- skip or limit causes a fallback to persistent cursors.
+-- eligible find commands with skip or limit use dynamic streaming cursors.
 SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog,documentdb_api_internal;
 SET documentdb.next_collection_id TO 41000;
 SET citus.next_shard_id TO 4100000;
 SET documentdb.next_collection_index_id TO 41000;
 SET documentdb.enableDynamicCursors TO on;
 SET documentdb.enable_dynamic_cursor_early_index_lock_release TO on;
+SET documentdb.enable_dynamic_cursor_with_skiplimit TO on;
 SET documentdb.enableIndexOnlyScanForFindProject TO on;
 SET enable_seqscan TO off;
 DO $$
 DECLARE
     dynamic_cursor_nodes int;
     lock_release_nodes int;
+    skip_limit_nodes int;
     reloaded_nodes int;
 BEGIN
     SELECT count(*) INTO dynamic_cursor_nodes
@@ -25,11 +30,17 @@ BEGIN
         $cmd$ALTER SYSTEM SET documentdb.enable_dynamic_cursor_early_index_lock_release = 'on'$cmd$)
     WHERE success;
 
+    SELECT count(*) INTO skip_limit_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM SET documentdb.enable_dynamic_cursor_with_skiplimit = 'on'$cmd$)
+    WHERE success;
+
     SELECT count(*) INTO reloaded_nodes
     FROM run_command_on_all_nodes($cmd$SELECT pg_reload_conf()$cmd$)
     WHERE success;
 
-    IF dynamic_cursor_nodes <> 2 OR lock_release_nodes <> 2 OR reloaded_nodes <> 2 THEN
+    IF dynamic_cursor_nodes <> 2 OR lock_release_nodes <> 2 OR
+       skip_limit_nodes <> 2 OR reloaded_nodes <> 2 THEN
         RAISE EXCEPTION 'failed to configure all nodes';
     END IF;
 END
@@ -109,7 +120,10 @@ FROM run_command_on_workers($worker$
          JOIN pg_class t ON t.oid = i.indrelid
     WHERE l.pid = pg_backend_pid() AND
           l.mode = 'AccessShareLock' AND
-          t.relname LIKE 'documents_41000_%';
+          t.relname LIKE (
+              SELECT format('documents_%s_%%', collection_id)
+              FROM documentdb_api_catalog.collections
+              WHERE database_name = 'dyncur_sp_db' AND collection_name = 'sp_coll');
 $worker$);
  only_used_index_lock_held 
 ---------------------------------------------------------------------
@@ -144,7 +158,10 @@ FROM run_command_on_workers($worker$
          JOIN pg_class t ON t.oid = i.indrelid
     WHERE l.pid = pg_backend_pid() AND
           l.mode = 'AccessShareLock' AND
-          t.relname LIKE 'documents_41000_%';
+          t.relname LIKE (
+              SELECT format('documents_%s_%%', collection_id)
+              FROM documentdb_api_catalog.collections
+              WHERE database_name = 'dyncur_sp_db' AND collection_name = 'sp_coll');
 $worker$);
  all_index_locks_held 
 ---------------------------------------------------------------------
@@ -439,22 +456,22 @@ NOTICE:  Done: drained 3 pages
 
 -- ===========================================================================
 -- SECTION B: Cursors with skip or limit
--- Skip and limit force persistent cursors (the planner wraps the scan with
--- Limit/Offset nodes, preventing streaming). This applies regardless of
--- whether the sort matches the index.
+-- Eligible find commands with positive skip or limit stream when the ordered
+-- index satisfies the query. The continuation clears a consumed offset and
+-- tracks the remaining limit across pages.
 -- ===========================================================================
 -- ---------------------------------------------------------------------------
--- Test B1: sort + limit - persistent cursor (limit wraps scan node)
+-- Test B1: sort + limit - dynamic streaming cursor
 -- limit: 10 with batchSize: 3
--- OBSERVATION: persistent cursor - limit node wraps the custom scan
+-- The remaining limit is tracked across pages.
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 10, "batchSize": 3 }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
     false);
-NOTICE:  Page 1: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 3: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
+NOTICE:  Page 2: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
+NOTICE:  Page 3: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
 NOTICE:  Page 4: batch=1, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 4 pages
  remote_drain_and_report 
@@ -463,18 +480,18 @@ NOTICE:  Done: drained 4 pages
 (1 row)
 
 -- ---------------------------------------------------------------------------
--- Test B2: sort + skip - persistent cursor
+-- Test B2: sort + skip - dynamic streaming cursor
 -- skip: 5, batchSize: 3
--- OBSERVATION: persistent cursor, 15 docs returned (20 - 5 skipped)
+-- The offset is consumed once, returning 15 docs (20 - 5 skipped).
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
-    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 3 }',
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 3, "hint": "idx_val_asc" }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
     false);
-NOTICE:  Page 1: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 3: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 4: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41001_4100000, portal=<NULL>
+NOTICE:  Page 2: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41001_4100000, portal=<NULL>
+NOTICE:  Page 3: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41001_4100000, portal=<NULL>
+NOTICE:  Page 4: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41001_4100000, portal=<NULL>
 NOTICE:  Page 5: batch=3, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 5 pages
  remote_drain_and_report 
@@ -483,17 +500,17 @@ NOTICE:  Done: drained 5 pages
 (1 row)
 
 -- ---------------------------------------------------------------------------
--- Test B3: sort + skip + limit - persistent cursor
+-- Test B3: sort + skip + limit - dynamic streaming cursor
 -- skip: 3, limit: 7, batchSize: 2
--- OBSERVATION: persistent cursor, 7 docs returned (docs 4-10 by val order)
+-- Returns 7 docs (docs 4-10 by val order) across streaming pages.
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
-    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 3, "limit": 7, "batchSize": 2 }',
+    '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 3, "limit": 7, "batchSize": 2, "hint": "idx_val_asc" }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
     false);
-NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 3: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41001_4100000, portal=<NULL>
+NOTICE:  Page 2: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41001_4100000, portal=<NULL>
+NOTICE:  Page 3: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41001_4100000, portal=<NULL>
 NOTICE:  Page 4: batch=1, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 4 pages
  remote_drain_and_report 
@@ -502,7 +519,7 @@ NOTICE:  Done: drained 4 pages
 (1 row)
 
 -- ---------------------------------------------------------------------------
--- Test B4: sort + skip=0 behaves same as sort only (persistent cursor)
+-- Test B4: sort + skip=0 behaves the same as the streaming sort-only query
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 0, "batchSize": 5 }',
@@ -519,17 +536,17 @@ NOTICE:  Done: drained 4 pages
 (1 row)
 
 -- ---------------------------------------------------------------------------
--- Test B5: sort + limit >= total docs - still persistent
+-- Test B5: sort + limit >= total docs - dynamic streaming cursor
 -- limit: 100 with only 20 docs
--- OBSERVATION: persistent cursor even though limit exceeds row count
+-- Streaming ends when the collection is exhausted before the limit.
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 100, "batchSize": 5 }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 5 }',
     false);
-NOTICE:  Page 1: batch=5, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=5, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 3: batch=5, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=5, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
+NOTICE:  Page 2: batch=5, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
+NOTICE:  Page 3: batch=5, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
 NOTICE:  Page 4: batch=5, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 4 pages
  remote_drain_and_report 
@@ -539,19 +556,19 @@ NOTICE:  Done: drained 4 pages
 
 -- ===========================================================================
 -- SECTION C: Filter + sort + skip/limit combinations on compound index
--- All produce persistent cursors because sort is present.
+-- All stream because the compound index satisfies the filter and sort.
 -- ===========================================================================
 -- ---------------------------------------------------------------------------
 -- Test C1: Filter + sort + limit on compound index
 -- filter: { cat: "odd" }, sort: { val: 1 }, limit: 5, batchSize: 2
--- 10 "odd" docs, limited to 5 => persistent cursor
+-- 10 "odd" docs, limited to 5 across streaming pages
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_coll", "filter": { "cat": "odd" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 5, "batchSize": 2, "hint": "idx_cat_val" }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
     false);
-NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41002_4100000, portal=<NULL>
+NOTICE:  Page 2: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41002_4100000, portal=<NULL>
 NOTICE:  Page 3: batch=1, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 3 pages
  remote_drain_and_report 
@@ -562,15 +579,15 @@ NOTICE:  Done: drained 3 pages
 -- ---------------------------------------------------------------------------
 -- Test C2: Filter + sort + skip on compound index
 -- filter: { cat: "even" }, sort: { val": 1 }, skip: 3, batchSize: 2
--- 10 "even" docs, skip 3 => 7 docs, persistent cursor
+-- 10 "even" docs, skip 3 => 7 docs across streaming pages
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_coll", "filter": { "cat": "even" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 3, "batchSize": 2, "hint": "idx_cat_val" }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
     false);
-NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 3: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41002_4100000, portal=<NULL>
+NOTICE:  Page 2: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41002_4100000, portal=<NULL>
+NOTICE:  Page 3: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41002_4100000, portal=<NULL>
 NOTICE:  Page 4: batch=1, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 4 pages
  remote_drain_and_report 
@@ -581,13 +598,13 @@ NOTICE:  Done: drained 4 pages
 -- ---------------------------------------------------------------------------
 -- Test C3: Filter + sort + skip + limit on compound index
 -- filter: { cat: "even" }, sort: { val: 1 }, skip: 2, limit: 4, batchSize: 2
--- 10 "even" docs, skip 2, take 4 => 4 docs, persistent cursor
+-- 10 "even" docs, skip 2, take 4 => 4 docs across streaming pages
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_coll", "filter": { "cat": "even" }, "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 2, "limit": 4, "batchSize": 2, "hint": "idx_cat_val" }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
     false);
-NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=2, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41002_4100000, portal=<NULL>
 NOTICE:  Page 2: batch=2, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 2 pages
  remote_drain_and_report 
@@ -634,21 +651,21 @@ $cmd$);
 
 -- ---------------------------------------------------------------------------
 -- Test D2: EXPLAIN for cursor with limit
--- The limit should cause the planner to produce a Limit node which prevents
--- the dynamic cursor scan from streaming
+-- The plain worker plan contains a Limit node. The cursor path authorizes that
+-- node for dynamic streaming when skip/limit streaming is enabled.
 -- ---------------------------------------------------------------------------
 SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
 EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
     '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 10, "batchSize": 5 }');
 $cmd$);
-                                                                                                                                                                                                                                                                                                                                                                                                       run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                                                                                                                                                       run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                       
 ---------------------------------------------------------------------
  Custom Scan (Citus Adaptive)
    Output: remote_scan.document
    Task Count: 1
    Tasks Shown: All
    ->  Task
-         Query: SELECT documentdb_api_internal.bson_dollar_project_find(document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson) AS document FROM documentdb_data.documents_41000_4100000 collection WHERE ((shard_key_value OPERATOR(pg_catalog.=) '41000'::bigint) AND documentdb_api_internal.cursor_tracker(document, '{ "allowOffsetLimitNode" : false }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) ORDER BY (documentdb_api_catalog.bson_orderby(document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) NULLS FIRST LIMIT '10'::bigint
+         Query: SELECT documentdb_api_internal.bson_dollar_project_find(document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson) AS document FROM documentdb_data.documents_41000_4100000 collection WHERE ((shard_key_value OPERATOR(pg_catalog.=) '41000'::bigint) AND documentdb_api_internal.cursor_tracker(document, '{ "allowOffsetLimitNode" : true }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) ORDER BY (documentdb_api_catalog.bson_orderby(document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) NULLS FIRST LIMIT '10'::bigint
          Node: host=localhost port=58081 dbname=postgres
          ->  Limit
                Output: (documentdb_api_internal.bson_dollar_project_find(document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson)), (documentdb_api_catalog.bson_orderby(document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson))
@@ -667,14 +684,14 @@ SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
 EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
     '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 5 }');
 $cmd$);
-                                                                                                                                                                                                                                                                                                                                                                                                                                                    run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                    run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                                                    
 ---------------------------------------------------------------------
  Custom Scan (Citus Adaptive)
    Output: remote_scan.document
    Task Count: 1
    Tasks Shown: All
    ->  Task
-         Query: SELECT documentdb_api_internal.bson_dollar_project_find(document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson) AS document FROM (SELECT collection.document FROM documentdb_data.documents_41000_4100000 collection WHERE ((collection.shard_key_value OPERATOR(pg_catalog.=) '41000'::bigint) AND documentdb_api_internal.cursor_tracker(collection.document, '{ "allowOffsetLimitNode" : false }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) ORDER BY (documentdb_api_catalog.bson_orderby(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) NULLS FIRST OFFSET '5'::bigint) agg_stage_2
+         Query: SELECT documentdb_api_internal.bson_dollar_project_find(document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson) AS document FROM (SELECT collection.document FROM documentdb_data.documents_41000_4100000 collection WHERE ((collection.shard_key_value OPERATOR(pg_catalog.=) '41000'::bigint) AND documentdb_api_internal.cursor_tracker(collection.document, '{ "allowOffsetLimitNode" : true }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) ORDER BY (documentdb_api_catalog.bson_orderby(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) NULLS FIRST OFFSET '5'::bigint) agg_stage_2
          Node: host=localhost port=58081 dbname=postgres
          ->  Subquery Scan on agg_stage_2
                Output: documentdb_api_internal.bson_dollar_project_find(agg_stage_2.document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson)
@@ -694,14 +711,14 @@ SELECT documentdb_distributed_test_helpers.run_explain_and_trim($cmd$
 EXPLAIN (VERBOSE ON, COSTS OFF) SELECT document FROM bson_aggregation_find('dyncur_sp_db',
     '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 3, "limit": 7, "batchSize": 5 }');
 $cmd$);
-                                                                                                                                                                                                                                                                                                                                                                                                                                                             run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                                                                                                                                                                                                                             run_explain_and_trim                                                                                                                                                                                                                                                                                                                                                                                                                                                             
 ---------------------------------------------------------------------
  Custom Scan (Citus Adaptive)
    Output: remote_scan.document
    Task Count: 1
    Tasks Shown: All
    ->  Task
-         Query: SELECT documentdb_api_internal.bson_dollar_project_find(document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson) AS document FROM (SELECT collection.document FROM documentdb_data.documents_41000_4100000 collection WHERE ((collection.shard_key_value OPERATOR(pg_catalog.=) '41000'::bigint) AND documentdb_api_internal.cursor_tracker(collection.document, '{ "allowOffsetLimitNode" : false }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) ORDER BY (documentdb_api_catalog.bson_orderby(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) NULLS FIRST OFFSET '3'::bigint LIMIT '7'::bigint) agg_stage_3
+         Query: SELECT documentdb_api_internal.bson_dollar_project_find(document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson) AS document FROM (SELECT collection.document FROM documentdb_data.documents_41000_4100000 collection WHERE ((collection.shard_key_value OPERATOR(pg_catalog.=) '41000'::bigint) AND documentdb_api_internal.cursor_tracker(collection.document, '{ "allowOffsetLimitNode" : true }'::documentdb_core.bson) AND documentdb_api_internal.bson_dollar_fullscan(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) ORDER BY (documentdb_api_catalog.bson_orderby(collection.document, '{ "val" : { "$numberInt" : "1" } }'::documentdb_core.bson)) NULLS FIRST OFFSET '3'::bigint LIMIT '7'::bigint) agg_stage_3
          Node: host=localhost port=58081 dbname=postgres
          ->  Subquery Scan on agg_stage_3
                Output: documentdb_api_internal.bson_dollar_project_find(agg_stage_3.document, '{ "_id" : { "$numberInt" : "1" }, "val" : { "$numberInt" : "1" } }'::documentdb_core.bson, '{ }'::documentdb_core.bson, '{ "now" : NOW_SYS_VARIABLE }'::documentdb_core.bson)
@@ -780,7 +797,7 @@ FROM cursor_get_more(database => 'dyncur_sp_db',
 
 DROP TABLE sp_first_page_response;
 -- ---------------------------------------------------------------------------
--- Test E2: File-based cursor with skip returns correct offset results
+-- Test E2: Streaming cursor with skip returns correct offset results
 -- skip: 5, sort: { val: 1 } - first batch should start from val=60 (6th doc)
 -- ---------------------------------------------------------------------------
 CREATE TEMP TABLE sp_skip_response AS
@@ -789,8 +806,8 @@ SELECT bson_dollar_project(cursorpage, '{ "cursor.firstBatch._id": 1, "cursor.fi
 FROM find_cursor_first_page(database => 'dyncur_sp_db',
     commandSpec => '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 3 }',
     cursorId => 538);
--- persistconnection is false: a skip query drains via a worker file cursor
--- (state persisted to a file, not a held connection)
+-- persistconnection is false because the remote worker returns a dynamic
+-- streaming continuation rather than holding a connection.
 SELECT cp, persistconnection FROM sp_skip_response;
                                                                                                                                           cp                                                                                                                                           | persistconnection 
 ---------------------------------------------------------------------
@@ -799,7 +816,7 @@ SELECT cp, persistconnection FROM sp_skip_response;
 
 DROP TABLE sp_skip_response;
 -- ---------------------------------------------------------------------------
--- Test E3: File-based cursor with limit returns correct count
+-- Test E3: Streaming cursor with limit returns correct count
 -- limit: 7, sort: { val: 1 }, batchSize: 3
 -- Should return exactly 7 docs total across all batches
 -- ---------------------------------------------------------------------------
@@ -807,8 +824,8 @@ SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_coll", "sort": { "val": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 7, "batchSize": 3 }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
     false);
-NOTICE:  Page 1: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=3, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
+NOTICE:  Page 2: batch=3, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_SecondaryIndexScan, remote_shard=documents_41000_4100000, idx=documents_rum_index_41003_4100000, portal=<NULL>
 NOTICE:  Page 3: batch=1, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 3 pages
  remote_drain_and_report 
@@ -1970,16 +1987,16 @@ NOTICE:  Done: drained 3 pages
 (1 row)
 
 -- ---------------------------------------------------------------------------
--- Test H6: Primary key scan with skip + ascending sort → persistent
+-- Test H6: Primary key scan with skip + ascending sort -> streaming
 -- sort: { _id: 1 }, skip: 5
--- Skip always forces persistent regardless of scan type.
+-- The primary key ordering supports dynamic skip streaming.
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_pk_coll", "sort": { "_id": 1 }, "projection": { "_id": 1, "val": 1 }, "skip": 5, "batchSize": 5, "hint": "_id_" }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
     false);
-NOTICE:  Page 1: batch=5, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
-NOTICE:  Page 2: batch=5, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=5, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_PrimaryKeyScan, remote_shard=documents_41003_4100006, idx=collection_pk_41003_4100006, portal=<NULL>
+NOTICE:  Page 2: batch=5, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_PrimaryKeyScan, remote_shard=documents_41003_4100006, idx=collection_pk_41003_4100006, portal=<NULL>
 NOTICE:  Page 3: batch=5, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 3 pages
  remote_drain_and_report 
@@ -1988,15 +2005,15 @@ NOTICE:  Done: drained 3 pages
 (1 row)
 
 -- ---------------------------------------------------------------------------
--- Test H7: Primary key scan with limit + ascending sort → persistent
+-- Test H7: Primary key scan with limit + ascending sort -> streaming
 -- sort: { _id: 1 }, limit: 10
--- Limit always forces persistent regardless of scan type.
+-- The primary key ordering supports dynamic limit streaming.
 -- ---------------------------------------------------------------------------
 SELECT * FROM remote_drain_and_report(
     '{ "find": "sp_pk_coll", "sort": { "_id": 1 }, "projection": { "_id": 1, "val": 1 }, "limit": 10, "batchSize": 5, "hint": "_id_" }',
     '{ "getMore": { "$numberLong": "538" }, "collection": "sp_pk_coll", "batchSize": 5 }',
     false);
-NOTICE:  Page 1: batch=5, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 1: batch=5, coordinator_holds_portal=f, kind=DynamicStreamingRemote, scan_type=QueryScanType_PrimaryKeyScan, remote_shard=documents_41003_4100006, idx=collection_pk_41003_4100006, portal=<NULL>
 NOTICE:  Page 2: batch=5, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
 NOTICE:  Done: drained 2 pages
  remote_drain_and_report 
@@ -2161,8 +2178,8 @@ NOTICE:  Done: drained 2 pages
 -- | H3   | {_id:1}       | _id >= 5     | primary key  | streaming   | OK        |
 -- | H4   | {_id:-1}      | _id <= 15    | primary key  | streaming   | OK        |
 -- | H5   | -             | _id range    | primary key  | streaming   | OK        |
--- | H6   | {_id:1}       | - (skip:5)   | primary key  | persistent  | OK        |
--- | H7   | {_id:1}       | - (limit:10) | primary key  | persistent  | OK        |
+-- | H6   | {_id:1}       | - (skip:5)   | primary key  | streaming   | OK        |
+-- | H7   | {_id:1}       | - (limit:10) | primary key  | streaming   | OK        |
 -- | H8   | {a:-1,b:-1}   | -            | idx_ab_asc   | streaming   | OK        |
 -- | H9   | {a:-1,b:1}    | -            | idx_a1_b-1   | streaming   | OK        |
 -- | H10  | {a:1}         | -            | idx_a_desc   | streaming   | OK        |
@@ -2339,13 +2356,377 @@ NOTICE:  Done: drained 2 pages
 
 SET documentdb.enableCursorsOnAggregationQueryRewrite TO off;
 -- ===========================================================================
+-- SECTION I: no-sort skip / limit windows on the remote-unsharded worker
+--
+-- Sections B/C/E already cover skip/limit with an explicit sort (drained via the
+-- dynamic streaming cursor). This section fills the remaining gap: skip/limit
+-- with NO sort clause (order-unspecified windows), skip edge cases (== total,
+-- > total), the aggregation $skip/$limit forms, and a collection with no
+-- secondary index.
+--
+-- Eligible find windows use a dynamic streaming cursor. Aggregation stage forms
+-- remain worker file cursors because skip/limit streaming is find-only. The
+-- helper reports the total drained count and classification, so it is stable
+-- for order-unspecified results.
+-- ===========================================================================
+CREATE OR REPLACE FUNCTION remote_window_report(
+    p_label   text,
+    p_find    text,
+    p_getmore text,
+    p_is_agg  bool DEFAULT false
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_page    documentdb_core.bson;
+    v_cont    documentdb_core.bson;
+    v_persist bool;
+    v_total   bigint := 0;
+    v_batch   bigint;
+    v_kind    text := 'Done';
+BEGIN
+    IF p_is_agg THEN
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM aggregate_cursor_first_page(database => 'dyncur_sp_db',
+            commandSpec => p_find::documentdb_core.bson, cursorId => 538) fp;
+    ELSE
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM find_cursor_first_page(database => 'dyncur_sp_db',
+            commandSpec => p_find::documentdb_core.bson, cursorId => 538) fp;
+    END IF;
+
+    SELECT (bson_dollar_project(v_page,
+        '{ "c": { "$size": { "$ifNull": ["$cursor.firstBatch", []] } } }') ->> 'c')::bigint
+    INTO v_batch;
+    v_total := v_total + COALESCE(v_batch, 0);
+
+    IF v_cont IS NOT NULL THEN
+        IF (bson_dollar_project(v_cont, '{ "qr": 1 }') ->> 'qr') IS NOT NULL THEN
+            IF (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type') IS NOT NULL THEN
+                v_kind := 'DynamicStreamingRemote';
+            ELSIF (bson_dollar_project(v_cont, '{ "wc.qf": 1 }') ->> 'wc.qf') IS NOT NULL THEN
+                v_kind := 'DynamicFileCursorRemote';
+            ELSE
+                v_kind := 'DynamicHoldPortalRemote';
+            END IF;
+        ELSIF v_persist THEN
+            v_kind := 'Persisted';
+        ELSE
+            v_kind := 'Unknown';
+        END IF;
+    END IF;
+
+    WHILE v_cont IS NOT NULL LOOP
+        SELECT gm.cursorPage, gm.continuation
+        INTO v_page, v_cont
+        FROM cursor_get_more(database => 'dyncur_sp_db',
+            getMoreSpec => p_getmore::documentdb_core.bson,
+            continuationSpec => v_cont) gm;
+
+        SELECT (bson_dollar_project(v_page,
+            '{ "c": { "$size": { "$ifNull": ["$cursor.nextBatch", []] } } }') ->> 'c')::bigint
+        INTO v_batch;
+        v_total := v_total + COALESCE(v_batch, 0);
+    END LOOP;
+
+    RETURN format('%s: total=%s, coordinator_holds_portal=%s, kind=%s',
+        p_label, v_total, v_persist, v_kind);
+END;
+$$;
+-- A collection with NO secondary index (only the implicit _id primary key), on
+-- the remote worker, to exercise skip/limit windows without an index available.
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_noidx_coll');
+ drop_collection 
+---------------------------------------------------------------------
+ f
+(1 row)
+
+SELECT COUNT(documentdb_api.insert_one('dyncur_sp_db', 'sp_noidx_coll',
+    FORMAT('{ "_id": %s, "k": %s }', i, i)::documentdb_core.bson))
+FROM generate_series(1, 15) AS i;
+NOTICE:  creating collection
+ count 
+---------------------------------------------------------------------
+    15
+(1 row)
+
+ANALYZE;
+CALL documentdb_distributed_test_helpers.place_collection_on_node('dyncur_sp_db', 'sp_noidx_coll', 1);
+-- I1 (S2): no-sort skip>0 -> streaming worker cursor, 15 rows
+SELECT remote_window_report('I1 no-sort skip>0',
+    '{ "find": "sp_coll", "skip": 5, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+                                 remote_window_report                                 
+---------------------------------------------------------------------
+ I1 no-sort skip>0: total=15, coordinator_holds_portal=f, kind=DynamicStreamingRemote
+(1 row)
+
+-- I2 (S6): skip spanning multiple pages before the first returned row -> 12 rows
+SELECT remote_window_report('I2 no-sort skip spans pages',
+    '{ "find": "sp_coll", "skip": 8, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+                                      remote_window_report                                      
+---------------------------------------------------------------------
+ I2 no-sort skip spans pages: total=12, coordinator_holds_portal=f, kind=DynamicStreamingRemote
+(1 row)
+
+-- I3 (S7): skip == total -> empty window
+SELECT remote_window_report('I3 no-sort skip==total',
+    '{ "find": "sp_coll", "skip": 20, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+                          remote_window_report                          
+---------------------------------------------------------------------
+ I3 no-sort skip==total: total=0, coordinator_holds_portal=f, kind=Done
+(1 row)
+
+-- I4 (S7): skip > total -> empty window
+SELECT remote_window_report('I4 no-sort skip>total',
+    '{ "find": "sp_coll", "skip": 25, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+                         remote_window_report                          
+---------------------------------------------------------------------
+ I4 no-sort skip>total: total=0, coordinator_holds_portal=f, kind=Done
+(1 row)
+
+-- I5 (L2): no-sort limit>1 -> streaming worker cursor, exactly 7 rows
+SELECT remote_window_report('I5 no-sort limit>1',
+    '{ "find": "sp_coll", "limit": 7, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+                                 remote_window_report                                 
+---------------------------------------------------------------------
+ I5 no-sort limit>1: total=7, coordinator_holds_portal=f, kind=DynamicStreamingRemote
+(1 row)
+
+-- I6 (SL4): no-sort skip + limit -> exactly 10 rows (skip 4, take 10)
+SELECT remote_window_report('I6 no-sort skip+limit',
+    '{ "find": "sp_coll", "skip": 4, "limit": 10, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }');
+                                   remote_window_report                                   
+---------------------------------------------------------------------
+ I6 no-sort skip+limit: total=10, coordinator_holds_portal=f, kind=DynamicStreamingRemote
+(1 row)
+
+-- I7 (SL3): filter + skip + limit, no sort -> 4 rows
+--   cat=even has 10 docs (val 20,40,...,200); skip 2, take 4 => 4 rows
+SELECT remote_window_report('I7 filter+skip+limit no-sort',
+    '{ "find": "sp_coll", "filter": { "cat": "even" }, "skip": 2, "limit": 4, "batchSize": 2 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }');
+                                      remote_window_report                                      
+---------------------------------------------------------------------
+ I7 filter+skip+limit no-sort: total=4, coordinator_holds_portal=f, kind=DynamicStreamingRemote
+(1 row)
+
+-- I8 (S11): skip>0 on a collection with no secondary index -> 12 rows (15 - 3)
+SELECT remote_window_report('I8 skip>0 no-index',
+    '{ "find": "sp_noidx_coll", "skip": 3, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_noidx_coll", "batchSize": 4 }');
+                                 remote_window_report                                  
+---------------------------------------------------------------------
+ I8 skip>0 no-index: total=12, coordinator_holds_portal=f, kind=DynamicStreamingRemote
+(1 row)
+
+-- I9 (L11): limit>1 on a collection with no secondary index -> 6 rows
+SELECT remote_window_report('I9 limit>1 no-index',
+    '{ "find": "sp_noidx_coll", "limit": 6, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_noidx_coll", "batchSize": 4 }');
+                                 remote_window_report                                  
+---------------------------------------------------------------------
+ I9 limit>1 no-index: total=6, coordinator_holds_portal=f, kind=DynamicStreamingRemote
+(1 row)
+
+-- I10 (S9): aggregation $skip>0 -> persistent, 15 rows
+SELECT remote_window_report('I10 $skip>0',
+    '{ "aggregate": "sp_coll", "pipeline": [ { "$skip": 5 } ], "cursor": { "batchSize": 3 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    true);
+                              remote_window_report                               
+---------------------------------------------------------------------
+ I10 $skip>0: total=15, coordinator_holds_portal=f, kind=DynamicFileCursorRemote
+(1 row)
+
+-- I11 (L9): aggregation $limit>1 -> persistent, 7 rows
+SELECT remote_window_report('I11 $limit>1',
+    '{ "aggregate": "sp_coll", "pipeline": [ { "$limit": 7 } ], "cursor": { "batchSize": 3 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 3 }',
+    true);
+                              remote_window_report                               
+---------------------------------------------------------------------
+ I11 $limit>1: total=7, coordinator_holds_portal=f, kind=DynamicFileCursorRemote
+(1 row)
+
+-- I12 (SL7): aggregation $skip + $limit -> 7 rows (skip 3, take 7)
+SELECT remote_window_report('I12 $skip+$limit',
+    '{ "aggregate": "sp_coll", "pipeline": [ { "$skip": 3 }, { "$limit": 7 } ], "cursor": { "batchSize": 2 } }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "sp_coll", "batchSize": 2 }',
+    true);
+                                remote_window_report                                 
+---------------------------------------------------------------------
+ I12 $skip+$limit: total=7, coordinator_holds_portal=f, kind=DynamicFileCursorRemote
+(1 row)
+
+SELECT documentdb_api.drop_collection('dyncur_sp_db', 'sp_noidx_coll');
+ drop_collection 
+---------------------------------------------------------------------
+ t
+(1 row)
+
+-- ===========================================================================
+-- SECTION J (P1-8): batch-size sweep for remote-unsharded dynamic streaming
+-- cursors. Section I proved each window at a single fixed batch size; this
+-- section proves the same window total is invariant across a 1..N batch-size
+-- sweep and requires a continuation whenever the batch is smaller than the
+-- result. Exact identity checks for unordered windows remain separate coverage.
+-- ===========================================================================
+CREATE OR REPLACE FUNCTION remote_window_sweep(
+    p_label       text,
+    p_find_tmpl   text,
+    p_getmore_tmpl text,
+    p_batch_sizes int[],
+    p_expected    bigint,
+    p_expected_kind text,
+    p_is_agg      bool DEFAULT false
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_bs      int;
+    v_page    documentdb_core.bson;
+    v_cont    documentdb_core.bson;
+    v_persist bool;
+    v_total   bigint;
+    v_batch   bigint;
+    v_kind    text;
+    v_had_continuation bool;
+BEGIN
+    FOREACH v_bs IN ARRAY p_batch_sizes LOOP
+        v_total := 0;
+        IF p_is_agg THEN
+            SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+            INTO v_page, v_cont, v_persist
+            FROM aggregate_cursor_first_page(database => 'dyncur_sp_db',
+                commandSpec => format(p_find_tmpl, v_bs)::documentdb_core.bson, cursorId => 539) fp;
+        ELSE
+            SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+            INTO v_page, v_cont, v_persist
+            FROM find_cursor_first_page(database => 'dyncur_sp_db',
+                commandSpec => format(p_find_tmpl, v_bs)::documentdb_core.bson, cursorId => 539) fp;
+        END IF;
+
+        SELECT (bson_dollar_project(v_page,
+            '{ "c": { "$size": { "$ifNull": ["$cursor.firstBatch", []] } } }') ->> 'c')::bigint
+        INTO v_batch;
+        v_total := v_total + COALESCE(v_batch, 0);
+        IF v_batch > v_bs THEN
+            RAISE EXCEPTION '%: batchSize=%: first page returned % rows',
+                p_label, v_bs, v_batch;
+        END IF;
+        v_had_continuation := v_cont IS NOT NULL;
+        IF v_bs < p_expected AND NOT v_had_continuation THEN
+            RAISE EXCEPTION '%: batchSize=%: expected pagination for % rows',
+                p_label, v_bs, p_expected;
+        END IF;
+
+        v_kind := 'Done';
+        IF v_cont IS NOT NULL THEN
+            IF (bson_dollar_project(v_cont, '{ "qr": 1 }') ->> 'qr') IS NOT NULL THEN
+                IF (bson_dollar_project(v_cont, '{ "wc.dc.type": 1 }') ->> 'wc.dc.type') IS NOT NULL THEN
+                    v_kind := 'DynamicStreamingRemote';
+                ELSIF (bson_dollar_project(v_cont, '{ "wc.qf": 1 }') ->> 'wc.qf') IS NOT NULL THEN
+                    v_kind := 'DynamicFileCursorRemote';
+                ELSE
+                    v_kind := 'DynamicHoldPortalRemote';
+                END IF;
+            ELSIF v_persist THEN
+                v_kind := 'Persisted';
+            ELSE
+                v_kind := 'Unknown';
+            END IF;
+        END IF;
+
+        WHILE v_cont IS NOT NULL LOOP
+            SELECT gm.cursorPage, gm.continuation
+            INTO v_page, v_cont
+            FROM cursor_get_more(database => 'dyncur_sp_db',
+                getMoreSpec => format(p_getmore_tmpl, v_bs)::documentdb_core.bson,
+                continuationSpec => v_cont) gm;
+
+            SELECT (bson_dollar_project(v_page,
+                '{ "c": { "$size": { "$ifNull": ["$cursor.nextBatch", []] } } }') ->> 'c')::bigint
+            INTO v_batch;
+            v_total := v_total + COALESCE(v_batch, 0);
+            IF v_batch > v_bs THEN
+                RAISE EXCEPTION '%: batchSize=%: getMore returned % rows',
+                    p_label, v_bs, v_batch;
+            END IF;
+        END LOOP;
+
+        IF v_total <> p_expected THEN
+            RAISE EXCEPTION '%: batchSize=%: expected total=%, got %',
+                p_label, v_bs, p_expected, v_total;
+        END IF;
+        -- The cursor kind is only asserted when the window spans more than one
+        -- page (a continuation was issued). When the batch size is >= the window
+        -- size the whole window fits in the first page (kind = Done, no
+        -- continuation), which is the correct single-batch behavior.
+        IF v_had_continuation AND v_kind <> p_expected_kind THEN
+            RAISE EXCEPTION '%: batchSize=%: expected kind=%, got %',
+                p_label, v_bs, p_expected_kind, v_kind;
+        END IF;
+    END LOOP;
+
+    RETURN format('%s: OK  total=%s  kind=%s  (invariant across %s batch sizes)',
+        p_label, p_expected, p_expected_kind, array_length(p_batch_sizes, 1));
+END;
+$$;
+-- J1 (qr streaming): filter-only, no sort -> streaming worker cursor. val in
+-- [50,150] by 10s = 11 docs, invariant across the sweep.
+SELECT remote_window_sweep('J1 qr streaming filter',
+    '{ "find": "sp_coll", "filter": { "val": { "$gte": 50, "$lte": 150 } }, "projection": { "_id": 1 }, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,2,4,11,100], 11, 'DynamicStreamingRemote');
+                                         remote_window_sweep                                         
+---------------------------------------------------------------------
+ J1 qr streaming filter: OK  total=11  kind=DynamicStreamingRemote  (invariant across 5 batch sizes)
+(1 row)
+
+-- J2 (qr streaming, skip>0): no-sort skip -> streaming worker cursor.
+SELECT remote_window_sweep('J2 qr streaming skip>0',
+    '{ "find": "sp_coll", "skip": 5, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,3,7,15,100], 15, 'DynamicStreamingRemote');
+                                         remote_window_sweep                                         
+---------------------------------------------------------------------
+ J2 qr streaming skip>0: OK  total=15  kind=DynamicStreamingRemote  (invariant across 5 batch sizes)
+(1 row)
+
+-- J3 (qr streaming, limit>1): no-sort limit -> streaming worker cursor.
+SELECT remote_window_sweep('J3 qr streaming limit>1',
+    '{ "find": "sp_coll", "limit": 7, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,2,7,100], 7, 'DynamicStreamingRemote');
+                                         remote_window_sweep                                         
+---------------------------------------------------------------------
+ J3 qr streaming limit>1: OK  total=7  kind=DynamicStreamingRemote  (invariant across 4 batch sizes)
+(1 row)
+
+-- J4 (qr streaming, skip+limit): no-sort window -> streaming worker cursor.
+SELECT remote_window_sweep('J4 qr streaming skip+limit',
+    '{ "find": "sp_coll", "skip": 4, "limit": 10, "batchSize": %s }',
+    '{ "getMore": { "$numberLong": "539" }, "collection": "sp_coll", "batchSize": %s }',
+    ARRAY[1,3,10,100], 10, 'DynamicStreamingRemote');
+                                           remote_window_sweep                                           
+---------------------------------------------------------------------
+ J4 qr streaming skip+limit: OK  total=10  kind=DynamicStreamingRemote  (invariant across 4 batch sizes)
+(1 row)
+
+-- ===========================================================================
 -- Cleanup
 -- ===========================================================================
 RESET documentdb.enable_dynamic_cursor_early_index_lock_release;
+RESET documentdb.enable_dynamic_cursor_with_skiplimit;
 DO $$
 DECLARE
     reset_dynamic_cursor_nodes int;
     reset_lock_release_nodes int;
+    reset_skip_limit_nodes int;
     reloaded_nodes int;
 BEGIN
     SELECT count(*) INTO reset_dynamic_cursor_nodes
@@ -2358,17 +2739,24 @@ BEGIN
         $cmd$ALTER SYSTEM RESET documentdb.enable_dynamic_cursor_early_index_lock_release$cmd$)
     WHERE success;
 
+    SELECT count(*) INTO reset_skip_limit_nodes
+    FROM run_command_on_all_nodes(
+        $cmd$ALTER SYSTEM RESET documentdb.enable_dynamic_cursor_with_skiplimit$cmd$)
+    WHERE success;
+
     SELECT count(*) INTO reloaded_nodes
     FROM run_command_on_all_nodes($cmd$SELECT pg_reload_conf()$cmd$)
     WHERE success;
 
-    IF reset_dynamic_cursor_nodes <> 2 OR reset_lock_release_nodes <> 2 OR
-       reloaded_nodes <> 2 THEN
+     IF reset_dynamic_cursor_nodes <> 2 OR reset_lock_release_nodes <> 2 OR
+         reset_skip_limit_nodes <> 2 OR reloaded_nodes <> 2 THEN
         RAISE EXCEPTION 'failed to reset all nodes';
     END IF;
 END
 $$;
 DROP FUNCTION IF EXISTS remote_drain_and_report;
+DROP FUNCTION IF EXISTS remote_window_report;
+DROP FUNCTION IF EXISTS remote_window_sweep;
 DROP FUNCTION IF EXISTS sp_drain_ordered;
 DROP FUNCTION IF EXISTS sp_drain_docs;
 NOTICE:  function sp_drain_docs() does not exist, skipping

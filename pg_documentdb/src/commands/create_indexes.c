@@ -172,6 +172,8 @@ extern bool EnablePerCollectionPlannerStatistics;
 extern bool EnableCompositeReducedCorrelatedTermsOnCommonSubPath;
 extern bool EnableIndexMetadataGlobalTracking;
 extern bool EnableNewNamespaceValidation;
+extern bool EnableCompositeUniqueOptionalKey;
+extern bool EnableCollatedUniqueIndexes;
 
 extern bool EnableCollationWithNonUniqueOrderedIndexes;
 extern bool SkipFailOnCollation;
@@ -199,6 +201,20 @@ extern char *AlternateIndexHandler;
 /* Compound index terms have an overhead of 16 bytes so we need to substract that from the actual limit */
 #define COMPOUND_INDEX_TERM_SIZE_LIMIT (uint32_t) (_RUM_TERM_SIZE_LIMIT - \
 												   (sizeof(uint8_t) + VARHDRSZ + 16))
+
+/*
+ * Returns true when the running cluster version supports the unique-shard
+ * optional-key layout (and collation-aware unique indexes built on top of it).
+ * The feature is available from 2.0-1 onward on the major-2 line and was also
+ * backported to the 1.117 release line (from 1.117-6), so accept either range.
+ */
+static inline bool
+SupportsUniqueShardOptionalKey(void)
+{
+	return IsClusterVersionAtleast(DocDB_V1, 0, 1) ||
+		   IsClusterVersionAtLeastPatch(DocDB_V0, 117, 6);
+}
+
 
 /* Available exclusively for internal testing purposes */
 PG_FUNCTION_INFO_V1(generate_create_index_arg);
@@ -249,9 +265,6 @@ static bool CheckPartFilterExprOperatorsWalker(Node *node, void *context);
 static void ThrowUnsupportedPartFilterExprError(Node *node);
 static char * GetPartFilterExprNodeRepr(Node *node);
 static bool GetPartFilterExprNodeReprWalker(Node *node, void *contextArg);
-static bool CheckIndexSpecConflictWithExistingIndexes(uint64 collectionId,
-													  const IndexSpec *indexSpec,
-													  int *inBuildIndexId);
 static void ThrowIndexNameConflictError(const IndexSpec *existingIndexSpec,
 										const IndexSpec *requestedIndexSpec);
 static void ThrowIndexOptionsConflictError(const char *existingIndexName);
@@ -314,6 +327,7 @@ static char * GenerateIndexExprStr(const char *indexAmSuffix,
 								   const char *indexAmOpClassCatalogSchema,
 								   const char *indexAmOpClassInternalCatalogSchema,
 								   const char *collationString,
+								   const char *optionalCollectionId,
 								   bool supportsMetadataBasedTracking);
 static char * Generate2dsphereIndexExprStr(const IndexDefKey *indexDefKey);
 static char * Generate2dsphereSparseExprStr(const IndexDefKey *indexDefKey);
@@ -804,9 +818,14 @@ create_indexes_concurrently(Datum dbNameDatum, CreateIndexesArg createIndexesArg
 	}
 	else
 	{
-		/* collection does not exist, create it (or race for creating it) */
+		/*
+		 * collection does not exist, create it (or race for creating it).
+		 * The creation is implicit to this command, so it may be carried
+		 * separately and committed before the index work that follows.
+		 */
+		bool canUseLibPq = true;
 		result.createdCollectionAutomatically =
-			CreateCollection(dbNameDatum, collectionNameDatum);
+			CreateCollection(dbNameDatum, collectionNameDatum, canUseLibPq);
 
 		collection = GetMongoCollectionByNameDatum(dbNameDatum, collectionNameDatum,
 												   AccessShareLock);
@@ -1025,9 +1044,14 @@ create_indexes_non_concurrently(Datum dbNameDatum, CreateIndexesArg createIndexe
 	}
 	else
 	{
-		/* collection does not exist, create it (or race for creating it) */
+		/*
+		 * collection does not exist, create it (or race for creating it).
+		 * The creation is implicit to this command, so it may be carried
+		 * separately and committed before the index work that follows.
+		 */
+		bool canUseLibPq = true;
 		result.createdCollectionAutomatically =
-			CreateCollection(dbNameDatum, collectionNameDatum);
+			CreateCollection(dbNameDatum, collectionNameDatum, canUseLibPq);
 
 		collection = GetMongoCollectionByNameDatum(dbNameDatum, collectionNameDatum,
 												   AccessShareLock);
@@ -2524,7 +2548,7 @@ ParseIndexDefDocumentInternal(const bson_iter_t *indexesDocIter,
 		}
 
 		/* We do not support collation with unique indexes yet */
-		if (isUniqueOrBuildAsUniqueIndex)
+		if (isUniqueOrBuildAsUniqueIndex && !EnableCollatedUniqueIndexes)
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg(
@@ -4390,7 +4414,8 @@ CheckForConflictsAndPruneExistingIndexes(uint64 collectionId, List *indexDefList
 
 		int32_t inBuildIndexId = -1;
 		if (!CheckIndexSpecConflictWithExistingIndexes(collectionId, &indexSpec,
-													   &inBuildIndexId))
+													   &inBuildIndexId,
+													   INVALID_INDEX_ID))
 		{
 			prunedIndexDefList = lappend(prunedIndexDefList, indexDef);
 		}
@@ -4509,18 +4534,59 @@ CheckForConflictsAndPruneExistingIndexes(uint64 collectionId, List *indexDefList
  * Finally, this function throws an error if there is an index that conlicts
  * with given one either by name or by index options.
  */
-static bool
+bool
 CheckIndexSpecConflictWithExistingIndexes(uint64 collectionId, const IndexSpec *indexSpec,
-										  int32_t *inBuildIndexId)
+										  int32_t *inBuildIndexId,
+										  int excludedIndexId)
 {
-	const IndexDetails *nameMatchedIndexDetails =
-		IndexNameGetIndexDetails(collectionId, indexSpec->indexName);
+	const IndexDetails *nameMatchedIndexDetails = NULL;
+	const IndexDetails *optionsMatchedIndexDetails = NULL;
+
+	if (excludedIndexId == INVALID_INDEX_ID)
+	{
+		nameMatchedIndexDetails =
+			IndexNameGetIndexDetails(collectionId, indexSpec->indexName);
+		if (nameMatchedIndexDetails == NULL)
+		{
+			optionsMatchedIndexDetails =
+				FindIndexWithSpecOptions(collectionId, indexSpec);
+		}
+	}
+	else
+	{
+		bool excludeIdIndex = false;
+		bool enableNestedDistribution = false;
+		List *indexDetailsList = CollectionIdGetIndexes(collectionId, excludeIdIndex,
+														enableNestedDistribution);
+
+		ListCell *indexDetailsCell = NULL;
+		foreach(indexDetailsCell, indexDetailsList)
+		{
+			const IndexDetails *existingIndexDetails = lfirst(indexDetailsCell);
+			if (existingIndexDetails->indexId == excludedIndexId)
+			{
+				continue;
+			}
+
+			if (strcmp(existingIndexDetails->indexSpec.indexName,
+					   indexSpec->indexName) == 0)
+			{
+				nameMatchedIndexDetails = existingIndexDetails;
+				break;
+			}
+
+			if (optionsMatchedIndexDetails == NULL &&
+				IndexSpecOptionsAreEquivalent(&existingIndexDetails->indexSpec,
+											  indexSpec) !=
+				IndexOptionsEquivalency_NotEquivalent)
+			{
+				optionsMatchedIndexDetails = existingIndexDetails;
+			}
+		}
+	}
 
 	if (nameMatchedIndexDetails == NULL)
 	{
-		const IndexDetails *optionsMatchedIndexDetails =
-			FindIndexWithSpecOptions(collectionId, indexSpec);
-
 		/* Don't consider indexes not in progress */
 		if (optionsMatchedIndexDetails != NULL)
 		{
@@ -5265,9 +5331,11 @@ CreatePostgresIndex(uint64 collectionId, IndexDef *indexDef, int indexId,
 					bool concurrently, bool isTempCollection, bool isUnsharded)
 {
 	bool isBackgroundBuild = false;
+	bool isUpgradeOptionsCommand = false;
 	char *cmd = CreatePostgresIndexCreationCmd(collectionId, indexDef, indexId,
 											   concurrently, isTempCollection,
-											   isBackgroundBuild);
+											   isBackgroundBuild,
+											   isUpgradeOptionsCommand);
 	const Oid userOid = InvalidOid;
 	bool useSerialExecution = isUnsharded;
 	ExecuteCreatePostgresIndexCmd(cmd, concurrently, userOid, useSerialExecution);
@@ -5280,7 +5348,7 @@ CreatePostgresIndex(uint64 collectionId, IndexDef *indexDef, int indexId,
 char *
 CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int indexId,
 							   bool concurrently, bool isTempCollection,
-							   bool isBackgroundBuild)
+							   bool isBackgroundBuild, bool isUpgradeOptionsCommand)
 {
 	StringInfo cmdStr = makeStringInfo();
 	bool unique = indexDef->unique == BoolIndexOption_True;
@@ -5301,10 +5369,18 @@ CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int inde
 									 indexDef->enableLargeIndexKeys ==
 									 BoolIndexOption_True;
 
-		isBackgroundNonBlockingUnique = EnableNonBlockingUniqueIndexBuild &&
+		isBackgroundNonBlockingUnique = (EnableNonBlockingUniqueIndexBuild ||
+										 isUpgradeOptionsCommand) &&
 										isBackgroundBuild &&
 										CanBuildNonBlockingUniqueIndex() &&
 										IsCompositePathIndex(indexDef);
+
+		if (isUpgradeOptionsCommand && !isBackgroundNonBlockingUnique)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg(
+								"updating unique index options requires non-blocking unique index build support")));
+		}
 	}
 
 	if (EnableExtendedIndexes &&
@@ -5393,6 +5469,15 @@ CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int inde
 
 		bool enableNewIndexOpClass = IsCompositePathIndex(indexDef);
 
+		char collectionIdString[128] = { 0 };
+		pg_snprintf(collectionIdString, sizeof(collectionIdString), "%lu", collectionId);
+
+		const char *optionalCollectionId = NULL;
+		if (EnableCompositeUniqueOptionalKey && indexAm->supports_optional_key)
+		{
+			optionalCollectionId = collectionIdString;
+		}
+
 		bool useReducedWildcardTermGeneration = false;
 		bool buildAsUnique = false;
 		appendStringInfo(cmdStr,
@@ -5412,6 +5497,7 @@ CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int inde
 											  indexAm->get_opclass_catalog_schema(),
 											  indexAm->get_opclass_internal_catalog_schema(),
 											  indexDef->collationString,
+											  optionalCollectionId,
 											  indexAm->get_opclass_metadata != NULL),
 						 indexDef->partialFilterExpr ? "WHERE (" : "",
 						 indexDef->partialFilterExpr ?
@@ -5548,6 +5634,16 @@ CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int inde
 												 BoolIndexOption_True);
 		bool buildAsUnique = indexDef->buildAsUnique == BoolIndexOption_True ||
 							 isBackgroundNonBlockingUnique;
+
+		char collectionIdString[128] = { 0 };
+		pg_snprintf(collectionIdString, sizeof(collectionIdString), "%lu", collectionId);
+
+		const char *optionalCollectionId = NULL;
+		if (EnableCompositeUniqueOptionalKey && indexAm->supports_optional_key)
+		{
+			optionalCollectionId = collectionIdString;
+		}
+
 		appendStringInfo(cmdStr,
 						 " USING %s_%s (%s) %s%s%s",
 						 ExtensionObjectPrefix,
@@ -5565,6 +5661,7 @@ CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int inde
 											  indexAm->get_opclass_catalog_schema(),
 											  indexAm->get_opclass_internal_catalog_schema(),
 											  indexDef->collationString,
+											  optionalCollectionId,
 											  indexAm->get_opclass_metadata != NULL),
 						 indexDef->partialFilterExpr ? "WHERE (" : "",
 						 indexDef->partialFilterExpr ?
@@ -5890,26 +5987,85 @@ AppendUniqueColumnExpr(StringInfo indexExprStr, IndexDefKey *indexDefKey,
 					   bool sparse, const char *indexAmSuffix, const
 					   char *indexAmOpClassInternalCatalogSchema,
 					   bool firstColumnWritten, bool buildAsUnique,
-					   bool generateCompositeHash)
+					   bool generateCompositeHash, const char *collation,
+					   const char *optionalCollectionId)
 {
 	const char *generateCompositeTermString = "";
+	const char *collationTermString = "";
 	if (generateCompositeHash &&
 		EnableCompositeShardDocumentTerms)
 	{
 		generateCompositeTermString = ", true";
 	}
 
+	bool hasCollation = IsCollationValid(collation);
+	if (hasCollation)
+	{
+		if (!EnableCollatedUniqueIndexes || !SupportsUniqueShardOptionalKey())
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+							errmsg("collated unique indexes are not supported")));
+		}
+
+		/* We only support uniqueness when there's an optsk option (i.e., a collection ID) */
+		if (optionalCollectionId == NULL)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("collated unique indexes require a collection ID")));
+		}
+
+		/* add the collated specification for the unique index */
+		collationTermString = psprintf(", %s::text", quote_literal_cstr(collation));
+		if (strlen(generateCompositeTermString) == 0)
+		{
+			generateCompositeTermString = ", true";
+		}
+	}
+
 	appendStringInfo(indexExprStr,
-					 "%s%s.generate_unique_shard_document(document, shard_key_value, '%s'::%s.bson, %s%s) %s.bson_%s_unique_shard_path_ops%s",
+					 "%s%s.generate_unique_shard_document(document, shard_key_value, '%s'::%s.bson, %s%s%s) %s.bson_%s_unique_shard_path_ops",
 					 !firstColumnWritten ? "" : ",",
 					 DocumentDBApiInternalSchemaName,
 					 GenerateUniqueProjectionSpec(indexDefKey),
 					 CoreSchemaName,
 					 sparse ? "true" : "false",
 					 generateCompositeTermString,
+					 collationTermString,
 					 indexAmOpClassInternalCatalogSchema,
-					 indexAmSuffix,
-					 generateCompositeHash ? "(cmp=true)" : "");
+					 indexAmSuffix);
+
+	bool hasWrittenOptions = false;
+	if (generateCompositeHash)
+	{
+		appendStringInfoString(indexExprStr,
+							   hasWrittenOptions ? "," : "(");
+
+		appendStringInfo(indexExprStr, "cmp=true");
+		hasWrittenOptions = true;
+	}
+
+	if (EnableCompositeUniqueOptionalKey &&
+		optionalCollectionId != NULL &&
+		strlen(optionalCollectionId) > 0 &&
+		SupportsUniqueShardOptionalKey())
+	{
+		appendStringInfoString(indexExprStr,
+							   hasWrittenOptions ? "," : "(");
+
+		appendStringInfo(indexExprStr, "optsk=%s", quote_literal_cstr(
+							 optionalCollectionId));
+		hasWrittenOptions = true;
+	}
+	else if (hasCollation)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg("collated unique indexes are not supported")));
+	}
+
+	if (hasWrittenOptions)
+	{
+		appendStringInfo(indexExprStr, ")");
+	}
 
 	if (!buildAsUnique)
 	{
@@ -5939,6 +6095,7 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 					 const char *indexAmOpClassCatalogSchema,
 					 const char *indexAmOpClassInternalCatalogSchema,
 					 const char *collationString,
+					 const char *optionalCollectionId,
 					 bool supportsMetadataBasedTracking)
 {
 	StringInfo indexExprStr = makeStringInfo();
@@ -6000,7 +6157,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		bool generateCompositeHash = false;
 		AppendUniqueColumnExpr(indexExprStr, indexDefKey, sparse, indexAmSuffix,
 							   indexAmOpClassInternalCatalogSchema, firstColumnWritten,
-							   buildAsUniqueOverride, generateCompositeHash);
+							   buildAsUniqueOverride, generateCompositeHash,
+							   collationString, optionalCollectionId);
 		firstColumnWritten = true;
 	}
 
@@ -6533,7 +6691,8 @@ GenerateIndexExprStr(const char *indexAmSuffix,
 		bool generateCompositeHash = EnableCompositeUniqueHash;
 		AppendUniqueColumnExpr(indexExprStr, indexDefKey, sparse, indexAmSuffix,
 							   indexAmOpClassInternalCatalogSchema, firstColumnWritten,
-							   buildAsUnique, generateCompositeHash);
+							   buildAsUnique, generateCompositeHash, collationString,
+							   optionalCollectionId);
 	}
 
 	return indexExprStr->data;

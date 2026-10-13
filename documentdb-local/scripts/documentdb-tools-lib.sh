@@ -603,6 +603,279 @@ documentdb_detect_extended_rum() {
     fi
 }
 
+# ── Extension-creation guidance (shared) ────────────────────────────
+#
+# documentdb-tune pins documentdb.alternate_index_handler_name (cluster-wide)
+# from a control-file probe, but the access method it names needs per-database
+# state that only CREATE EXTENSION documentdb_extended_rum supplies — and
+# CASCADE does not pull it in. When the two disagree, a new index build fails
+# with "Index access method extended_rum is not available", so any tool telling
+# an operator how to create the extension must name the extended-RUM one too.
+#
+# Single-sourced here. The gateway package banners (maintainer-scripts/gateway/
+# postinst, packaging/rpm/spec/documentdb-gateway.spec) are static duplicates —
+# they run before documentdb-postgresql-tools is necessarily installed — so
+# verify_install_banner_extension_hint in the packaged-install E2E suites fails
+# the build if one of them drops a statement, reverses the two, or loses its
+# flags or coordinates. That is a bounded check, not proof of equivalence.
+
+# documentdb_alternate_index_handler_extension <handler_name>: echo the
+# extension <handler_name> needs, or nothing (the built-in documentdb_rum
+# handler ships in pg_documentdb itself).
+documentdb_alternate_index_handler_extension() {
+    case "$(trim_whitespace "${1:-}")" in
+        extended_rum) printf 'documentdb_extended_rum' ;;
+        *)            printf '' ;;
+    esac
+}
+
+# documentdb_index_handler_for_extension <extension>: the reverse — echo the
+# access-method name <extension> provides, for diagnostics that name the
+# handler when it was resolved from disk. Paired with the forward direction
+# above so the mapping cannot drift.
+documentdb_index_handler_for_extension() {
+    case "$(trim_whitespace "${1:-}")" in
+        documentdb_extended_rum) printf 'extended_rum' ;;
+        *)                       printf '' ;;
+    esac
+}
+
+# documentdb_create_extension_sql [extra_extension]: the CREATE EXTENSION
+# statements, one per line, for feeding to psql. One transaction, so a failed
+# extended-RUM statement cannot leave documentdb committed without it.
+documentdb_create_extension_sql() {
+    printf 'BEGIN;\n'
+    printf 'CREATE EXTENSION IF NOT EXISTS documentdb CASCADE;\n'
+    if [[ -n "${1:-}" ]]; then
+        printf 'CREATE EXTENSION IF NOT EXISTS %s CASCADE;\n' "$1"
+    fi
+    printf 'COMMIT;\n'
+}
+
+# documentdb_shell_quote <word>...: the words as one shell command line, each
+# argument quoted so that whatever it contains stays literal argument data.
+# Single quotes rather than printf %q because these lines are meant to be read
+# and pasted by an operator: %q escapes every space in the SQL, and the static
+# DEB/RPM banners quote the same statements this way.
+documentdb_shell_quote() {
+    local word="" line="" sep=""
+    for word in ${@+"$@"}; do
+        if [[ -n "${word}" && "${word}" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+            line+="${sep}${word}"
+        else
+            line+="${sep}'${word//\'/\'\\\'\'}'"
+        fi
+        sep=" "
+    done
+    printf '%s' "${line}"
+}
+
+# documentdb_create_extension_command <pg_owner> <target_db> <extra_extension>
+# [psql connection argument...]: the copy-pasteable psql command, one -c per
+# line of documentdb_create_extension_sql. The -c strings share one session, so
+# its BEGIN/COMMIT spans them and ON_ERROR_STOP exits before COMMIT.
+#
+# Connection coordinates are separate arguments — "--cluster" "N/name" on
+# Debian, "-h" "DIR" "-p" "PORT" anywhere — never one free-text string: a
+# socket directory or owner read off the host's configuration has to reach the
+# operator's shell as data, not as syntax. Pass them whenever you have them:
+# without coordinates psql follows the default socket and port, which on a
+# multi-cluster host (or the stand-alone instance on port 9700+major) is a
+# different cluster than the caller meant.
+#
+# Returns 1 and prints nothing when the host has no way to run a command as
+# another user — documentdb_create_extension_advice handles that case.
+#
+# pg_documentdb_extended_rum errors out of _PG_init unless already in
+# shared_preload_libraries, so print this only AFTER the restart instruction.
+documentdb_create_extension_command() {
+    local owner="${1:-postgres}" target_db="${2:-postgres}" extra="${3:-}"
+    if (( $# > 3 )); then shift 3; else shift $#; fi
+
+    local -a psql_args=(psql ${@+"$@"} -d "${target_db}" -X -v ON_ERROR_STOP=1)
+    local statement=""
+    while IFS= read -r statement; do
+        [[ -n "${statement}" ]] || continue
+        psql_args+=(-c "${statement}")
+    done < <(documentdb_create_extension_sql "${extra}")
+
+    # sudo first, unlike run_as_user: this command is printed for an operator
+    # to paste into their own shell, where runuser/su would fail unless they
+    # are already root.
+    if command -v sudo >/dev/null 2>&1; then
+        documentdb_shell_quote sudo -u "${owner}" "${psql_args[@]}"
+    elif command -v runuser >/dev/null 2>&1; then
+        documentdb_shell_quote runuser -u "${owner}" -- "${psql_args[@]}"
+    elif command -v su >/dev/null 2>&1; then
+        documentdb_shell_quote su -s /bin/bash "${owner}" -c \
+            "$(documentdb_shell_quote "${psql_args[@]}")"
+    else
+        return 1
+    fi
+}
+
+# documentdb_create_extension_advice <pg_owner> <target_db> <extra_extension>
+# [psql connection argument...]: what to actually show an operator — the
+# command above, plus the caveat it needs, one advisory line per output line so
+# callers can prefix each with their own logger. Never empty: a host with no
+# privilege runner gets the statements themselves rather than a command that
+# cannot run.
+documentdb_create_extension_advice() {
+    local owner="${1:-postgres}" target_db="${2:-postgres}" extra="${3:-}"
+    if (( $# > 3 )); then shift 3; else shift $#; fi
+
+    local recipe="" runner=""
+    if recipe="$(documentdb_create_extension_command "${owner}" "${target_db}" \
+            "${extra}" ${@+"$@"})"; then
+        printf '%s\n' "${recipe}"
+        if ! command -v sudo >/dev/null 2>&1; then
+            runner="su"
+            if command -v runuser >/dev/null 2>&1; then runner="runuser"; fi
+            printf 'Run that as root: this host has no sudo, so it uses %s.\n' "${runner}"
+        fi
+        return 0
+    fi
+
+    printf 'This host has no sudo, runuser or su, so there is no command to paste.\n'
+    if (( $# > 0 )); then
+        # Still name the instance: statements run against the default socket
+        # land in whichever cluster owns it.
+        printf 'As %s, run these statements against %s in database %s:\n' \
+            "${owner}" "$(documentdb_shell_quote "$@")" "${target_db}"
+    else
+        printf 'As %s, run these statements in database %s:\n' "${owner}" "${target_db}"
+    fi
+    documentdb_create_extension_sql "${extra}"
+}
+
+# documentdb_pg_sharedir <major>: echo the PostgreSQL share directory, or
+# return non-zero.
+#
+# Callers decide what a failure means, and both answers are defensible:
+# documentdb-tune's resolve_pg_sharedir swallows the same failure and so does
+# NOT pin the handler, meaning a caller that reads the failure as "no extended
+# RUM" stays consistent with the config tune wrote. What must not happen is the
+# two sides disagreeing in either direction.
+documentdb_pg_sharedir() {
+    local major="$1" candidate="" sharedir=""
+    while IFS= read -r candidate; do
+        if [[ -x "${candidate}/pg_config" ]]; then
+            sharedir="$("${candidate}/pg_config" --sharedir 2>/dev/null)" || sharedir=""
+            break
+        fi
+    done < <(documentdb_pg_bindir_candidates "${major}")
+    [[ -n "${sharedir}" ]] || return 1
+    printf '%s' "${sharedir}"
+}
+
+# documentdb_read_alternate_index_handler <psql> <socket_dir> <port> <db>
+# [run_as_user]: echo the live documentdb.alternate_index_handler_name.
+# Returns 0 if the GUC exists (an empty value is legitimate — that is its
+# default), 2 if it does not exist, 1 if it could not be read.
+#
+# The 0-with-empty vs 2 split is the point and is easy to lose:
+# current_setting(..., true) yields NULL for an unknown GUC and '' for a known
+# one at its default, and psql -tA renders both as an empty line — hence the
+# sentinel. Unknown means pg_documentdb is not preloaded yet, i.e. after
+# documentdb-tune wrote the config and before PostgreSQL restarted. Merging the
+# two states breaks both ways: as "no handler" the advice silently drops back
+# to the single-statement recipe exactly when it is needed, and as "handler
+# pinned" it tells an operator on an untuned cluster to create an extension
+# whose library is not preloaded.
+#
+# Prefer documentdb_required_index_extension unless you want the raw GUC.
+documentdb_read_alternate_index_handler() {
+    local psql_bin="$1" socket_dir="$2" port="$3" target_db="$4" as_user="${5:-}"
+    # Function-local, not a readonly global: re-sourcing this library would
+    # abort on a readonly reassignment under set -e.
+    local absent_sentinel='__documentdb_guc_absent__'
+    local sql="SELECT coalesce(current_setting('documentdb.alternate_index_handler_name', true), '${absent_sentinel}');"
+    local out=""
+    if [[ -n "${as_user}" ]] && declare -F run_as_user >/dev/null 2>&1; then
+        out="$(run_as_user "${as_user}" "${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 1
+    else
+        out="$("${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 1
+    fi
+    out="$(trim_whitespace "${out}")"
+    [[ "${out}" == "${absent_sentinel}" ]] && return 2
+    printf '%s' "${out}"
+    return 0
+}
+
+# documentdb_read_pg_major <psql> <socket_dir> <port> <db> [run_as_user]: echo
+# the connected server's major version, or nothing. For tools that hold a
+# working connection but no configured major (documentdb-gateway-admin resolves
+# socket and port from state files) and need it to locate the share directory.
+documentdb_read_pg_major() {
+    local psql_bin="$1" socket_dir="$2" port="$3" target_db="$4" as_user="${5:-}"
+    local sql="SELECT current_setting('server_version_num')::int / 10000;"
+    local out=""
+    if [[ -n "${as_user}" ]] && declare -F run_as_user >/dev/null 2>&1; then
+        out="$(run_as_user "${as_user}" "${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 0
+    else
+        out="$("${psql_bin}" -h "${socket_dir}" -p "${port}" \
+            -d "${target_db}" -X -tA -v ON_ERROR_STOP=1 -c "${sql}" 2>/dev/null)" || return 0
+    fi
+    out="$(trim_whitespace "${out}")"
+    [[ "${out}" =~ ^[0-9]+$ ]] && printf '%s' "${out}"
+    return 0
+}
+
+# documentdb_required_index_extension <psql> <socket_dir> <port> <db>
+# [run_as_user] [pg_major]: echo the extension <db> needs for index creation to
+# work, or nothing. The exit status says how much that answer is worth:
+#
+#   0  read from the live server: authoritative for this connection and
+#      database, empty output included (no alternate handler is configured).
+#   2  not live-confirmed. Named output comes from the installed control file —
+#      what a tuned cluster will demand once it has restarted — and empty
+#      output means the requirement could not be determined at all, NOT that
+#      there is none.
+#
+# Callers must handle both and must not turn any other status into an answer:
+# under set -e capture it explicitly (`|| rc=$?`), since a bare assignment
+# aborts the caller.
+#
+# Prefers the live GUC — what the running cluster actually demands — and falls
+# back to the on-disk probe when it is unreadable or not loaded yet. The
+# fallback is the same probe documentdb-tune used to pin the handler, so the
+# two agree.
+#
+# The fallback assigns HAS_EXTENDED_RUM via documentdb_detect_extended_rum. No
+# caller reads it afterwards today, but a tool with its own HAS_EXTENDED_RUM
+# state (documentdb-tune, documentdb-setup) must re-derive it after calling.
+documentdb_required_index_extension() {
+    local psql_bin="$1" socket_dir="$2" port="$3" target_db="$4"
+    local as_user="${5:-}" major="${6:-}"
+    local handler="" rc=0 sharedir=""
+
+    handler="$(documentdb_read_alternate_index_handler "${psql_bin}" "${socket_dir}" \
+        "${port}" "${target_db}" "${as_user}")" || rc=$?
+
+    if (( rc == 0 )); then
+        # GUC exists, so the running cluster is authoritative — including when
+        # it is empty, which means no alternate handler.
+        documentdb_alternate_index_handler_extension "${handler}"
+        return 0
+    fi
+
+    # rc 1 (unreadable) or 2 (absent — not preloaded yet). The control file is
+    # what this cluster will demand after its next restart. Status 2 either way:
+    # without a major, or with no readable share directory, this returns empty
+    # without having looked at disk at all, and empty must not be read as "no
+    # extra extension needed".
+    if [[ -n "${major}" ]] && sharedir="$(documentdb_pg_sharedir "${major}")"; then
+        documentdb_detect_extended_rum "${sharedir}"
+        if [[ "${HAS_EXTENDED_RUM}" == "true" ]]; then
+            printf 'documentdb_extended_rum'
+        fi
+    fi
+    return 2
+}
+
 # documentdb_tune_fragment_path <major> <cluster>: echo the per-cluster
 # fragment documentdb-tune writes on Debian split layouts (picked up by the
 # createcluster.d hook's include_if_exists). Shared so documentdb-setup can
@@ -824,6 +1097,85 @@ documentdb_validate_gateway_username() {
     return 0
 }
 
+# User names PostgreSQL (public, none) or the backend (its built-in roles,
+# IS_NATIVE_BUILTIN_ROLE in pg_documentdb/include/utils/role_utils.h) refuses,
+# but only once the cluster exists. Matched exactly, as they do. install.sh
+# carries a copy; a unit test keeps both equal to the header.
+DOCUMENTDB_RESERVED_USER_NAMES="public none
+    __system autoCompact backup backupAndRestore
+    clusterAdmin clusterManager clusterMonitor dbAdmin dbAdminAnyDatabase
+    dbOwner directShardOperations enableSharding killOpSession
+    manageShardBalancer MongodbAutomationAgentUserRole read readAnyDatabase
+    readWrite readWriteAnyDatabase restore root searchCoordinator userAdmin
+    userAdminAnyDatabase"
+
+# documentdb_validate_username <username> [setup_configuration_json]
+#
+# Refuse a name that would install fine and then never log in.
+documentdb_validate_username() {
+    local username="$1" bytes reserved
+    bytes=$(LC_ALL=C; echo "${#username}")
+
+    if [[ -z "${username}" || "${username}" == -* ]]; then
+        echo "Error: username '${username}' is empty or looks like an option; check that the option was given a value." >&2
+        return 1
+    fi
+    # Clients send these as SCRAM escapes (=2C, =3D) the gateway doesn't decode.
+    if [[ "${username}" == *[,=]* ]]; then
+        echo "Error: username '${username}' contains ',' or '=', which the gateway cannot match at login." >&2
+        return 1
+    fi
+    if (( bytes > 63 )); then
+        echo "Error: username '${username}' is ${bytes} bytes; PostgreSQL role names are at most 63." >&2
+        return 1
+    fi
+    for reserved in ${DOCUMENTDB_RESERVED_USER_NAMES}; do
+        if [[ "${username}" == "${reserved}" ]]; then
+            echo "Error: username '${username}' is reserved by PostgreSQL or DocumentDB." >&2
+            return 1
+        fi
+    done
+    documentdb_validate_gateway_username "$@"
+}
+
+DOCUMENTDB_PASSWORD_RULE="must be one non-empty line of printable ASCII; one trailing newline (LF or CRLF) is allowed."
+
+# documentdb_check_password <password> <label>
+#
+# Clients SASLprep a password before SCRAM and refuse control characters and
+# some non-ASCII, while the server stores the raw bytes, so such a password
+# never logs in. ASCII-only is a stopgap until the backend refuses SASLprep
+# failures (documentdb/documentdb#765).
+documentdb_check_password() {
+    local LC_ALL=C
+    [[ -n "$1" && "$1" != *[![:print:]]* ]] && return 0
+    echo "Error: $2 ${DOCUMENTDB_PASSWORD_RULE}" >&2
+    return 1
+}
+
+# documentdb_read_password <var> <label>
+#
+# Read a password file or pipe from stdin into <var>, dropping one trailing
+# LF and a CR before it.
+documentdb_read_password() {
+    # Prefixed locals so the nameref never resolves to one of them.
+    local -n _ddb_password_out="$1"
+    local _ddb_raw=""
+
+    # read -d '' succeeds only on a NUL, which would cut the password short.
+    if IFS= read -r -d '' _ddb_raw; then
+        echo "Error: $2 ${DOCUMENTDB_PASSWORD_RULE}" >&2
+        return 1
+    fi
+    if [[ "${_ddb_raw}" == *$'\n' ]]; then
+        _ddb_raw="${_ddb_raw%?}"
+        # Test first: a suffix strip that finds no match is quadratic in bash.
+        [[ "${_ddb_raw}" != *$'\r' ]] || _ddb_raw="${_ddb_raw%?}"
+    fi
+    documentdb_check_password "${_ddb_raw}" "$2" || return 1
+    _ddb_password_out="${_ddb_raw}"
+}
+
 # ─────────────────────────────────────────────────────────────────────────
 # port→PID identity primitives (root-capable, /proc-only)
 # ─────────────────────────────────────────────────────────────────────────
@@ -941,12 +1293,9 @@ nohup_gateway_record_pid() {
     # instead of returning 1.
     local recordfile="$1" first="" pid=""
     [[ -r "${recordfile}" ]] || return 1
-    # 2>/dev/null BEFORE the input redirection: redirections apply left-to-right,
-    # so if the file was unlinked since the -r test (a concurrent reset/setup),
-    # the open failure is reported to fd 2 only AFTER it points at /dev/null —
-    # otherwise bash prints a stray "No such file or directory" to the operator's
-    # terminal before the suppression takes effect.
-    IFS= read -r first 2>/dev/null < "${recordfile}" || true
+    # Non-blocking bounded read: the gateway user can fill this directory with FIFOs
+    # or /dev/zero links; a file unlinked since the -r test reads as empty.
+    IFS= read -r first <<< "$(dd if="${recordfile}" bs=256 count=1 iflag=nonblock 2>/dev/null | tr -d '\0')" || true
     pid="${first%%[![:digit:]]*}"      # leading digit run of field 1
     [[ -n "${pid}" ]] || return 1
     (( 10#${pid} > 1 )) 2>/dev/null || return 1
@@ -1010,11 +1359,9 @@ nohup_gateway_pid_for_port() {
     kill -0 "${pid}" 2>/dev/null || return 1
     gateway_exe_matches "${pid}" || return 1
 
-    # Fields 2 (starttime) and 3 (boot_id) of the record, if present. 2>/dev/null
-    # precedes the input redirect so a file unlinked in the TOCTOU window (see
-    # nohup_gateway_record_pid) fails the open silently rather than leaking a
-    # bash error to the operator; rec_start/rec_boot then stay empty (legacy).
-    read -r _ rec_start rec_boot 2>/dev/null < "${pidfile}" || true
+    # Fields 2 (starttime) and 3 (boot_id) of the record, if present, read as in
+    # nohup_gateway_record_pid; empty (legacy) if the file is gone.
+    read -r _ rec_start rec_boot <<< "$(dd if="${pidfile}" bs=256 count=1 iflag=nonblock 2>/dev/null | tr -d '\0')" || true
 
     if [[ -n "${rec_boot}" ]]; then
         cur_boot="$(current_boot_id)"
@@ -1092,6 +1439,117 @@ pid1_is_postgres() {
         comm="$(ps -o comm= -p 1 2>/dev/null | tr -d '[:space:]' || true)"
     fi
     [[ "${comm}" == "postgres" || "${comm}" == "postmaster" ]]
+}
+
+# documentdb_pid_running <pid> — alive and not an unreaped zombie (a container
+# PID 1 may never reap an orphan, and kill -0 succeeds on a zombie).
+documentdb_pid_running() {
+    local stat=""
+    kill -0 "$1" 2>/dev/null || return 1
+    IFS= read -r stat 2>/dev/null < "/proc/$1/stat" || true
+    stat="${stat##*) }"
+    [[ "${stat:0:1}" != "Z" ]]
+}
+
+# documentdb_postmaster_pids <data_dir> [socket_lock] — print the PID of every
+# live postmaster serving <data_dir>, one per line. PIDs come only from this
+# install's own postmaster.pid or socket lock file (the lock outlives a deleted
+# data directory), never a /proc-wide scan that would reach other containers'
+# clusters; one counts only while that process still runs as
+# "postgres -D <data_dir>", so a recycled PID never matches. argv needs no ptrace.
+documentdb_postmaster_pids() {
+    local datadir="$1" lock="${2:-}" norm="$1" f pid i d
+    local -a argv
+    # Canonical, symlinks resolved: pg_ctl normalizes -D, and setup accepts a symlinked spelling.
+    [[ "${datadir}" == /* ]] && norm="$(realpath -m -- "${datadir}")"
+    for f in "${datadir}/postmaster.pid" "${lock}"; do
+        [[ -n "${f}" && -f "${f}" ]] || continue
+        pid=""
+        IFS= read -r pid 2>/dev/null < "${f}" || true
+        pid="${pid#-}"   # a single-user backend records -PID
+        [[ "${pid}" =~ ^[0-9]+$ ]] && (( 10#${pid} > 1 )) || continue
+        mapfile -d '' -t argv 2>/dev/null < "/proc/${pid}/cmdline" || continue
+        case "${argv[0]:-}" in */postgres|postgres|*/postmaster|postmaster) ;; *) continue ;; esac
+        for (( i = 1; i < ${#argv[@]}; i++ )); do
+            case "${argv[i]}" in
+                -D) d="${argv[i+1]:-}" ;;
+                -D?*) d="${argv[i]#-D}" ;;
+                *) continue ;;
+            esac
+            if [[ "${d}" == "${datadir}" || ( "${d}" == /* && "$(realpath -m -- "${d}")" == "${norm}" ) ]]; then
+                documentdb_pid_running "${pid}" && printf '%s\n' "${pid}"
+                break
+            fi
+        done
+    done | sort -u
+    return 0
+}
+
+# documentdb_stop_postmaster <data_dir> [socket_lock] — fast shutdown, then
+# immediate, of every postmaster serving <data_dir>, 30s each. Prints the PIDs
+# still running, if any.
+documentdb_stop_postmaster() {
+    local pids sig pid i
+    pids="$(documentdb_postmaster_pids "$@")"
+    for sig in INT QUIT; do
+        [[ -n "${pids}" ]] || break
+        for pid in ${pids}; do kill "-${sig}" "${pid}" 2>/dev/null || true; done
+        for (( i = 0; i < 150; i++ )); do
+            pids="$(documentdb_postmaster_pids "$@")"
+            [[ -n "${pids}" ]] || break
+            sleep 0.2
+        done
+    done
+    printf '%s' "${pids}"
+}
+
+# documentdb_stop_local_major <major> — stop what documentdb-setup started for
+# <major> when there was no systemd to do it: the nohup gateway recorded for the
+# major's port, then (greenfield only) its postmaster. For the package removal
+# scriptlets, which must not leave either serving from removed files. Returns 1
+# if anything is still running.
+documentdb_stop_local_major() {
+    local major="$1" conf_dir="/etc/documentdb/local/$1" conf port="" pid pids i rc=0
+    local data_dir="" pg_port="" lock managed=""
+    for conf in "${conf_dir}/setup.conf" "${conf_dir}/brownfield.conf"; do
+        [[ -r "${conf}" ]] || continue
+        port="$(grep -E '^GATEWAY_PORT=' "${conf}" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+        [[ -n "${port}" ]] && break
+    done
+    if [[ "${port}" =~ ^[0-9]+$ ]]; then
+        pid="$(nohup_gateway_pid_for_port "${port}" || true)"
+        if [[ -n "${pid}" ]]; then
+            echo "Stopping the DocumentDB gateway for PostgreSQL ${major} (pid ${pid})."
+            kill "${pid}" 2>/dev/null || true
+            for (( i = 0; i < 50; i++ )); do documentdb_pid_running "${pid}" || break; sleep 0.2; done
+            documentdb_pid_running "${pid}" && kill -KILL "${pid}" 2>/dev/null && sleep 1
+            if [[ -n "$(nohup_gateway_pid_for_port "${port}" 2>/dev/null || true)" ]]; then
+                echo "The DocumentDB gateway for PostgreSQL ${major} (pid ${pid}) did not stop." >&2
+                rc=1
+            fi
+        fi
+        (( rc )) || rm -f "$(nohup_gateway_pidfile "${port}")" 2>/dev/null || true
+    fi
+
+    # Brownfield PostgreSQL belongs to the operator; only a greenfield cluster is ours.
+    if [[ -r "${conf_dir}/setup.conf" ]]; then
+        managed="$(grep -E '^DOCUMENTDB_MANAGED_POSTGRES=' "${conf_dir}/setup.conf" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+        data_dir="$(grep -E '^DATA_DIR=' "${conf_dir}/setup.conf" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+        pg_port="$(grep -E '^PG_PORT=' "${conf_dir}/setup.conf" 2>/dev/null | head -n 1 | cut -d= -f2- || true)"
+    fi
+    if [[ "${managed}" == "true" && -n "${data_dir}" ]]; then
+        lock="/run/documentdb-local/${major}/postgresql/.s.PGSQL.${pg_port:-0}.lock"
+        pids="$(documentdb_postmaster_pids "${data_dir}" "${lock}")"
+        if [[ -n "${pids}" ]]; then
+            echo "Stopping PostgreSQL ${major} (pid ${pids//$'\n'/ })."
+            pids="$(documentdb_stop_postmaster "${data_dir}" "${lock}")"
+            if [[ -n "${pids}" ]]; then
+                echo "PostgreSQL ${major} (pid ${pids//$'\n'/ }) did not stop." >&2
+                rc=1
+            fi
+        fi
+    fi
+    return "${rc}"
 }
 
 # resolve_uid_check_target <listener-pid> <port>

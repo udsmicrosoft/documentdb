@@ -105,6 +105,14 @@ jobs:
           echo "DOCUMENTDB_VERSION=${{ steps.version.outputs.version }}" >> "$GITHUB_ENV"
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
+      # documentdb_local_tests.yml ignores **/*.md, so a README-only PR would
+      # never run this pin. One cell is enough; nothing here varies by cell.
+      - name: Check the prerequisite copies match packaging/README.md
+        if: matrix.arch == 'amd64' && matrix.pg_version == env.PAVED_PG_MAJOR
+        # Named class, not -k: a renamed class then errors instead of "Ran 0 tests".
+        working-directory: documentdb-local/scripts/documentdb_local_tests
+        run: python3 -m unittest test_configuration_registry.RhelPrerequisitePinTests
+
       - name: Build RPM Package
         run: |
           # Build the extension .rpm only. `build_packages.sh
@@ -282,7 +290,7 @@ jobs:
         uses: actions/checkout@v5
       - name: documentdb-common co-install lifecycle (RPM)
         run: |
-          docker run --rm -v "$PWD:/repo" rockylinux:9 bash -c '
+          docker run --rm -v "$PWD:/repo" rockylinux/rockylinux:9 bash -c '
             set -e
             dnf -q install -y rpm-build findutils >/dev/null 2>&1
             bash /repo/packaging/test_packages/test-documentdb-common-coinstall.sh --type rpm'

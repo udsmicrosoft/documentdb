@@ -40,6 +40,7 @@
 #include "utils/guc_utils.h"
 #include "metadata/metadata_guc.h"
 #include "api_hooks.h"
+#include "rbac_hooks.h"
 #include "commands/parse_error.h"
 #include "utils/feature_counter.h"
 #include "jsonschema/bson_json_schema_tree.h"
@@ -1598,7 +1599,8 @@ validate_collection_cache_entry(PG_FUNCTION_ARGS)
  * pointer whose content stays valid and equal after the cache is invalidated and
  * rebuilt - with copyByRefFields=false they are left NULL, and a missing collection
  * id returns false. The caller passes a collection with a by-ref field set (e.g. a
- * shard key) so these cases are observable.
+ * shard key) so these cases are observable. When a third argument is supplied, it
+ * also validates canonical collation metadata across copy modes and cache rebuilds.
  */
 Datum
 validate_try_copy_collection_by_id(PG_FUNCTION_ARGS)
@@ -1614,6 +1616,12 @@ validate_try_copy_collection_by_id(PG_FUNCTION_ARGS)
 	if (expected == NULL)
 	{
 		ereport(ERROR, (errmsg("collection does not exist")));
+	}
+
+	const char *expectedCollationString = expected->options.collationString;
+	if (PG_NARGS() == 3)
+	{
+		expectedCollationString = TextDatumGetCString(PG_GETARG_DATUM(2));
 	}
 
 	/* Case 1: copyByRefFields = true gives the caller an independently owned deep
@@ -1680,7 +1688,9 @@ validate_try_copy_collection_by_id(PG_FUNCTION_ARGS)
 						 shallowCopy.relationId == expected->relationId &&
 						 shallowCopy.shardKey == NULL &&
 						 shallowCopy.viewDefinition == NULL &&
-						 shallowCopy.schemaValidator.validator == NULL;
+						 shallowCopy.schemaValidator.validator == NULL &&
+						 strcmp(shallowCopy.options.collationString,
+								expectedCollationString) == 0;
 
 	/* Case 3: a non-existent collection id reports false. */
 	MongoCollection missingCopy;
@@ -1808,7 +1818,7 @@ GetCollectionOrViewCore(PG_FUNCTION_ARGS, bool allowViews)
  * transaction may have created it).
  */
 bool
-CreateCollection(Datum dbNameDatum, Datum collectionNameDatum)
+CreateCollection(Datum dbNameDatum, Datum collectionNameDatum, bool canUseLibPq)
 {
 	char *collectionNameStr = TextDatumGetCString(collectionNameDatum);
 	if (collectionNameStr != NULL && strlen(collectionNameStr) == 0)
@@ -1816,9 +1826,6 @@ CreateCollection(Datum dbNameDatum, Datum collectionNameDatum)
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDNAMESPACE),
 						errmsg("An invalid and empty namespace has been specified")));
 	}
-
-	const char *cmdStr = FormatSqlQuery("SELECT %s.create_collection($1, $2)",
-										ApiSchemaName);
 
 	Oid argTypes[CREATE_COLLECTION_FUNC_NARGS] = { TEXTOID, TEXTOID };
 	Datum argValues[CREATE_COLLECTION_FUNC_NARGS] = {
@@ -1831,11 +1838,9 @@ CreateCollection(Datum dbNameDatum, Datum collectionNameDatum)
 
 	bool isNull = true;
 	bool readOnly = false;
-	Datum resultDatum = ExtensionExecuteQueryWithArgsViaSPI(cmdStr,
-															CREATE_COLLECTION_FUNC_NARGS,
-															argTypes, argValues, argNulls,
-															readOnly, SPI_OK_SELECT,
-															&isNull);
+	Datum resultDatum = RunCollectionLevelFunctionWithPrivilegeChecks(
+		ApiSchemaName, "create_collection", argValues, argTypes, argNulls,
+		CREATE_COLLECTION_FUNC_NARGS, readOnly, canUseLibPq, &isNull);
 	if (isNull)
 	{
 		ereport(ERROR, (errmsg("create_collection unexpectedly "
@@ -2698,6 +2703,13 @@ CopyCollectionOptions(const pgbson *options, MongoCollection *collection)
 		{
 			collection->options.statsEnabled =
 				BsonValueAsBool(bson_iter_value(&optionsIter));
+		}
+		else if (strcmp(key, "collation") == 0)
+		{
+			const bson_value_t *collationValue = bson_iter_value(&optionsIter);
+
+			ParseAndGetCollationString(collationValue,
+									   collection->options.collationString);
 		}
 	}
 }

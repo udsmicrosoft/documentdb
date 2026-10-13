@@ -30,6 +30,87 @@ ERROR:  Username is reserved, use a different username.
 SELECT documentdb_api.create_user('{"createUser":"newBlock2_user", "pwd":"test_password", "roles":[{"role":"readWriteAnyDatabase","db":"admin"}, {"role":"clusterAdmin","db":"admin"}], "$db":"admin"}');
 ERROR:  Username is reserved, use a different username.
 RESET documentdb.blockedRolePrefixList;
+-- Passwords that fail SASLprep must not create or change native users.
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_emoji", "pwd":"Valid\ud83e\uddeaPass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+\echo :SQLSTATE
+M0001
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_private_use", "pwd":"Valid\ue000Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_bidi", "pwd":"Valid\u05d0Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_empty", "pwd":"\u00ad", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+-- Raw BSON reaches password validation without the JSON decoder rejecting UTF-8.
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"createUser":"saslprep_rejected_utf8", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}') AS command
+)
+SELECT documentdb_api.create_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+ERROR:  Password contains prohibited characters. Use a different password.
+\echo :SQLSTATE
+M0001
+SELECT count(*) AS rejected_users_created
+FROM pg_authid
+WHERE rolname LIKE 'saslprep_rejected_%';
+ rejected_users_created 
+------------------------
+                      0
+(1 row)
+
+SET client_min_messages TO WARNING;
+DROP ROLE IF EXISTS saslprep_rejected_emoji, saslprep_rejected_private_use,
+    saslprep_rejected_bidi, saslprep_rejected_empty, saslprep_rejected_utf8;
+RESET client_min_messages;
+SELECT documentdb_api.create_user('{"createUser":"saslprep_update_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+            create_user            
+-----------------------------------
+ { "ok" : { "$numberInt" : "1" } }
+(1 row)
+
+SELECT rolpassword AS saslprep_original_password
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user' \gset
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ud83e\uddeaPass123!", "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+\echo :SQLSTATE
+M0001
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ue000Pass123!", "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\u05d0Pass123!", "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"\u00ad", "$db":"admin"}');
+ERROR:  Password contains prohibited characters. Use a different password.
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"updateUser":"saslprep_update_user", "pwd":"test_password", "$db":"admin"}') AS command
+)
+SELECT documentdb_api.update_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+ERROR:  Password contains prohibited characters. Use a different password.
+\echo :SQLSTATE
+M0001
+SELECT rolpassword = :'saslprep_original_password' AS password_unchanged
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user';
+ password_unchanged 
+--------------------
+ t
+(1 row)
+
+SELECT pg_has_role('saslprep_update_user', 'documentdb_readonly_role', 'MEMBER') AS membership_unchanged;
+ membership_unchanged 
+----------------------
+ t
+(1 row)
+
+SELECT documentdb_api.drop_user('{"dropUser":"saslprep_update_user", "$db":"admin"}');
+             drop_user             
+-----------------------------------
+ { "ok" : { "$numberInt" : "1" } }
+(1 row)
+
 --Enable DB admin requirement feature flag
 SET documentdb.enableUsersAdminDBCheck TO ON;
 -- Test user APIs with non-admin database - all should fail
@@ -745,7 +826,7 @@ SELECT documentdb_api.insert_one(
     'gating_user_db',
     'gating_user_collection',
     '{"_id":1,"value":"standalone"}');
-                              insert_one
+                              insert_one                              
 ----------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
 (1 row)
@@ -753,7 +834,7 @@ SELECT documentdb_api.insert_one(
 SELECT documentdb_api.count_query(
     'gating_user_db',
     '{"count":"gating_user_collection","query":{"value":"standalone"}}');
-                             count_query
+                             count_query                              
 ----------------------------------------------------------------------
  { "n" : { "$numberInt" : "1" }, "ok" : { "$numberDouble" : "1.0" } }
 (1 row)
@@ -834,7 +915,7 @@ SELECT pg_has_role('customRoleUser', 'customUserRole', 'MEMBER');
 (1 row)
 
 SELECT documentdb_api.users_info('{"usersInfo":"customRoleUser", "$db":"admin"}');
-                                                                                                           users_info
+                                                                                                           users_info                                                                                                           
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  { "users" : [ { "_id" : "admin.customRoleUser", "userId" : "admin.customRoleUser", "user" : "customRoleUser", "db" : "admin", "roles" : [ { "role" : "customUserRole", "db" : "admin" } ] } ], "ok" : { "$numberInt" : "1" } }
 (1 row)
@@ -842,7 +923,7 @@ SELECT documentdb_api.users_info('{"usersInfo":"customRoleUser", "$db":"admin"}'
 SELECT documentdb_core.bson_to_json_string(
         documentdb_api.users_info('{"usersInfo":1, "$db":"admin"}'))::text
     LIKE '%"role" : "customUserRole"%' AS custom_role_reported;
- custom_role_reported
+ custom_role_reported 
 ----------------------
  t
 (1 row)
@@ -864,7 +945,7 @@ SET ROLE "customRoleUser";
 SELECT document
 FROM documentdb_api_catalog.bson_aggregation_find(
         'admin', '{"find":"system.users"}');
-                                                                  document
+                                                                  document                                                                  
 --------------------------------------------------------------------------------------------------------------------------------------------
  { "_id" : "admin.customRoleUser", "user" : "customRoleUser", "db" : "admin", "roles" : [ { "db" : "admin", "role" : "customUserRole" } ] }
 (1 row)
@@ -873,7 +954,7 @@ SELECT documentdb_api.users_info(
         '{"usersInfo":"customRoleUser", "$db":"admin"}') AS custom_users_info \gset
 SELECT :'custom_users_info' LIKE '%"role" : "customUserRole"%'
     AS custom_role_reported_by_users_info;
- custom_role_reported_by_users_info
+ custom_role_reported_by_users_info 
 ------------------------------------
  t
 (1 row)
@@ -882,7 +963,7 @@ SELECT documentdb_api.connection_status(
         '{"connectionStatus":1, "$db":"admin"}') AS custom_connection_status \gset
 SELECT :'custom_connection_status' LIKE '%"role" : "customUserRole"%'
     AS custom_role_reported_by_connection_status;
- custom_role_reported_by_connection_status
+ custom_role_reported_by_connection_status 
 -------------------------------------------
  t
 (1 row)

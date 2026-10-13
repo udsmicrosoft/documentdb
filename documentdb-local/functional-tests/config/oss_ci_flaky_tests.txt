@@ -1915,5 +1915,8 @@ docdb_functional_tests/documentdb_tests/compatibility/tests/core/operator/system
 #    case times out waiting for its own 'query' op to show up within 10s.
 #    Non-strict absorbs either outcome.
 docdb_functional_tests/documentdb_tests/compatibility/tests/core/operator/system-stages/currentOp/test_system_stage_currentOp_live_state.py::test_currentOp_live_state[documentdb-command_full_truncateOps_omitted_large]
+# Added after #754 run 37336468513: the truncateOps false variant flaps the same way
+# (XPASS(strict) in the run before, then the same 10s wait for its own query op).
+docdb_functional_tests/documentdb_tests/compatibility/tests/core/operator/system-stages/currentOp/test_system_stage_currentOp_live_state.py::test_currentOp_live_state[documentdb-command_full_truncateOps_false_large]
 docdb_functional_tests/documentdb_tests/compatibility/tests/core/operator/system-stages/currentOp/test_system_stage_currentOp_live_state.py::test_currentOp_live_state[documentdb-idle_connections_true_reports_inactive]
 docdb_functional_tests/documentdb_tests/compatibility/tests/core/operator/system-stages/currentOp/test_system_stage_currentOp_live_state.py::test_currentOp_live_state[documentdb-inactive_op_document_fields]

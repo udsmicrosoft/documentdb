@@ -947,7 +947,22 @@ restartScanEntry:
 			entry->isFinished = setListPositionScanEntry(rumstate, entry);
 			if (!entry->isFinished)
 			{
-				entry->curItem = entry->list[entry->offset];
+				if (entry->nlist > 0)
+				{
+					entry->curItem = entry->list[entry->offset];
+				}
+				else
+				{
+					/*
+					 * The leftmost leaf of the posting tree is empty: its
+					 * items were removed, but boundary leaves are never
+					 * deleted by vacuum. Do not read an uninitialized list
+					 * slot. Seed curItem with the minimum so the subsequent
+					 * walk resumes from the first live item on a later leaf
+					 * instead of a garbage value.
+					 */
+					RumItemSetMin(&entry->curItem);
+				}
 			}
 		}
 		else if (RumGetNPosting(itup) > 0)
@@ -1667,7 +1682,21 @@ PrepareOrderedMatchedEntry(RumScanOpaque so, RumScanEntry entry,
 		entry->isFinished = setListPositionScanEntry(&so->rumstate, entry);
 		if (!entry->isFinished)
 		{
-			entry->curItem = entry->list[entry->offset];
+			if (entry->nlist > 0)
+			{
+				entry->curItem = entry->list[entry->offset];
+			}
+			else
+			{
+				/*
+				 * The leftmost leaf of the posting tree is empty: its items
+				 * were removed, but boundary leaves are never deleted by
+				 * vacuum. Do not read an uninitialized list slot. Seed curItem
+				 * with the minimum so the subsequent walk resumes from the
+				 * first live item on a later leaf instead of a garbage value.
+				 */
+				RumItemSetMin(&entry->curItem);
+			}
 		}
 	}
 	else if (RumGetNPosting(itup) > 0)
@@ -2681,9 +2710,23 @@ entryGetNextItemList(RumState *rumstate, RumScanEntry entry, Snapshot snapshot)
 		entry->isFinished = setListPositionScanEntry(rumstate, entry);
 	}
 
-	Assert(entry->nlist > 0 && entry->list);
+	Assert(entry->list);
 
-	entry->curItem = entry->list[entry->offset];
+	if (entry->nlist > 0)
+	{
+		entry->curItem = entry->list[entry->offset];
+	}
+	else
+	{
+		/*
+		 * The leftmost leaf of the posting tree is empty: its items were
+		 * removed, but boundary leaves are never deleted by vacuum. Do not
+		 * read an uninitialized list slot. Seed curItem with the minimum so
+		 * the subsequent walk resumes from the first live item on a later
+		 * leaf instead of a garbage value.
+		 */
+		RumItemSetMin(&entry->curItem);
+	}
 	entry->offset += entry->scanDirection;
 
 	SCAN_ENTRY_GET_KEY(entry, rumstate, itup);
@@ -5458,6 +5501,11 @@ RMGR_PG_FUNCTION_DEF(documentdb_rum_get_current_index_key)
 
 	Page page = so->orderByScanData->orderByEntryPageCopy;
 
+	if (so->orderByScanData->orderStack == NULL)
+	{
+		PG_RETURN_DATUM((Datum) 0);
+	}
+
 	OffsetNumber off = so->orderByScanData->orderStack->off;
 
 	/* Off would already be pointing to the next item */
@@ -5659,6 +5707,10 @@ TrySkipScanToNextDistinctKey(IndexScanDesc scan, RumScanOpaque so,
 	/* Re-seek the ordered scan to the new skip bound. */
 	rumFlushKilledEntries(so);
 	startScanEntryOrderedCore(so, entry, scan->xs_snapshot);
-	entry->isFinished = false;
+	if (so->orderByScanData->orderStack != NULL)
+	{
+		entry->isFinished = false;
+	}
+
 	return true;
 }

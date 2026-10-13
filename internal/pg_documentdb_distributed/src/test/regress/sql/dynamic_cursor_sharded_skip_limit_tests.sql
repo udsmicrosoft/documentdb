@@ -1,0 +1,196 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+-- SPDX-License-Identifier: MIT
+
+-- Tier 3 regression guard: dynamic cursors on a SHARDED collection.
+--
+-- Dynamic cursors apply to unsharded collections only; a sharded collection
+-- uses the sharded persistent model even when skip/limit streaming is enabled.
+-- The goal here is a thin guard proving that the enabled feature does not
+-- regress skip/limit pagination on a sharded collection: every window must
+-- return the correct number of documents across getMore boundaries.
+--
+-- Results on a sharded collection are order-unspecified (rows are gathered from
+-- multiple shards), so the helper reports only the drained total count plus the
+-- fallback classification (persistConnection) - both stable across runs.
+
+SET search_path TO documentdb_api, documentdb_core, documentdb_api_catalog, documentdb_api_internal;
+
+SET documentdb.next_collection_id TO 62000;
+SET citus.next_shard_id TO 6200000;
+SET documentdb.next_collection_index_id TO 62000;
+
+SET documentdb.enableDynamicCursors TO on;
+SET documentdb.enable_dynamic_cursor_with_skiplimit TO on;
+
+-- ===========================================================================
+-- Data setup: 30 documents across two hashed shard-key values (15 + 15)
+-- ===========================================================================
+SELECT documentdb_api.drop_collection('dyncur_sharded_db', 'shard_coll');
+SELECT documentdb_api.create_collection('dyncur_sharded_db', 'shard_coll');
+SELECT documentdb_api.shard_collection('dyncur_sharded_db', 'shard_coll', '{ "sh": "hashed" }', false);
+
+SELECT COUNT(documentdb_api.insert_one('dyncur_sharded_db', 'shard_coll',
+    FORMAT('{ "_id": %s, "sh": 1, "val": %s }', i, i)::documentdb_core.bson))
+FROM generate_series(1, 15) AS i;
+
+SELECT COUNT(documentdb_api.insert_one('dyncur_sharded_db', 'shard_coll',
+    FORMAT('{ "_id": %s, "sh": 2, "val": %s }', i + 100, i)::documentdb_core.bson))
+FROM generate_series(1, 15) AS i;
+
+ANALYZE documentdb_data.documents_62000;
+
+-- ===========================================================================
+-- Helper: drain all pages, report total drained count + fallback classification
+-- ===========================================================================
+CREATE OR REPLACE FUNCTION sharded_window_report(
+    p_label   text,
+    p_find    text,
+    p_getmore text,
+    p_batch_size int,
+    p_expected bigint,
+    p_is_agg  bool DEFAULT false
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_page    documentdb_core.bson;
+    v_cont    documentdb_core.bson;
+    v_persist bool;
+    v_total   bigint := 0;
+    v_batch   bigint;
+    v_ids     text[] := '{}';
+    v_batch_ids text[];
+    v_distinct bigint;
+    v_had_continuation bool;
+BEGIN
+    IF p_is_agg THEN
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM aggregate_cursor_first_page(database => 'dyncur_sharded_db',
+            commandSpec => p_find::documentdb_core.bson, cursorId => 700) fp;
+    ELSE
+        SELECT fp.cursorPage, fp.continuation, fp.persistconnection
+        INTO v_page, v_cont, v_persist
+        FROM find_cursor_first_page(database => 'dyncur_sharded_db',
+            commandSpec => p_find::documentdb_core.bson, cursorId => 700) fp;
+    END IF;
+
+    SELECT (bson_dollar_project(v_page,
+        '{ "c": { "$size": { "$ifNull": ["$cursor.firstBatch", []] } } }') ->> 'c')::bigint
+    INTO v_batch;
+    v_total := v_total + COALESCE(v_batch, 0);
+    IF v_batch > p_batch_size THEN
+        RAISE EXCEPTION '%: first page returned % rows for batchSize %',
+            p_label, v_batch, p_batch_size;
+    END IF;
+    v_had_continuation := v_cont IS NOT NULL;
+    IF p_expected > p_batch_size AND NOT v_had_continuation THEN
+        RAISE EXCEPTION '%: expected pagination for % rows with batchSize %',
+            p_label, p_expected, p_batch_size;
+    END IF;
+        SELECT array_agg(value->'_id'->>'$numberInt' ORDER BY ordinality)
+        INTO v_batch_ids
+        FROM jsonb_array_elements((v_page::text::jsonb)->'cursor'->'firstBatch')
+            WITH ORDINALITY;
+        v_ids := v_ids || COALESCE(v_batch_ids, '{}');
+
+    WHILE v_cont IS NOT NULL LOOP
+        SELECT gm.cursorPage, gm.continuation
+        INTO v_page, v_cont
+        FROM cursor_get_more(database => 'dyncur_sharded_db',
+            getMoreSpec => p_getmore::documentdb_core.bson,
+            continuationSpec => v_cont) gm;
+
+        SELECT (bson_dollar_project(v_page,
+            '{ "c": { "$size": { "$ifNull": ["$cursor.nextBatch", []] } } }') ->> 'c')::bigint
+        INTO v_batch;
+        v_total := v_total + COALESCE(v_batch, 0);
+        IF v_batch > p_batch_size THEN
+            RAISE EXCEPTION '%: getMore returned % rows for batchSize %',
+                p_label, v_batch, p_batch_size;
+        END IF;
+        SELECT array_agg(value->'_id'->>'$numberInt' ORDER BY ordinality)
+        INTO v_batch_ids
+        FROM jsonb_array_elements((v_page::text::jsonb)->'cursor'->'nextBatch')
+             WITH ORDINALITY;
+        v_ids := v_ids || COALESCE(v_batch_ids, '{}');
+    END LOOP;
+
+    SELECT count(DISTINCT id) INTO v_distinct FROM unnest(v_ids) AS id;
+    IF v_total IS DISTINCT FROM p_expected OR v_distinct IS DISTINCT FROM v_total THEN
+        RAISE EXCEPTION '%: expected % rows without duplicates, got % rows and % distinct ids',
+            p_label, p_expected, v_total, v_distinct;
+    END IF;
+
+    RETURN format('%s: total=%s, coordinator_holds_portal=%s', p_label, v_total, v_persist);
+END;
+$$;
+
+-- ===========================================================================
+-- Baseline: full drain returns every document
+-- ===========================================================================
+SELECT sharded_window_report('T0 baseline no skip/limit',
+    '{ "find": "shard_coll", "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }', 4, 30);
+
+-- ===========================================================================
+-- FIND: skip / limit / skip+limit windows
+-- ===========================================================================
+
+-- T1: skip>0 -> 25 docs (30 - 5)
+SELECT sharded_window_report('T1 skip>0',
+    '{ "find": "shard_coll", "skip": 5, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }', 4, 25);
+
+-- T2: limit>1 -> exactly 7 docs
+SELECT sharded_window_report('T2 limit>1',
+    '{ "find": "shard_coll", "limit": 7, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }', 4, 7);
+
+-- T3: skip + limit -> exactly 10 docs (skip 4, take 10)
+SELECT sharded_window_report('T3 skip+limit',
+    '{ "find": "shard_coll", "skip": 4, "limit": 10, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }', 4, 10);
+
+-- T4: skip == total -> empty window
+SELECT sharded_window_report('T4 skip==total',
+    '{ "find": "shard_coll", "skip": 30, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }', 4, 0);
+
+-- T5: limit >= total -> all 30 docs
+SELECT sharded_window_report('T5 limit>=total',
+    '{ "find": "shard_coll", "limit": 100, "batchSize": 4 }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }', 4, 30);
+
+-- T6: filter + skip + limit -> 5 docs (sh=1 has 15 docs; skip 5, take 5)
+SELECT sharded_window_report('T6 filter+skip+limit',
+    '{ "find": "shard_coll", "filter": { "sh": 1 }, "skip": 5, "limit": 5, "batchSize": 3 }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 3 }', 3, 5);
+
+-- ===========================================================================
+-- AGGREGATE: $skip / $limit / $skip+$limit windows
+-- ===========================================================================
+
+-- T7: $skip>0 -> 25 docs
+SELECT sharded_window_report('T7 $skip>0',
+    '{ "aggregate": "shard_coll", "pipeline": [ { "$skip": 5 } ], "cursor": { "batchSize": 4 } }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }',
+    4, 25, true);
+
+-- T8: $limit>1 -> 7 docs
+SELECT sharded_window_report('T8 $limit>1',
+    '{ "aggregate": "shard_coll", "pipeline": [ { "$limit": 7 } ], "cursor": { "batchSize": 4 } }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }',
+    4, 7, true);
+
+-- T9: $skip + $limit -> 10 docs (skip 4, take 10)
+SELECT sharded_window_report('T9 $skip+$limit',
+    '{ "aggregate": "shard_coll", "pipeline": [ { "$skip": 4 }, { "$limit": 10 } ], "cursor": { "batchSize": 4 } }',
+    '{ "getMore": { "$numberLong": "700" }, "collection": "shard_coll", "batchSize": 4 }',
+    4, 10, true);
+
+-- ===========================================================================
+-- Cleanup
+-- ===========================================================================
+RESET documentdb.enable_dynamic_cursor_with_skiplimit;
+DROP FUNCTION IF EXISTS sharded_window_report(text, text, text, int, bigint, bool);
+SELECT documentdb_api.drop_collection('dyncur_sharded_db', 'shard_coll');

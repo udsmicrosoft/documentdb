@@ -124,13 +124,14 @@ run_mongosh_script() {
     local init_file="${1:-}"
     local init_mode="${2:-load}"
 
+    # File mode propagates JavaScript errors; interactive stdin exits zero at EOF.
     DOCUMENTDB_HOST="$DOCUMENTDB_HOST" \
     DOCUMENTDB_PORT="$DOCUMENTDB_PORT" \
     DOCUMENTDB_USERNAME="$USERNAME" \
     DOCUMENTDB_PASSWORD="$PASSWORD" \
     DOCUMENTDB_INIT_FILE="$init_file" \
     DOCUMENTDB_INIT_MODE="$init_mode" \
-        mongosh --quiet --nodb <<'EOF'
+        mongosh --quiet --nodb --file /dev/stdin <<'EOF'
 const host = process.env.DOCUMENTDB_HOST || 'localhost';
 const port = process.env.DOCUMENTDB_PORT;
 const username = process.env.DOCUMENTDB_USERNAME;
@@ -148,7 +149,7 @@ if (initMode === 'ping') {
     // init scripts that reference the ambient `db` without calling use().
     // The URI above targets /admin only for authentication (authSource=admin);
     // the previous `mongosh localhost:PORT --file` invocation defaulted to
-    // 'test'. Scripts that select their own db (e.g. use('sampledb')) are
+    // 'test'. Scripts that select their own db (e.g. use('StoreData')) are
     // unaffected because their use() runs after this and overrides it.
     db = db.getSiblingDB('test');
     load(initFile);

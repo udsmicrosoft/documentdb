@@ -125,6 +125,13 @@ HandlePreParsedDollarMeta(pgbson *doc, void *arguments,
 
 	bson_value_t currentValue = childResult.value;
 
+	if (currentValue.value_type != BSON_TYPE_UTF8)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_LOCATION17308),
+						errmsg("$meta expected value of type text, found %s",
+							   BsonTypeNameExtended(currentValue.value_type))));
+	}
+
 	StringView valueView = {
 		.string = currentValue.value.v_utf8.str,
 		.length = currentValue.value.v_utf8.len

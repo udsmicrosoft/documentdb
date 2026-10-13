@@ -296,10 +296,15 @@ void SendTupleToClient(HeapTuple tup, TupleDesc tupDesc,
 List * CheckForConflictsAndPruneExistingIndexes(uint64 collectionId,
 												List *indexDefList,
 												List **inBuildIndexIds);
+bool CheckIndexSpecConflictWithExistingIndexes(uint64 collectionId,
+											   const IndexSpec *indexSpec,
+											   int *inBuildIndexId,
+											   int excludedIndexId);
 char * CreatePostgresIndexCreationCmd(uint64 collectionId, IndexDef *indexDef, int
 									  indexId,
 									  bool concurrently, bool isTempCollection,
-									  bool isBackgroundBuild);
+									  bool isBackgroundBuild,
+									  bool isUpgradeOptionsCommand);
 void ExecuteCreatePostgresIndexCmd(char *cmd, bool concurrently, const Oid userOid,
 								   bool useSerialExecution);
 void UpdateIndexStatsForPostgresIndex(uint64 collectionId, List *indexIdList);

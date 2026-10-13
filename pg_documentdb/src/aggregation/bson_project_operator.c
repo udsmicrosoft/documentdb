@@ -737,9 +737,10 @@ ValidateFindProjectionSpecAndSetNodeContext(BsonLeafPathNode *child,
 
 			/* ElemMatch state to hold the compiled expression as well as record the index in projection spec */
 			elemMatchState->index = treeState->totalElemMatchProjections++;
-			elemMatchState->elemMatchExprState = GetExpressionEvalState(
+			elemMatchState->elemMatchExprState = GetExpressionEvalStateWithCollation(
 				operatorValue,
-				CurrentMemoryContext);
+				CurrentMemoryContext,
+				treeState->collationString);
 			SetOperatorFlag(treeState->operatorExistenceFlag,
 							FindProjectionOperators_ElemMatch);
 			projectionOpHandlerContext->state = elemMatchState;

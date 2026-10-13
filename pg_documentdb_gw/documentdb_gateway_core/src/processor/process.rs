@@ -12,8 +12,8 @@ use crate::{
     explain,
     postgres::PgDataClient,
     processor::{
-        constant, cursor, data_description, data_management, indexing, ismaster, roles, session,
-        transaction, users,
+        constant, cursor, data_description, data_management, indexing, ismaster, list_commands,
+        roles, server_status, session, transaction, users,
     },
     requests::RequestType,
     responses::Response,
@@ -199,9 +199,9 @@ pub async fn process_request(
         | RequestType::PlanCacheClearFilters
         | RequestType::PlanCacheSetFilter
         | RequestType::RefreshSessions
-        | RequestType::KillAllSessions
         | RequestType::KillAllSessionsByPattern
         | RequestType::EnableSharding => Ok(constant::ok_response()),
+        RequestType::KillAllSessions => session::validate_kill_all_sessions(request_context),
         RequestType::PlanCacheListFilters => Ok(constant::plan_cache_list_filters_response()),
         RequestType::SaslContinue | RequestType::SaslStart | RequestType::Logout => Err(
             DocumentDBError::internal_error("Command should have been handled by Auth".to_owned()),
@@ -220,6 +220,11 @@ pub async fn process_request(
             data_management::process_validate(request_context, connection_context, pg_data_client)
                 .await
         }
+        RequestType::ServerStatus => Ok(server_status::process(
+            request_context,
+            connection_context,
+            &dynamic_config,
+        )),
         RequestType::DropIndexes => {
             indexing::process_drop_indexes(request_context, connection_context, pg_data_client)
                 .await
@@ -278,7 +283,7 @@ pub async fn process_request(
         RequestType::AbortTransaction => {
             transaction::process_abort(connection_context, request_context.activity_id).await
         }
-        RequestType::ListCommands => Ok(constant::list_commands()),
+        RequestType::ListCommands => Ok(list_commands::process(dynamic_config.as_ref())),
         RequestType::EndSessions | RequestType::KillSessions => {
             session::end_or_kill_sessions(request_context, connection_context, pg_data_client).await
         }

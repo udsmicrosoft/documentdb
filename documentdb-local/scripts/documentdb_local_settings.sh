@@ -14,8 +14,14 @@
 # Row: FLAG|ENV_VAR|DEFAULT|TYPE|LABEL
 #   FLAG     command-line spelling; every flag takes one value
 #   DEFAULT  applied when the variable is unset or empty; "" means none
-#   TYPE     uint | bool (true/false) | enum:a,b,c | string
+#   TYPE     uint | bool (true/false) | boolish | enum:a,b,c | string
 #   LABEL    how error messages name the setting
+#
+# "boolish" is "bool" for a setting a user must always be able to turn off,
+# whatever spelling they reach for. A strict bool rejects anything but
+# true/false and aborts the container, which for a privacy opt-out means
+# trying to opt out breaks the container; see
+# documentdb_local_parse_boolish.
 #
 # Two defaults are applied by the entrypoint itself, not by the generic pass:
 # OWNER (computed as the current user) and DOCUMENTDB_TOAST_COMPRESSION (the
@@ -33,6 +39,7 @@ DOCUMENTDB_LOCAL_SETTINGS=(
     "--start-pg|START_POSTGRESQL|true|bool|start-pg"
     "--allow-external-connections|ALLOW_EXTERNAL_CONNECTIONS|false|bool|allow-external-connections"
     "--enable-telemetry|ENABLE_TELEMETRY|false|bool|enable-telemetry"
+    "--usage-telemetry|DOCUMENTDB_USAGE_TELEMETRY|true|boolish|usage-telemetry"
     "--log-level|LOG_LEVEL|info|enum:quiet,error,warn,info,debug,trace|log level"
     "--tlsMode|TLS_MODE|allowTLS|enum:disabled,allowTLS,requireTLS|tlsMode"
     "--cert-path|CERT_PATH||string|cert-path"
@@ -78,5 +85,25 @@ documentdb_local_setting_allowed() {
     type="${row#*|}"; type="${type#*|}"; type="${type#*|}"; type="${type%%|*}"
     case "$type" in
         enum:*) printf '%s' "${type#enum:}" | sed 's/,/, /g' ;;
+    esac
+}
+
+# documentdb_local_parse_boolish <VALUE>: print "true" or "false" for any of
+# the spellings people reasonably reach for, case-insensitively.
+#
+# The canonical parser for every "boolish" setting. The entrypoint and the
+# usage-telemetry emitter both use it so a value cannot mean one thing to the
+# setting validator and the opposite to the code that acts on it -- a
+# disagreement that would silently ignore an opt-out.
+#
+# An unrecognized value prints "false" and returns 1 so the caller can warn.
+# Erring to "false" is deliberate: every boolish setting is an off switch, and
+# honoring an unparsable off switch as "on" is the one outcome a user who
+# typed it can reasonably call a bug.
+documentdb_local_parse_boolish() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|y|on|enable|enabled)    printf 'true' ;;
+        false|0|no|n|off|disable|disabled) printf 'false' ;;
+        *) printf 'false'; return 1 ;;
     esac
 }

@@ -40,6 +40,14 @@ bool EnableWriteDocumentsInRepath = DEFAULT_ENABLE_WRITE_DOCUMENTS_IN_REPATH;
 bool EnableBsonSelectivityFromBtreeStats =
 	DEFAULT_ENABLE_BSON_SELECTIVITY_FROM_BTREE_STATS;
 
+/* SystemConfig */
+
+/* Whether ANALYZE on bson expression statistics unpacks array values into
+ * their elements so that equality on an array path is estimated per element.
+ */
+#define DEFAULT_BSON_STATS_ENABLE_ARRAY_VALUE_UNPACK false
+bool BsonStatsEnableArrayValueUnpack = DEFAULT_BSON_STATS_ENABLE_ARRAY_VALUE_UNPACK;
+
 /*
  * Initializes core configurations pertaining to documentdb core.
  */
@@ -75,5 +83,13 @@ InitDocumentDBCoreConfigurations(const char *prefix)
 			"Whether to enable selectivity calculations based on btree statistics for bson btree operators."),
 		NULL, &EnableBsonSelectivityFromBtreeStats,
 		DEFAULT_ENABLE_BSON_SELECTIVITY_FROM_BTREE_STATS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.bson_stats_enable_array_value_unpack", prefix),
+		gettext_noop(
+			"Whether to collect bson expression statistics over the elements of array values."),
+		NULL, &BsonStatsEnableArrayValueUnpack,
+		DEFAULT_BSON_STATS_ENABLE_ARRAY_VALUE_UNPACK,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 }

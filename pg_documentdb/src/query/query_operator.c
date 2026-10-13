@@ -144,7 +144,6 @@ typedef struct MatchNamespaceFiltersContext
 	bool isInvalidNSFilters;
 } MatchNamespaceFiltersContext;
 
-extern bool EnableObjectIdFuncExprConversion;
 extern bool EnablePartialFilterEvalOnPlanner;
 extern bool EnableSupportFunctionIdPushdown;
 
@@ -2153,6 +2152,11 @@ CreateBoolExprFromLogicalExpression(bson_iter_t *queryDocIterator,
 		SchemaTreeState localTreeStateIgnore = { };
 		bson_iter_t schemaIter;
 		const bson_value_t *queryDocValue = bson_iter_value(queryDocIterator);
+		if (queryDocValue->value_type != BSON_TYPE_DOCUMENT)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_TYPEMISMATCH),
+							errmsg("$jsonSchema must be of object type")));
+		}
 		BsonValueInitIterator(queryDocValue, &schemaIter);
 		BuildSchemaTree(&localTreeStateIgnore, &schemaIter);
 
@@ -4291,8 +4295,7 @@ VisitIdFilterExpression(Node *node, IdFilterWalkerContext *context)
 				/* For $regex on _id, we can mutate the existing expression if applicable
 				 * TODO: Expand this to more scenarios and operators.
 				 */
-				if (EnableObjectIdFuncExprConversion &&
-					TryConvertExistingExpression(funcExpr, context, indexOp))
+				if (TryConvertExistingExpression(funcExpr, context, indexOp))
 				{
 					return false;
 				}

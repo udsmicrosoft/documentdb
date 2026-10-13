@@ -9,10 +9,6 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[features]
-default = []
-postgres-sql-commenter = ["documentdb_gateway_core/postgres-sql-commenter"]
-
 [dependencies]
 documentdb_gateway_core.workspace = true
 metrics.workspace = true

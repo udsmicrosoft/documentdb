@@ -1,6 +1,8 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
  *
+ * SPDX-License-Identifier: MIT
+ *
  * src/aggregation/bson_aggregation_pipeline.c
  *
  * Implementation of the backend query generation for pipelines.
@@ -88,7 +90,6 @@ extern bool SkipFailOnCollation;
 extern bool DefaultInlineWriteOperations;
 extern int MaxAggregationStagesAllowed;
 
-extern bool FailOnNonEmptyGroupCountArg;
 extern bool ForceGroupSubqueryElimination;
 extern bool EnableTailableCursorMaxAwaitTime;
 extern bool RemoveMatchNamespaceFilters;
@@ -98,11 +99,9 @@ extern bool EnableScalarAggregateIndexPushdown;
 extern bool EnableScalarAggregateAccumulatorPathCollection;
 extern bool EnableProjectPushUpBeforeUnwindWithGroup;
 extern bool EnableSortPushToAccumulatorWithPrefix;
-extern bool EnableSampleScanFixOnSharded;
 extern bool EnableSampleScanPushdownForDynamicCursor;
 extern bool EnableDistinctIndexPushdown;
 extern bool EnableDistinctExistsFilterPushdown;
-extern bool EnableSubqueryPushdownForMatch;
 extern bool EnableDollarSampleReservoirScan;
 extern bool EnableSupportFunctionIdPushdown;
 
@@ -320,11 +319,15 @@ static Query * HandleFill(const bson_value_t *existingValue, Query *query,
 						  AggregationPipelineBuildContext *context);
 static Query * HandleLimit(const bson_value_t *existingValue, Query *query,
 						   AggregationPipelineBuildContext *context);
+static Query * HandleFindLimit(const bson_value_t *existingValue, Query *query,
+							   AggregationPipelineBuildContext *context);
 static Query * HandleProject(const bson_value_t *existingValue, Query *query,
 							 AggregationPipelineBuildContext *context);
 static Query * HandleProjectFind(const bson_value_t *existingValue,
 								 const bson_value_t *queryValue, Query *query,
 								 AggregationPipelineBuildContext *context);
+static Query * HandleProjectFindStage(const bson_value_t *stageValue, Query *query,
+									  AggregationPipelineBuildContext *context);
 static Query * HandleRedact(const bson_value_t *existingValue, Query *query,
 							AggregationPipelineBuildContext *context);
 static Query * HandleReplaceRoot(const bson_value_t *existingValue, Query *query,
@@ -336,6 +339,8 @@ static Query * HandleSample(const bson_value_t *existingValue, Query *query,
 static int64_t ParseSampleSize(const bson_value_t *sizeValue);
 static Query * HandleSkip(const bson_value_t *existingValue, Query *query,
 						  AggregationPipelineBuildContext *context);
+static Query * HandleFindSkip(const bson_value_t *existingValue, Query *query,
+							  AggregationPipelineBuildContext *context);
 static Query * HandleSort(const bson_value_t *existingValue, Query *query,
 						  AggregationPipelineBuildContext *context);
 static Query * HandleSortByCount(const bson_value_t *existingValue, Query *query,
@@ -348,6 +353,8 @@ static Query * HandleDistinct(const StringView *existingValue, Query *query,
 							  AggregationPipelineBuildContext *context);
 static Query * HandleGeoNear(const bson_value_t *existingValue, Query *query,
 							 AggregationPipelineBuildContext *context);
+static Query * HandleMatchForFind(const bson_value_t *existingValue, Query *query,
+								  AggregationPipelineBuildContext *context);
 static Query * HandleMatchAggregationStage(const bson_value_t *existingValue,
 										   Query *query,
 										   AggregationPipelineBuildContext *context);
@@ -374,6 +381,8 @@ static bool CanInlineLookupStageSetAddFields(const bson_value_t *stageValue, con
 											 StringView *lookupPath, bool hasLet);
 static bool CanInlineLookupStageProject(const bson_value_t *stageValue, const
 										StringView *lookupPath, bool hasLet);
+static bool CanInlineLookupStageProjectFind(const bson_value_t *stageValue, const
+											StringView *lookupPath, bool hasLet);
 static bool CanInlineLookupStageUnset(const bson_value_t *stageValue, const
 									  StringView *lookupPath, bool hasLet);
 static bool CanInlineLookupStageUnwind(const bson_value_t *stageValue, const
@@ -396,8 +405,6 @@ static void RewriteFillToSetWindowFieldsSpec(const bson_value_t *fillSpec,
 											 bson_value_t *addFieldsForValueFill,
 											 bson_value_t *setWindowFieldsSpec,
 											 bson_value_t *partitionByFields);
-static List * TryOptimizeAggregationPipelines(List *aggregationStages,
-											  AggregationPipelineBuildContext *context);
 static bool IsPipelineStageFollowedByOtherStage(Stage firstStage, Stage secondStage,
 												int curIndx, List *stagesList);
 static List * TryInjectProjectBeforeUnwindForGroup(List *aggregationStages,
@@ -441,6 +448,10 @@ static Query * ApplyFindSpec(const FindSpec *spec, MongoCollection *collection,
 static Query * ApplyFindSpecCore(const FindSpec *spec, Query *query,
 								 QueryData *queryData, CursorParamKind cursorParamKind,
 								 AggregationPipelineBuildContext *context);
+static void ResolveDefaultCollation(MongoCollection *collection,
+									AggregationPipelineBuildContext *context);
+static void ResolveAndCaptureCollation(MongoCollection *collection, QueryData *queryData,
+									   AggregationPipelineBuildContext *context);
 static void SetStreamingSkipLimitForFind(const FindSpec *spec,
 										 MongoCollection *collection,
 										 QueryData *queryData,
@@ -454,6 +465,13 @@ static Expr * MakeBsonFullScanQual(Expr *documentExpr,
 								   const pgbsonelement *sortSpecElement,
 								   const char *collationString);
 static pgbson * BuildDynamicCursorTrackerState(const QueryData *queryData);
+
+static Query * ApplyAggregationStagesToBaseQuery(Query *baseQuery, CursorParamKind
+												 cursorParamKind,
+												 QueryData *queryData,
+												 AggregationPipelineBuildContext *context,
+												 List *aggregationStages, bool
+												 isCollectionAgnosticQuery);
 
 #define COMPATIBLE_CHANGE_STREAM_STAGES_COUNT 8
 const char *CompatibleChangeStreamPipelineStages[COMPATIBLE_CHANGE_STREAM_STAGES_COUNT] =
@@ -502,6 +520,81 @@ static const AggregationStageDefinition SortGroupStageDefinition = {
 	.pipelineCheckFunc = NULL,
 	.allowBaseShardTablePushdown = true,
 	.stageEnum = Stage_SortGroup,
+};
+
+static const AggregationStageDefinition FindMatchStageDefinition = {
+	.stage = "$findMatch",
+	.mutateFunc = &HandleMatchForFind,
+	.requiresPersistentCursor = &RequiresPersistentCursorFalse,
+	.canInlineLookupStageFunc = &CanInlineLookupStageMatch,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = true,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.stageEnum = Stage_Match,
+};
+
+static const AggregationStageDefinition FindSortStageDefinition = {
+	.stage = "$findSort",
+	.mutateFunc = &HandleSort,
+	.requiresPersistentCursor = &RequiresPersistentCursorTrue,
+	.canInlineLookupStageFunc = &CanInlineLookupStageTrue,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = false,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.stageEnum = Stage_Sort,
+};
+
+static const AggregationStageDefinition FindSkipStageDefinition = {
+	.stage = "$findSkip",
+	.mutateFunc = &HandleFindSkip,
+	.requiresPersistentCursor = &RequiresPersistentCursorSkip,
+	.canInlineLookupStageFunc = NULL,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = false,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.stageEnum = Stage_Skip,
+};
+
+static const AggregationStageDefinition FindLimitStageDefinition = {
+	.stage = "$findLimit",
+	.mutateFunc = &HandleFindLimit,
+	.requiresPersistentCursor = &RequiresPersistentCursorLimit,
+	.canInlineLookupStageFunc = NULL,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = false,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.stageEnum = Stage_Limit,
+};
+
+static const AggregationStageDefinition ProjectFindStageDefinition = {
+	.stage = "$projectFind",
+	.mutateFunc = &HandleProjectFindStage,
+	.requiresPersistentCursor = &RequiresPersistentCursorFalse,
+	.canInlineLookupStageFunc = &CanInlineLookupStageProjectFind,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = true,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.stageEnum = Stage_Project,
 };
 
 /*
@@ -1499,9 +1592,6 @@ MutateQueryWithPipeline(Query *query, List *aggregationStages,
 								stageName)));
 		}
 
-		/* If the prior stage needed to be pushed to a sub-query before the next
-		 * stage is processed, then add a subquery stage
-		 */
 		if (context->requiresSubQuery)
 		{
 			query = MigrateQueryToSubQuery(query, context);
@@ -1734,8 +1824,8 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 	AggregationQueryPlan *plan = palloc0(sizeof(AggregationQueryPlan));
 	AggregationPipelineBuildContext *context = &plan->context;
 	context->databaseNameDatum = database;
-	context->optimizePipelineStages = true;
 	context->joinStatus = JoinStageStatus_Unknown;
+	context->shouldResolveDefaultCollation = true;
 	queryData->cursorKind = QueryCursorType_Unspecified;
 	queryData->streamingLimit = 0;
 	queryData->streamingSkip = 0;
@@ -1834,6 +1924,7 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 				if (EnsureTopLevelFieldIsDocumentNullOrEmptyOk(
 						"collation", &aggregationIterator))
 				{
+					context->shouldResolveDefaultCollation = false;
 					ParseAndGetCollationString(value, context->collationString);
 				}
 			}
@@ -1888,12 +1979,14 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 
 	context->variableSpec = (Expr *) MakeBsonConst(parsedVariables);
 
+	context->allowShardBaseTable = true;
 	List *aggregationStages = ExtractAggregationStages(&pipelineValue,
 													   context);
 
 	if (context->requiresTailableCursor)
 	{
 		queryData->cursorKind = QueryCursorType_Tailable;
+		context->shouldResolveDefaultCollation = false;
 	}
 
 	/*
@@ -1910,6 +2003,8 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 			PointerGetDatum(context->databaseNameDatum), collectionNameDatum,
 			AccessShareLock);
 
+		ResolveAndCaptureCollation(collection, queryData, context);
+
 		/*
 		 * Set the namespace name now so the remote-dispatch path (which skips the
 		 * apply phase) still has it for the cursor response preamble. For the
@@ -1917,6 +2012,10 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 		 */
 		queryData->namespaceName = CreateNamespaceName(context->databaseNameDatum,
 													   &collectionName);
+	}
+	else
+	{
+		context->shouldResolveDefaultCollation = false;
 	}
 
 	/*
@@ -1974,14 +2073,37 @@ ApplyParsedAggregationQuery(AggregationQueryPlan *plan)
 	else
 	{
 		context->mongoCollection = plan->collection;
-		query = GenerateBaseTableQuery(context->databaseNameDatum,
-									   &plan->collectionName,
-									   plan->collectionUuid, &plan->indexHint,
-									   context);
+		List *prependedStages = NIL;
+		query = GenerateBaseTableQueryAndGetStages(context->databaseNameDatum,
+												   &plan->collectionName,
+												   plan->collectionUuid, &plan->indexHint,
+												   context,
+												   &prependedStages);
+		if (prependedStages != NIL)
+		{
+			aggregationStages = list_concat(prependedStages, aggregationStages);
+		}
 	}
 
+	query = ApplyAggregationStagesToBaseQuery(query, cursorParamKind, queryData, context,
+											  aggregationStages,
+											  plan->isCollectionAgnosticQuery);
+
+	return query;
+}
+
+
+static Query *
+ApplyAggregationStagesToBaseQuery(Query *baseQuery, CursorParamKind cursorParamKind,
+								  QueryData *queryData,
+								  AggregationPipelineBuildContext *context,
+								  List *aggregationStages, bool isCollectionAgnosticQuery)
+{
 	/* Remember the base query - this will be needed since we need to update the cursor function on the base RTE */
-	Query *baseQuery = query;
+	Query *query = baseQuery;
+
+	/* First optimize aggregation pipeline stages */
+	aggregationStages = TryOptimizeAggregationPipelines(aggregationStages, context);
 
 	if (cursorParamKind == CursorParamKind_Dynamic &&
 		!TryAddDynamicCursorQuery(cursorParamKind, queryData, query, context))
@@ -2013,7 +2135,7 @@ ApplyParsedAggregationQuery(AggregationQueryPlan *plan)
 	else if (queryData->cursorKind == QueryCursorType_Unspecified)
 	{
 		queryData->cursorKind =
-			context->requiresPersistentCursor || plan->isCollectionAgnosticQuery ?
+			context->requiresPersistentCursor || isCollectionAgnosticQuery ?
 			QueryCursorType_Persistent : QueryCursorType_Streamable;
 	}
 
@@ -2189,6 +2311,7 @@ ParseFindQuery(pgbson *findSpec, QueryData *queryData,
 												BSON_TYPE_DOCUMENT);
 						if (!IsBsonValueEmptyDocument(value))
 						{
+							context->shouldResolveDefaultCollation = false;
 							ParseAndGetCollationString(value,
 													   context->collationString);
 						}
@@ -2483,6 +2606,61 @@ default_find_case:
 }
 
 
+static List *
+BuildAggregationStagesForFind(List *aggregationStages, const FindSpec *spec)
+{
+	if (spec->filter.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindMatchStageDefinition;
+		stage->stageValue = spec->filter;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->sort.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindSortStageDefinition;
+		stage->stageValue = spec->sort;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->skip.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindSkipStageDefinition;
+		stage->stageValue = spec->skip;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->limit.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindLimitStageDefinition;
+		stage->stageValue = spec->limit;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->projection.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		pgbson_writer writer;
+		PgbsonWriterInit(&writer);
+		PgbsonWriterAppendValue(&writer, "projection", 10, &spec->projection);
+		if (spec->filter.value_type != BSON_TYPE_EOD)
+		{
+			PgbsonWriterAppendValue(&writer, "filter", 6, &spec->filter);
+		}
+
+		stage->stageDefinition = &ProjectFindStageDefinition;
+		stage->stageValue = ConvertPgbsonToBsonValue(PgbsonWriterGetPgbson(&writer));
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	return aggregationStages;
+}
+
+
 /*
  * Looks up the collection, sets context fields, and calls ApplyFindSpecCore.
  */
@@ -2511,14 +2689,22 @@ ApplyFindSpec(const FindSpec *spec, MongoCollection *collection,
 	}
 	context->mongoCollection = collection;
 
-	Query *query = GenerateBaseTableQuery(spec->databaseDatum, &spec->collectionName,
-										  spec->collectionUuid, &spec->indexHint,
-										  context);
+	List *aggregationStages = NIL;
+	Query *query = GenerateBaseTableQueryAndGetStages(spec->databaseDatum,
+													  &spec->collectionName,
+													  spec->collectionUuid,
+													  &spec->indexHint,
+													  context,
+													  &aggregationStages);
 
-	Query *finalQuery = ApplyFindSpecCore(spec, query, queryData,
-										  cursorParamKind, context);
+	if (aggregationStages == NIL)
+	{
+		return ApplyFindSpecCore(spec, query, queryData, cursorParamKind, context);
+	}
 
-	return finalQuery;
+	aggregationStages = BuildAggregationStagesForFind(aggregationStages, spec);
+	return ApplyAggregationStagesToBaseQuery(query, cursorParamKind, queryData,
+											 context, aggregationStages, false);
 }
 
 
@@ -2632,7 +2818,7 @@ ApplyFindSpecCore(const FindSpec *spec, Query *query,
 	/* First apply match */
 	if (spec->filter.value_type != BSON_TYPE_EOD)
 	{
-		query = HandleMatch(&spec->filter, query, context);
+		query = HandleMatchForFind(&spec->filter, query, context);
 		context->stageNum++;
 	}
 
@@ -2646,39 +2832,22 @@ ApplyFindSpecCore(const FindSpec *spec, Query *query,
 	/* Then do skip and then limit */
 	if (spec->skip.value_type != BSON_TYPE_EOD)
 	{
-		query = HandleSkip(&spec->skip, query, context);
+		query = HandleFindSkip(&spec->skip, query, context);
 		context->stageNum++;
 	}
 
 	if (spec->limit.value_type != BSON_TYPE_EOD)
 	{
-		query = HandleLimit(&spec->limit, query, context);
+		query = HandleFindLimit(&spec->limit, query, context);
 		context->stageNum++;
 	}
 
 	/* Projection migration wraps this query but leaves it as the count owner. */
 	Query *skipLimitQuery = query;
 
-	/* $near and $nearSphere add sort clause to query, for them we need persistent cursor. */
-	if (query->sortClause)
-	{
-		context->requiresPersistentCursor = true;
-	}
-
 	/* finally update projection */
 	if (spec->projection.value_type != BSON_TYPE_EOD)
 	{
-		/* Before applying projection - check if we need to
-		 * push to a subquery. We do this only if we have
-		 * skip to avoid projecting on documents we won't need.
-		 */
-		if (context->requiresSubQuery &&
-			context->requiresPersistentCursor &&
-			query->limitOffset != NULL)
-		{
-			query = MigrateQueryToSubQuery(query, context);
-		}
-
 		query = HandleProjectFind(&spec->projection, &spec->filter, query, context);
 	}
 
@@ -2762,6 +2931,7 @@ ParseFindQueryAndLookupCollection(text *database, pgbson *findSpec,
 	/* For finds, we can generally query the shard directly if available. */
 	plan->context.allowShardBaseTable = true;
 	plan->context.databaseNameDatum = database;
+	plan->context.shouldResolveDefaultCollation = true;
 
 	/* Find queries have no joins */
 	plan->context.joinStatus = JoinStageStatus_NoJoinsOrUnions;
@@ -2773,6 +2943,8 @@ ParseFindQueryAndLookupCollection(text *database, pgbson *findSpec,
 		PointerGetDatum(cstring_to_text_with_len(plan->spec.collectionName.string,
 												 plan->spec.collectionName.length)),
 		AccessShareLock);
+
+	ResolveAndCaptureCollation(plan->collection, queryData, &plan->context);
 
 	/*
 	 * Set the namespace name now so the remote-dispatch path (which skips
@@ -2904,6 +3076,7 @@ GenerateCountQuery(text *databaseDatum, pgbson *countSpec, bool setStatementTime
 	AggregationPipelineBuildContext context = { 0 };
 	context.databaseNameDatum = databaseDatum;
 	context.joinStatus = JoinStageStatus_Unknown;
+	context.shouldResolveDefaultCollation = true;
 
 	bson_iter_t countIterator;
 	PgbsonInitIterator(countSpec, &countIterator);
@@ -2973,6 +3146,7 @@ GenerateCountQuery(text *databaseDatum, pgbson *countSpec, bool setStatementTime
 				if (EnsureTopLevelFieldIsDocumentNullOrEmptyOk(
 						"collation", &countIterator))
 				{
+					context.shouldResolveDefaultCollation = false;
 					ParseAndGetCollationString(value, context.collationString);
 				}
 			}
@@ -3015,12 +3189,21 @@ GenerateCountQuery(text *databaseDatum, pgbson *countSpec, bool setStatementTime
 
 	Query *query = GenerateBaseTableQuery(databaseDatum, &collectionName, collectionUuid,
 										  &indexHint, &context);
+	if (context.requiresSubQuery)
+	{
+		query = MigrateQueryToSubQuery(query, &context);
+	}
+
+	bool isView = context.mongoCollection != NULL &&
+				  strcmp(collectionName.string,
+						 context.mongoCollection->name.collectionName) != 0;
 
 	/*
 	 * the count() query which has no filter/skip/limit/etc can be done via an estimatedDocumentCount
 	 * In this case, we rewrite the query as a collStats aggregation query with a project to make it the appropriate output.
 	 */
-	if (!hasQueryModifier && context.mongoCollection != NULL)
+	if (!hasQueryModifier && context.mongoCollection != NULL &&
+		!isView)
 	{
 		/* Collection exists, get a collStats: { "count": {} } */
 		pgbson_writer collStatsWriter;
@@ -3148,6 +3331,9 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 	context.databaseNameDatum = databaseDatum;
 	context.joinStatus = JoinStageStatus_Unknown;
 
+	/* Distinct supports collation starting with version 1.1. */
+	context.shouldResolveDefaultCollation = IsClusterVersionAtleast(DocDB_V1, 1, 0);
+
 	bson_iter_t distinctIter;
 	PgbsonInitIterator(distinctSpec, &distinctIter);
 
@@ -3203,6 +3389,7 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 				if (EnsureTopLevelFieldIsDocumentNullOrEmptyOk(
 						"collation", &distinctIter))
 				{
+					context.shouldResolveDefaultCollation = false;
 					ParseAndGetCollationString(value, context.collationString);
 				}
 			}
@@ -3264,6 +3451,10 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 	context.allowShardBaseTable = true;
 	Query *query = GenerateBaseTableQuery(databaseDatum, &collectionName, collectionUuid,
 										  &indexHint, &context);
+	if (context.requiresSubQuery)
+	{
+		query = MigrateQueryToSubQuery(query, &context);
+	}
 
 	/* First apply match */
 	if (filter.value_type != BSON_TYPE_EOD)
@@ -4481,6 +4672,16 @@ HandleProjectFind(const bson_value_t *existingValue, const bson_value_t *queryVa
 		return query;
 	}
 
+	/* Before applying projection - check if we need to
+	 * push to a subquery. We do this only if we have
+	 * skip to avoid projecting on documents we won't need.
+	 */
+	if (context->requiresPersistentCursor &&
+		query->limitOffset != NULL)
+	{
+		query = MigrateQueryToSubQuery(query, context);
+	}
+
 	/* The first projector is the document */
 	TargetEntry *firstEntry = linitial(query->targetList);
 
@@ -4534,6 +4735,34 @@ HandleProjectFind(const bson_value_t *existingValue, const bson_value_t *queryVa
 
 	firstEntry->expr = (Expr *) resultExpr;
 	return query;
+}
+
+
+static Query *
+HandleProjectFindStage(const bson_value_t *stageValue, Query *query,
+					   AggregationPipelineBuildContext *context)
+{
+	EnsureTopLevelFieldValueType("$projectFind", stageValue, BSON_TYPE_DOCUMENT);
+
+	bson_value_t projection = { .value_type = BSON_TYPE_EOD };
+	bson_value_t filter = { .value_type = BSON_TYPE_EOD };
+	bson_iter_t stageIter;
+	BsonValueInitIterator(stageValue, &stageIter);
+	while (bson_iter_next(&stageIter))
+	{
+		const char *key = bson_iter_key(&stageIter);
+		if (strcmp(key, "projection") == 0)
+		{
+			projection = *bson_iter_value(&stageIter);
+		}
+		else if (strcmp(key, "filter") == 0)
+		{
+			filter = *bson_iter_value(&stageIter);
+		}
+	}
+
+	Assert(projection.value_type != BSON_TYPE_EOD);
+	return HandleProjectFind(&projection, &filter, query, context);
 }
 
 
@@ -4637,6 +4866,16 @@ HandleSkip(const bson_value_t *existingValue, Query *query,
 }
 
 
+static Query *
+HandleFindSkip(const bson_value_t *existingValue, Query *query,
+			   AggregationPipelineBuildContext *context)
+{
+	query = HandleSkip(existingValue, query, context);
+	context->requiresSubQuery = false;
+	return query;
+}
+
+
 /*
  * Mutates the query for the $limit stage
  * Simply updates the limit in the current query.
@@ -4711,6 +4950,16 @@ HandleLimit(const bson_value_t *existingValue, Query *query,
 }
 
 
+static Query *
+HandleFindLimit(const bson_value_t *existingValue, Query *query,
+				AggregationPipelineBuildContext *context)
+{
+	query = HandleLimit(existingValue, query, context);
+	context->requiresSubQuery = false;
+	return query;
+}
+
+
 /*
  * Mutates the query for the $match stage.
  * Simply calls the ExpandQueryOperator similar to the @@ operator.
@@ -4739,7 +4988,6 @@ HandleMatchWithIndexFilter(const bson_value_t *existingValue, Query *query,
 	TargetEntry *entry = linitial(query->targetList);
 
 	if (context->joinStatus == JoinStageStatus_NoJoinsOrUnions &&
-		EnableSubqueryPushdownForMatch &&
 		EnableDynamicCursors &&
 		IsA(entry->expr, FuncExpr))
 	{
@@ -4799,6 +5047,23 @@ HandleMatch(const bson_value_t *existingValue, Query *query,
 			AggregationPipelineBuildContext *context)
 {
 	return HandleMatchWithIndexFilter(existingValue, query, context, NULL);
+}
+
+
+static Query *
+HandleMatchForFind(const bson_value_t *existingValue, Query *query,
+				   AggregationPipelineBuildContext *context)
+{
+	int sortClauseCount = list_length(query->sortClause);
+	query = HandleMatch(existingValue, query, context);
+
+	/* $near and $nearSphere add an ordering that requires a persistent cursor. */
+	if (list_length(query->sortClause) > sortClauseCount)
+	{
+		context->requiresPersistentCursor = true;
+	}
+
+	return query;
 }
 
 
@@ -8268,14 +8533,9 @@ HandleGroupCore(const bson_value_t *existingValue, Query *query,
 
 			if (!IsBsonValueEmptyDocument(&accumulatorElement.bsonValue))
 			{
-				ReportFeatureUsage(FEATURE_AGGREGATE_GROUP_COUNT_WITH_ARG);
-
-				if (FailOnNonEmptyGroupCountArg)
-				{
-					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_TYPEMISMATCH),
-									errmsg(
-										"$count:{} accumulator requires 0 arguments")));
-				}
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_TYPEMISMATCH),
+								errmsg(
+									"$count:{} accumulator requires 0 arguments")));
 			}
 
 			/* Use the new BSONCOUNT aggregate. */
@@ -9237,7 +9497,6 @@ ExtractViewDefinitionAndPipeline(Datum databaseDatum, pgbson *viewDefinition,
 /*
  * Given the pipeline definition extract the stages as a list of `AggregationStage`.
  * Performs basic validation in the structure of the pipeline.
- * If `context->optimizePipelines` is set to true, the function will optimize the pipelines.
  */
 List *
 ExtractAggregationStages(const bson_value_t *pipelineValue,
@@ -9327,6 +9586,11 @@ ExtractAggregationStages(const bson_value_t *pipelineValue,
 			context->joinStatus = JoinStageStatus_HasJoinsOrUnions;
 		}
 
+		if (!definition->allowBaseShardTablePushdown)
+		{
+			context->allowShardBaseTable = false;
+		}
+
 		if (definition->stageEnum == Stage_ChangeStream)
 		{
 			context->requiresTailableCursor = true;
@@ -9347,11 +9611,6 @@ ExtractAggregationStages(const bson_value_t *pipelineValue,
 	 * fail. This is a tradeoff for perf b/w most of the valid cases v/s the rare invalid ones.
 	 */
 	CheckMaxAllowedAggregationStages(list_length(aggregationStages));
-
-	if (context->optimizePipelineStages)
-	{
-		aggregationStages = TryOptimizeAggregationPipelines(aggregationStages, context);
-	}
 
 	if (context->joinStatus == JoinStageStatus_Unknown)
 	{
@@ -9422,13 +9681,74 @@ FillRteForMongoCollection(Query *query, RangeTblEntry *rte,
 }
 
 
-/*
- * Updates the base table
- */
+static void
+ResolveAndCaptureCollation(MongoCollection *collection, QueryData *queryData,
+						   AggregationPipelineBuildContext *context)
+{
+	if (!EnableCollation)
+	{
+		context->shouldResolveDefaultCollation = false;
+		return;
+	}
+
+	/*
+	 * shouldResolveDefaultCollation is transient parse state: it is true when
+	 * the command did not provide an explicit collation. hasCapturedCollation
+	 * is durable cursor state and remains true after the effective value has
+	 * been captured, including when the value is empty for binary semantics.
+	 */
+	if (context->shouldResolveDefaultCollation)
+	{
+		if (queryData->hasCapturedCollation)
+		{
+			/* Reuse the retained value instead of reading collection metadata again. */
+			strlcpy((char *) context->collationString,
+					queryData->collationString,
+					sizeof(context->collationString));
+		}
+		else
+		{
+			/* A new query resolves the inherited collection default once. */
+			ResolveDefaultCollation(collection, context);
+		}
+
+		context->shouldResolveDefaultCollation = false;
+	}
+
+	/* An empty value is resolved binary semantics, not missing state. */
+	queryData->hasCapturedCollation = true;
+	strlcpy(queryData->collationString, context->collationString,
+			sizeof(queryData->collationString));
+}
+
+
+static void
+ResolveDefaultCollation(MongoCollection *collection,
+						AggregationPipelineBuildContext *context)
+{
+	if (!EnableCollation)
+	{
+		return;
+	}
+
+	if (collection == NULL ||
+		!IsCollationApplicable(collection->options.collationString))
+	{
+		return;
+	}
+
+	strlcpy((char *) context->collationString, collection->options.collationString,
+			sizeof(context->collationString));
+}
+
+
 Query *
-GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView,
-					   pg_uuid_t *collectionUuid, const bson_value_t *indexHint,
-					   AggregationPipelineBuildContext *context)
+GenerateBaseTableQueryAndGetStages(text *databaseDatum, const
+								   StringView *collectionNameView,
+								   pg_uuid_t *collectionUuid, const
+								   bson_value_t *indexHint,
+								   AggregationPipelineBuildContext *context,
+								   List **pipelineStagesToApply)
 {
 	Query *query = makeNode(Query);
 	query->commandType = CMD_SELECT;
@@ -9470,6 +9790,12 @@ GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView
 								"Namespace %s contains a mismatch in the collectionUUID identifier",
 								context->namespaceName)));
 		}
+	}
+
+	if (context->shouldResolveDefaultCollation)
+	{
+		ResolveDefaultCollation(collection, context);
+		context->shouldResolveDefaultCollation = false;
 	}
 
 	List *pipelineStages = NIL;
@@ -9673,12 +9999,41 @@ GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView
 		}
 	}
 
-	/* Now if there's pipeline stages, apply the stages in reverse (innermost first) */
-	for (int i = list_length(pipelineStages) - 1; i >= 0; i--)
+	if (list_length(pipelineStages) > 0)
 	{
-		List *stages = list_nth(pipelineStages, i);
-		query = MutateQueryWithPipeline(query, stages, context);
+		/* Now if there's pipeline stages, apply the stages in reverse (innermost first) */
+		for (int i = list_length(pipelineStages) - 1; i >= 0; i--)
+		{
+			List *stages = list_nth(pipelineStages, i);
+			*pipelineStagesToApply = list_concat(*pipelineStagesToApply, stages);
+			list_free(stages);
+		}
+
+		list_free(pipelineStages);
 	}
+
+	return query;
+}
+
+
+/*
+ * Updates the base table
+ */
+Query *
+GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView,
+					   pg_uuid_t *collectionUuid, const bson_value_t *indexHint,
+					   AggregationPipelineBuildContext *context)
+{
+	List *pipelineStages = NIL;
+	Query *query = GenerateBaseTableQueryAndGetStages(databaseDatum, collectionNameView,
+													  collectionUuid, indexHint, context,
+													  &pipelineStages);
+
+	if (pipelineStages != NIL)
+	{
+		query = MutateQueryWithPipeline(query, pipelineStages, context);
+	}
+	list_free(pipelineStages);
 
 	return query;
 }
@@ -10122,7 +10477,7 @@ IsSampleScanEligibleJoinTree(Node *node)
 	 * so HandleSample would conclude there was a user filter and skip
 	 * the TABLESAMPLE optimization.
 	 */
-	if (EnableSampleScanFixOnSharded && IsBooleanTrueConst(node))
+	if (IsBooleanTrueConst(node))
 	{
 		return true;
 	}
@@ -10417,6 +10772,26 @@ CanInlineLookupStageProject(const bson_value_t *stageValue, const
 }
 
 
+static bool
+CanInlineLookupStageProjectFind(const bson_value_t *stageValue, const
+								StringView *lookupPath, bool hasLet)
+{
+	if (stageValue->value_type != BSON_TYPE_DOCUMENT)
+	{
+		return false;
+	}
+
+	bson_iter_t stageIter;
+	BsonValueInitIterator(stageValue, &stageIter);
+	if (!bson_iter_find(&stageIter, "projection"))
+	{
+		return false;
+	}
+
+	return CanInlineLookupStageProject(bson_iter_value(&stageIter), lookupPath, hasLet);
+}
+
+
 /*
  * Helper for an unset stage on whether it can be inlined for a $lookup.
  */
@@ -10640,7 +11015,7 @@ HandleMatchAggregationStage(const bson_value_t *existingValue, Query *query,
  * 2- Improve match stage if preceded by a projection stage and the filter is on a renamed field which could
  *    potentially use index.
  */
-static List *
+List *
 TryOptimizeAggregationPipelines(List *aggregationStages,
 								AggregationPipelineBuildContext *context)
 {
@@ -10650,11 +11025,6 @@ TryOptimizeAggregationPipelines(List *aggregationStages,
 		return stagesList;
 	}
 
-	/* Whether or not we can safely push the aggregation pipeline query to the shard table directly depends on
-	 * if all the stages refer to a single collection and it is not sharded, only in this case it is feasible to push
-	 * these queries directly to shard table.
-	 */
-	bool allowShardBaseTable = true;
 	int nextIndex = 0;
 	int currentIndex = 0;
 
@@ -10687,13 +11057,6 @@ TryOptimizeAggregationPipelines(List *aggregationStages,
 
 		nextIndex = currentIndex + 1;
 		AggregationStage *stage = (AggregationStage *) lfirst(cell);
-		const AggregationStageDefinition *definition = stage->stageDefinition;
-		if (!definition->allowBaseShardTablePushdown)
-		{
-			/* If any stage doesn't support it the final value is not supported */
-			allowShardBaseTable = false;
-		}
-
 		Stage stageEnum = stage->stageDefinition->stageEnum;
 
 		/* Project-pushup disqualifier: any non-Unwind/Match/Group
@@ -10832,8 +11195,6 @@ TryOptimizeAggregationPipelines(List *aggregationStages,
 			}
 		}
 	}
-
-	context->allowShardBaseTable = allowShardBaseTable;
 
 	/* The rewrite can fire iff no disqualifying event was seen and the
 	 * per-stage walk found the complete $unwind ... $match* ... $group

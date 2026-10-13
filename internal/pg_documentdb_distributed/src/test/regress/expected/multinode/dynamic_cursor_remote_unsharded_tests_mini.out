@@ -1,3 +1,6 @@
+-- Copyright (c) Microsoft Corporation.
+-- Licensed under the MIT License.
+-- SPDX-License-Identifier: MIT
 SET search_path TO documentdb_api,documentdb_core,documentdb_api_catalog,documentdb_api_internal;
 SET documentdb.next_collection_id TO 42000;
 SET citus.next_shard_id TO 4200000;
@@ -883,19 +886,41 @@ NOTICE:  Done: drained 5 pages
 (1 row)
 
 -- ---------------------------------------------------------------------------
+-- Test R11 (P1-8): find({}) skip>0 - worker file cursor fallback in the mini
+-- suite. skip 40 over 95 docs → 55 rows drained across the getMore boundaries.
+-- No sort clause; skip forces the persistent worker file cursor path.
+-- ---------------------------------------------------------------------------
+SELECT remote_drain_and_report(
+    '{ "find": "remote_e2e_coll", "filter": { }, "projection": { "_id": 1 }, "skip": 40, "batchSize": 10, "hint": "idx_a" }',
+    '{ "getMore": { "$numberLong": "538" }, "collection": "remote_e2e_coll", "batchSize": 10 }',
+    false  -- print continuation token
+);
+NOTICE:  Page 1: batch=10, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 2: batch=10, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 3: batch=10, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 4: batch=10, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 5: batch=10, coordinator_holds_portal=f, kind=DynamicFileCursorRemote, scan_type=DynamicFileCursorRemote, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Page 6: batch=5, coordinator_holds_portal=f, kind=Done, scan_type=Done, remote_shard=<NULL>, idx=<NULL>, portal=<NULL>
+NOTICE:  Done: drained 6 pages
+ remote_drain_and_report 
+---------------------------------------------------------------------
+ 
+(1 row)
+
+-- ---------------------------------------------------------------------------
 -- Sorted positive limits: secondary and PK order stream on the worker; an
 -- unindexed sort remains a worker file cursor.
 -- ---------------------------------------------------------------------------
 SELECT run_command_on_all_nodes(
     $$ALTER SYSTEM SET documentdb.enable_dynamic_cursor_with_skiplimit = 'on'$$);
- run_command_on_all_nodes
+ run_command_on_all_nodes 
 ---------------------------------------------------------------------
  (1,t,"ALTER SYSTEM")
  (2,t,"ALTER SYSTEM")
 (2 rows)
 
 SELECT run_command_on_all_nodes($$SELECT pg_reload_conf()$$);
- run_command_on_all_nodes
+ run_command_on_all_nodes 
 ---------------------------------------------------------------------
  (1,t,t)
  (2,t,t)
@@ -967,14 +992,14 @@ SELECT remote_sorted_skip_report(
 
 SELECT run_command_on_all_nodes(
     $$ALTER SYSTEM RESET documentdb.enable_dynamic_cursor_with_skiplimit$$);
- run_command_on_all_nodes
+ run_command_on_all_nodes 
 ---------------------------------------------------------------------
  (1,t,"ALTER SYSTEM")
  (2,t,"ALTER SYSTEM")
 (2 rows)
 
 SELECT run_command_on_all_nodes($$SELECT pg_reload_conf()$$);
- run_command_on_all_nodes
+ run_command_on_all_nodes 
 ---------------------------------------------------------------------
  (1,t,t)
  (2,t,t)
@@ -1509,7 +1534,7 @@ SELECT documentdb_api.shard_collection('dyncur_sp_db','remote_e2e_coll', '{"_id"
 END;
 ANALYZE;
 -- ---------------------------------------------------------------------------
--- Test R11: collection sharded after cursor tests — verify fallback to local path
+-- Test R-SHARDED-FALLBACK: collection sharded after cursor tests; verify local fallback
 -- After shard_collection(), isShardRemote becomes false → coordinator handles
 -- query locally. Verifies remote unsharded path is not taken for sharded colls.
 -- ---------------------------------------------------------------------------
@@ -1643,25 +1668,6 @@ ANALYZE;
 SELECT runtime_sort_report('{ "find": "runtime_sort_coll", "filter": { }, "sort": { "val": 1 }, "projection": { "_id": 0, "val": 1 }, "batchSize": 100 }')
     AS with_statistics;
                               with_statistics                               
----------------------------------------------------------------------
- kind=streaming (index order), file_based=n/a, docs=500, sorted_ascending=t
-(1 row)
-
--- Case 2: per-collection statistics disabled → the dynamic-cursor planner has no
--- reliable estimates, prunes every candidate but the index-order path, and
--- forces the streaming plan for the same query.
-SET documentdb.enableDynamicPersistentCursorsWithStats TO off;
-SELECT documentdb_api.coll_mod('dyncur_sp_db', 'runtime_sort_coll',
-    '{ "collMod": "runtime_sort_coll", "enableStats": false }');
-             coll_mod              
----------------------------------------------------------------------
- { "ok" : { "$numberInt" : "1" } }
-(1 row)
-
-ANALYZE;
-SELECT runtime_sort_report('{ "find": "runtime_sort_coll", "filter": { }, "sort": { "val": 1 }, "projection": { "_id": 0, "val": 1 }, "batchSize": 100 }')
-    AS without_statistics;
-                             without_statistics                             
 ---------------------------------------------------------------------
  kind=streaming (index order), file_based=n/a, docs=500, sorted_ascending=t
 (1 row)

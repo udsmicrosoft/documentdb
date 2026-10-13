@@ -726,3 +726,87 @@ impl fmt::Display for RequestType {
         write!(f, "{self:?}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_commands_are_routed_to_authentication() {
+        for request_type in [
+            RequestType::Logout,
+            RequestType::SaslContinue,
+            RequestType::SaslStart,
+        ] {
+            assert!(request_type.handle_with_auth());
+        }
+
+        assert!(!RequestType::Authenticate.handle_with_auth());
+        assert!(!RequestType::Find.handle_with_auth());
+    }
+
+    #[test]
+    fn only_handshake_and_probe_commands_are_allowed_without_authentication() {
+        for request_type in [
+            RequestType::IsMaster,
+            RequestType::Hello,
+            RequestType::Ping,
+            RequestType::BuildInfo,
+        ] {
+            assert!(request_type.allowed_unauthorized());
+        }
+
+        assert!(!RequestType::ConnectionStatus.allowed_unauthorized());
+        assert!(!RequestType::Find.allowed_unauthorized());
+    }
+
+    #[test]
+    fn transaction_blocklist_contains_all_ddl_and_admin_commands() {
+        for request_type in [
+            RequestType::ReIndex,
+            RequestType::CreateIndex,
+            RequestType::CreateIndexes,
+            RequestType::CreateSearchIndexes,
+            RequestType::DropIndexes,
+            RequestType::RenameCollection,
+            RequestType::ListCollections,
+            RequestType::Drop,
+            RequestType::CurrentOp,
+            RequestType::KillOp,
+            RequestType::MoveCollection,
+        ] {
+            assert!(request_type.is_blocked_in_transaction());
+        }
+
+        assert!(!RequestType::Find.is_blocked_in_transaction());
+        assert!(!RequestType::Insert.is_blocked_in_transaction());
+        assert!(!RequestType::CommitTransaction.is_blocked_in_transaction());
+    }
+
+    #[test]
+    fn legacy_command_aliases_parse_to_canonical_request_types() {
+        let aliases = [
+            ("buildinfo", RequestType::BuildInfo),
+            ("dbhash", RequestType::DbHash),
+            ("dbstats", RequestType::DbStats),
+            ("findandmodify", RequestType::FindAndModify),
+            ("ismaster", RequestType::IsMaster),
+            ("reindex", RequestType::ReIndex),
+        ];
+
+        for (alias, expected) in aliases {
+            assert_eq!(alias.parse::<RequestType>().unwrap(), expected);
+            assert_eq!(
+                expected.to_command_str().parse::<RequestType>().unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_command_returns_command_not_found() {
+        let error = "notACommand".parse::<RequestType>().unwrap_err();
+
+        assert_eq!(error.error_code(), ErrorCode::CommandNotFound);
+    }
+}

@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     context::{ConnectionContext, ServiceContext},
-    error::DocumentDBError,
+    error::{DocumentDBError, ErrorCode},
     protocol::{
         header::Header, opcode::OpCode, MAX_MESSAGE_USIZE_BYTES, MAX_PRE_AUTH_MESSAGE_USIZE_BYTES,
         MESSAGE_SIZE_EXCEEDED_ERROR,
@@ -52,9 +52,7 @@ impl GatewayDecodeError {
     fn documentdb_error(&self) -> DocumentDBError {
         match self {
             Self::BadValue(message) => DocumentDBError::bad_value(message.clone()),
-            Self::MessageSizeExceeded => {
-                DocumentDBError::internal_error(MESSAGE_SIZE_EXCEEDED_ERROR.to_owned())
-            }
+            Self::MessageSizeExceeded => DocumentDBError::message_size_exceeded(),
         }
     }
 }
@@ -142,10 +140,15 @@ impl MessageDecoder for GatewayRequestDecoder {
             Ok(header) => header,
             Err(error) => {
                 self.read_request_start = None;
+                let decode_error = if error.error_code() == ErrorCode::InvalidLength {
+                    GatewayDecodeError::MessageSizeExceeded
+                } else {
+                    GatewayDecodeError::BadValue(error.error_message_user().to_owned())
+                };
                 return Ok(Some(decode_error_request(
                     input,
                     error_header,
-                    GatewayDecodeError::BadValue(error.error_message_user().to_owned()),
+                    decode_error,
                     read_request_start,
                 )));
             }
@@ -240,6 +243,7 @@ pub(super) struct GatewayWireProtocol {
     shutdown_token: CancellationToken,
     response_chunk_size: usize,
     connection_id: Option<Uuid>,
+    server_certificate_thumbprint: Option<String>,
 }
 
 impl GatewayWireProtocol {
@@ -257,14 +261,21 @@ impl GatewayWireProtocol {
             shutdown_token,
             response_chunk_size,
             connection_id: None,
+            server_certificate_thumbprint: None,
         }
     }
 
-    /// Creates a protocol instance scoped to one gateway connection.
+    /// Creates a protocol instance scoped to one gateway connection, carrying
+    /// the certificate thumbprint captured on its TLS handshake.
     #[must_use]
-    pub(super) fn for_connection(&self, connection_id: Uuid) -> Self {
+    pub(super) fn for_connection(
+        &self,
+        connection_id: Uuid,
+        server_certificate_thumbprint: Option<String>,
+    ) -> Self {
         let mut protocol = self.clone();
         protocol.connection_id = Some(connection_id);
+        protocol.server_certificate_thumbprint = server_certificate_thumbprint;
         protocol
     }
 }
@@ -289,6 +300,7 @@ impl Protocol for GatewayWireProtocol {
                 self.telemetry.clone(),
                 connection,
                 self.connection_id.unwrap_or_else(Uuid::new_v4),
+                self.server_certificate_thumbprint.clone(),
             ),
             self.shutdown_token.clone(),
             self.response_chunk_size,
@@ -397,7 +409,7 @@ impl Protocol for GatewayWireProtocol {
     }
 }
 
-fn documentdb_error_from_runtime_error(error: &NacelleError) -> DocumentDBError {
+pub(super) fn documentdb_error_from_runtime_error(error: &NacelleError) -> DocumentDBError {
     if let NacelleError::Protocol(source) = error {
         if let Some(decode_error) = source.downcast_ref::<GatewayDecodeError>() {
             return decode_error.documentdb_error();
@@ -407,7 +419,7 @@ fn documentdb_error_from_runtime_error(error: &NacelleError) -> DocumentDBError 
         error,
         NacelleError::ResourceLimit(NacelleResourceLimitReason::RequestBodyBytes)
     ) {
-        return DocumentDBError::internal_error(MESSAGE_SIZE_EXCEEDED_ERROR.to_owned());
+        return DocumentDBError::message_size_exceeded();
     }
 
     DocumentDBError::internal_error(format!("Gateway request failed: {error}."))
@@ -418,6 +430,7 @@ fn connection_context_from_info(
     telemetry: Option<Box<dyn TelemetryProvider>>,
     connection: &ConnectionInfo,
     connection_id: Uuid,
+    server_certificate_thumbprint: Option<String>,
 ) -> ConnectionContext {
     let ip_address = connection_peer_ip(connection);
     let transport_protocol = if connection.local_path.is_some() {
@@ -441,6 +454,7 @@ fn connection_context_from_info(
             .service_context
             .tls_provider()
             .ciphersuite_name_to_i32(tls.cipher_suite.as_deref());
+        connection_context.set_server_certificate_thumbprint(server_certificate_thumbprint);
     }
 
     connection_context
