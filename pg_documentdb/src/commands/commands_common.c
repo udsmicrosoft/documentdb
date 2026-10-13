@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/commands/commands_common.c
  *
@@ -48,14 +49,14 @@ extern bool EnableRequestIndexNameCache;
 extern bool EnableCollectionOwnerAclCheck;
 
 /*
- *  This is a list of command options that are not currently supported.
- *  At runtime, we ignore these optional fields.
+ *  Common command options are ignored when not handled by a command-specific parser.
  *
  *  Note: Please keep this array sorted.
  */
 static const char *const IgnoredCommonSpecFields[] = {
 	"$clusterTime",
 	"$db",
+	"$documentdbTrace",
 	"$readPreference",
 	"$sort",
 	"allowDiskUse",

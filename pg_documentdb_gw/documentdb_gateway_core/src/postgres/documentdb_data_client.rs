@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_core/src/postgres/documentdb_data_client.rs
  *
@@ -18,10 +19,11 @@ use crate::{
     error::{DocumentDBError, Result},
     explain::Verbosity,
     postgres::{
+        command_trace_context,
         conn_mgmt::{Connection, ConnectionPool, PoolConnection, PullConnection, QueryOptions},
         PgDataClient, PgDocument, ScopedTransaction,
     },
-    requests::ExplainTarget,
+    requests::{ExplainTarget, RequestType},
     responses::{PgResponse, Response},
 };
 
@@ -51,6 +53,36 @@ pub struct DocumentDBDataClient {
 }
 
 impl DocumentDBDataClient {
+    fn udf_trace_context_enabled(&self, request_context: &RequestContext<'_>) -> Result<bool> {
+        let request = request_context.request();
+        if !command_trace_context::supports_operation(request.request_type()) {
+            return Ok(false);
+        }
+        command_trace_context::validate_command(request.document(), request.request_type())?;
+
+        // Runtime capability loss disables trace propagation, not data commands.
+        Ok(self.udf_trace_context_available())
+    }
+
+    #[cfg(feature = "postgres-udf-trace-context")]
+    #[must_use]
+    fn udf_trace_context_available(&self) -> bool {
+        self.service_context
+            .setup_configuration()
+            .telemetry_settings()
+            .udf_trace_context_enabled()
+            && self
+                .service_context
+                .dynamic_configuration()
+                .supports_udf_trace_context()
+    }
+
+    #[cfg(not(feature = "postgres-udf-trace-context"))]
+    #[must_use]
+    fn udf_trace_context_available(&self) -> bool {
+        false
+    }
+
     /// Runs a db+bson query returning the raw rows.
     async fn run_db_bson_rows(
         &self,
@@ -63,8 +95,10 @@ impl DocumentDBDataClient {
         let db = request.db();
         let doc = request.document();
 
+        let trace_context_enabled = self.udf_trace_context_enabled(request_context)?;
         let run_db_bson = |conn: Arc<Connection>| async move {
-            conn.query_db_bson(query, db, &PgDocument(doc)).await
+            let outgoing = command_trace_context::outgoing_command(doc, trace_context_enabled);
+            conn.query_db_bson(query, db, &PgDocument(&outgoing)).await
         };
 
         self.run_query(
@@ -103,8 +137,12 @@ impl DocumentDBDataClient {
         let db = request.db();
         let doc = request.document();
 
+        let trace_context_enabled = self.udf_trace_context_enabled(request_context)?;
         let run_cursor = |conn: Arc<Connection>| async move {
-            let rows = conn.query_db_bson(query, db, &PgDocument(doc)).await?;
+            let outgoing = command_trace_context::outgoing_command(doc, trace_context_enabled);
+            let rows = conn
+                .query_db_bson(query, db, &PgDocument(&outgoing))
+                .await?;
             Ok((rows, conn))
         };
 
@@ -354,11 +392,13 @@ impl PgDataClient for DocumentDBDataClient {
         let doc = request.document();
         let extra = request.extra();
 
+        let trace_context_enabled = self.udf_trace_context_enabled(request_context)?;
         let run_delete = |conn: Arc<Connection>| async move {
+            let outgoing = command_trace_context::outgoing_command(doc, trace_context_enabled);
             conn.query(
                 query,
                 &[Type::TEXT, Type::BYTEA, Type::BYTEA],
-                &[&db, &PgDocument(doc), &extra],
+                &[&db, &PgDocument(&outgoing), &extra],
             )
             .await
         };
@@ -386,7 +426,9 @@ impl PgDataClient for DocumentDBDataClient {
         let doc = request.document();
         let extra = request.extra();
 
+        let trace_context_enabled = self.udf_trace_context_enabled(request_context)?;
         let run_delete_readonly = |conn: Arc<Connection>| async move {
+            let outgoing = command_trace_context::outgoing_command(doc, trace_context_enabled);
             let mut txn = ScopedTransaction::start_if_necessary(&conn).await?;
             conn.batch_execute(self.service_context.query_catalog().set_allow_write())
                 .await?;
@@ -394,7 +436,7 @@ impl PgDataClient for DocumentDBDataClient {
                 .query(
                     self.service_context.query_catalog().delete(),
                     &[Type::TEXT, Type::BYTEA, Type::BYTEA],
-                    &[&db, &PgDocument(doc), &extra],
+                    &[&db, &PgDocument(&outgoing), &extra],
                 )
                 .await;
             if rows.is_ok() {
@@ -574,6 +616,7 @@ impl PgDataClient for DocumentDBDataClient {
         connection_context: &ConnectionContext,
     ) -> Result<(Option<serde_json::Value>, String)> {
         let request = request_context.request();
+        command_trace_context::validate_command(request.document(), RequestType::Explain)?;
         let analyze = match verbosity {
             Verbosity::QueryPlanner | Verbosity::AllShardsQueryPlan => "False",
             _ => "True",
@@ -586,6 +629,9 @@ impl PgDataClient for DocumentDBDataClient {
 
         let db = request.db();
         let doc = explain_target.document();
+        if command_trace_context::supports_operation(explain_target.request_type()) {
+            command_trace_context::validate_command(doc, explain_target.request_type())?;
+        }
         let explain_query_str = explain_query.as_str();
 
         let explain_config = match verbosity {
@@ -692,11 +738,13 @@ impl PgDataClient for DocumentDBDataClient {
         let doc = request_context.request().document();
         let continuation = &cursor.continuation;
 
+        let trace_context_enabled = self.udf_trace_context_enabled(request_context)?;
         let run_get_more = |conn: Arc<Connection>| async move {
+            let outgoing = command_trace_context::outgoing_command(doc, trace_context_enabled);
             conn.query(
                 self.service_context.query_catalog().cursor_get_more(),
                 &[Type::TEXT, Type::BYTEA, Type::BYTEA],
-                &[&db, &PgDocument(doc), &PgDocument(continuation)],
+                &[&db, &PgDocument(&outgoing), &PgDocument(continuation)],
             )
             .await
         };
@@ -738,16 +786,18 @@ impl PgDataClient for DocumentDBDataClient {
         let doc = request.document();
         let extra = request.extra();
 
+        let trace_context_enabled = self.udf_trace_context_enabled(request_context)?;
         let mut query_options_builder = QueryOptions::builder().supports_backend_timeout(true);
         if is_batch_commit {
             query_options_builder = query_options_builder.retry_request(false);
         }
 
         let run_insert = |conn: Arc<Connection>| async move {
+            let outgoing = command_trace_context::outgoing_command(doc, trace_context_enabled);
             conn.query(
                 query,
                 &[Type::TEXT, Type::BYTEA, Type::BYTEA],
-                &[&db, &PgDocument(doc), &extra],
+                &[&db, &PgDocument(&outgoing), &extra],
             )
             .await
         };
@@ -871,11 +921,13 @@ impl PgDataClient for DocumentDBDataClient {
         let doc = request.document();
         let extra = request.extra();
 
+        let trace_context_enabled = self.udf_trace_context_enabled(request_context)?;
         let run_update = |conn: Arc<Connection>| async move {
+            let outgoing = command_trace_context::outgoing_command(doc, trace_context_enabled);
             conn.query(
                 query_str,
                 &[Type::TEXT, Type::BYTEA, Type::BYTEA],
-                &[&db, &PgDocument(doc), &extra],
+                &[&db, &PgDocument(&outgoing), &extra],
             )
             .await
         };
@@ -1617,5 +1669,74 @@ impl PgDataClient for DocumentDBDataClient {
         Err(DocumentDBError::command_not_supported(
             "Not supported operation.".to_owned(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bson::rawdoc;
+
+    use crate::{
+        context::RequestContext,
+        error::ErrorCode,
+        postgres::{DocumentDBDataClient, PgDataClient},
+        requests::{request_tracker::RequestTracker, Request, RequestType, WireRequest},
+        telemetry::TelemetrySettings,
+        testing::{test_connection_context_with_telemetry_settings, TestDynamicConfiguration},
+    };
+
+    #[tokio::test]
+    async fn unavailable_udf_trace_context_preserves_commands_and_field_validation() {
+        let connection_context = test_connection_context_with_telemetry_settings(
+            TelemetrySettings::new(false).with_udf_trace_context(true),
+            Arc::new(TestDynamicConfiguration::default()),
+            None,
+        )
+        .await;
+        let client = DocumentDBDataClient::new_unauthorized(&connection_context.service_context)
+            .expect("Test data client should initialize");
+
+        for (operation, document, reserved_field_error) in [
+            (
+                RequestType::Count,
+                rawdoc! { "count": "events", "$db": "test" },
+                ErrorCode::BadValue,
+            ),
+            (
+                RequestType::Insert,
+                rawdoc! { "insert": "events", "documents": [], "$db": "test" },
+                ErrorCode::UnknownBsonField,
+            ),
+        ] {
+            for has_reserved_field in [false, true] {
+                let mut command = document.clone();
+                if has_reserved_field {
+                    command.append("$documentdbTrace", rawdoc! { "version": 1 });
+                }
+                let request = Request::RawBuf(operation, command);
+                let request_info = request
+                    .extract_common()
+                    .expect("Test command should have valid common fields");
+                let wire_request = WireRequest::from_request_and_info(&request, request_info);
+                let tracker = RequestTracker::new();
+                let request_context = RequestContext::new("", &wire_request, &tracker);
+
+                let enabled = client.udf_trace_context_enabled(&request_context);
+                if has_reserved_field {
+                    assert_eq!(
+                        enabled
+                            .expect_err("Caller-supplied trace metadata should remain rejected")
+                            .error_code(),
+                        reserved_field_error,
+                    );
+                } else {
+                    assert!(
+                        !enabled.expect("Unavailable trace context must not reject data commands")
+                    );
+                }
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * include/commands/cursor_private.h
  *
@@ -13,6 +14,7 @@
 #define CURSOR_PRIVATE_H
 
 typedef struct QueryCursorPlanResult QueryCursorPlanResult;
+typedef struct BackendFindSpan BackendFindSpan;
 
 bool DrainStreamingQuery(HTAB *cursorMap, Query *query, int batchSize,
 						 int32_t *numIterations, uint32_t accumulatedSize,
@@ -28,7 +30,8 @@ bool CreateAndDrainPersistedQuery(const char *cursorName,
 								  bool closeCursor);
 void CreateAndDrainSingleBatchQuery(const char *cursorName, Query *query,
 									int batchSize, int32_t *numIterations, uint32_t
-									accumulatedSize, pgbson_array_writer *arrayWriter);
+									accumulatedSize, pgbson_array_writer *arrayWriter,
+									BackendFindSpan *telemetrySpan);
 bytea * CreateAndDrainPersistedQueryWithFiles(const char *cursorName,
 											  QueryCursorPlanResult *planResult,
 											  int batchSize, int32_t *numIterations,
@@ -48,7 +51,8 @@ bytea * DrainPersistedFileCursor(const char *cursorName, int batchSize,
 void CreateAndDrainPointReadQuery(const char *cursorName, Query *query,
 								  int32_t *numIterations, uint32_t
 								  accumulatedSize,
-								  pgbson_array_writer *arrayWriter);
+								  pgbson_array_writer *arrayWriter,
+								  BackendFindSpan *telemetrySpan);
 
 QueryCursorPlanResult * PlanForcedPersistentQuery(Query *query, bool isHoldCursor);
 

@@ -9,7 +9,9 @@
 
 use std::{env, path::PathBuf};
 
-use documentdb_gateway_core::configuration::{env_keys, DocumentDBSetupConfiguration};
+use documentdb_gateway_core::configuration::{
+    env_keys, DocumentDBSetupConfiguration, SetupConfiguration,
+};
 use documentdb_gateway_otel::TelemetryManager;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -106,7 +108,16 @@ pub fn load_configuration(config: Option<PathBuf>) -> DocumentDBSetupConfigurati
         }
     }
 
-    match DocumentDBSetupConfiguration::from_env_with_optional_json(resolved.as_deref()) {
+    let configuration = DocumentDBSetupConfiguration::from_env_with_optional_json(
+        resolved.as_deref(),
+    )
+    .and_then(|mut config| {
+        if TelemetryManager::udf_trace_context_requested(config.telemetry_provider_options())? {
+            config.set_telemetry_settings(config.telemetry_settings().with_udf_trace_context(true));
+        }
+        Ok(config)
+    });
+    match configuration {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("documentdb-gateway: failed to load configuration: {e}");

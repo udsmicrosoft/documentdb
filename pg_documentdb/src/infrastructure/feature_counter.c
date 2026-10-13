@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/oss_backend/infrastructure/feature_counter.c
  *
@@ -547,6 +548,9 @@ static char FeatureMapping[MAX_FEATURE_COUNT][MAX_FEATURE_NAME_LENGTH] = {
 	[FEATURE_STAGE_UNWIND] = "unwind",
 	[FEATURE_STAGE_VECTOR_SEARCH_KNN] = "vector_search_knn",
 	[FEATURE_STAGE_VECTOR_SEARCH_NATIVE] = "vector_search_native",
+
+	[FEATURE_UDF_TRACE_CONTEXT_LOG_DROPPED] = "udf_trace_context_log_dropped",
+	[FEATURE_UDF_TRACE_CONTEXT_REJECTED] = "udf_trace_context_rejected",
 
 	/* Feature Mapping region - Unique shard key path */
 	[FEATURE_UNIQUE_SHARD_KEY_MISMATCH_SUPPRESSED_CONFLICT] =

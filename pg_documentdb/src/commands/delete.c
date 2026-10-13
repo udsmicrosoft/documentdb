@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/commands/delete.c
  *
@@ -45,6 +46,7 @@
 #include "utils/error_utils.h"
 #include "utils/documentdb_errors.h"
 #include "utils/feature_counter.h"
+#include "utils/udf_trace_context.h"
 #include "utils/index_utils.h"
 #include "utils/version_utils.h"
 #include "utils/query_utils.h"
@@ -271,6 +273,7 @@ CommandDeleteCore(PG_FUNCTION_ARGS, WriteMode writeMode, MemoryContext allocCont
 
 	Datum databaseNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
 	pgbson *deleteSpec = PG_GETARG_PGBSON(1);
+	ProcessUdfTraceContextAtEntry(deleteSpec, "delete");
 
 	pgbsonsequence *deleteDocs = PG_GETARG_MAYBE_NULL_PGBSON_SEQUENCE(2);
 

@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * include/utils/feature_counter.h
  *
@@ -19,7 +20,7 @@
 #include <port/atomics.h>
 
 #define MAX_FEATURE_NAME_LENGTH 255
-#define MAX_FEATURE_COUNT 476
+#define MAX_FEATURE_COUNT 478
 
 /* Internal features that are not exposed */
 #define INTERNAL_FEATURE_TYPE MAX_FEATURE_COUNT
@@ -519,9 +520,11 @@ typedef enum
 	FEATURE_STAGE_VECTOR_SEARCH_KNN,
 	FEATURE_STAGE_VECTOR_SEARCH_NATIVE,
 
+	FEATURE_UDF_TRACE_CONTEXT_LOG_DROPPED,
+	FEATURE_UDF_TRACE_CONTEXT_REJECTED,
+
 	/* Feature counter region - Unique shard key path */
 	FEATURE_UNIQUE_SHARD_KEY_MISMATCH_SUPPRESSED_CONFLICT,
-
 
 	/* Feature counter region - Update operators/Options */
 	FEATURE_UPDATE_MANY,

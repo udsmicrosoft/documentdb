@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway/src/check.rs
  *
@@ -11,8 +12,10 @@
     reason = "Main binary uses expect for initialization failures that should crash the process"
 )]
 
+use std::sync::Arc;
+
 use documentdb_gateway_core::{
-    configuration::{DocumentDBSetupConfiguration, SetupConfiguration},
+    configuration::{DocumentDBSetupConfiguration, PgConfiguration, SetupConfiguration},
     postgres::{conn_mgmt, create_query_catalog},
 };
 
@@ -47,6 +50,18 @@ pub fn run_check(setup_configuration: &DocumentDBSetupConfiguration) -> i32 {
             Box::new(setup_configuration.clone()),
         )
         .await?;
+
+        if setup_configuration
+            .telemetry_settings()
+            .udf_trace_context_enabled()
+        {
+            PgConfiguration::new(
+                setup_configuration,
+                Arc::clone(&pool),
+                vec!["documentdb.".to_owned()],
+            )
+            .await?;
+        }
 
         // Pool validation already proved the connection works and the
         // extension is loaded. Run one more targeted query so we can

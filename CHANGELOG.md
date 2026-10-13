@@ -1,4 +1,7 @@
 ### documentdb v1.2-0 (Unreleased) ###
+* Add opt-in local single-batch Find execution spans with bounded shared storage, restricted telemetry read functions, and actual scan classification and document counts for supported local plans. *[Feature]*
+* Add an opt-in command-BSON trace carrier and bounded server-only context logs for data commands without changing SQL signatures or application comments. *[Feature]*
+* Preserve environment-selected gateway tracing and metrics when JSON configuration omits the corresponding flags. *[Bugfix]*
 * Reject passwords that fail SASLprep in `createUser` and `updateUser` before creating or changing native users. *[Bugfix]* ([#765](https://github.com/documentdb/documentdb/issues/765))
 * Estimate the inner side of a `$lookup` join from collected statistics instead of a fixed fallback selectivity, so an index on the `foreignField` is costed correctly. Controlled by the default-on `documentdb.enable_lookup_join_selectivity_from_stats` setting. *[Perf]*
 * Support `timestamptz` values in `bson_build_document`, writing them as BSON dates with millisecond precision. *[Feature]*

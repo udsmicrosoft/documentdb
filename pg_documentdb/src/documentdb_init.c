@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/documentdb_init.c
  *
@@ -28,6 +29,7 @@
 #include "configs/config_initialization.h"
 #include "index_am/documentdb_rum.h"
 #include "infrastructure/cursor_store.h"
+#include "infrastructure/backend_telemetry.h"
 #include "infrastructure/job_management.h"
 #include "background_worker/background_worker_job.h"
 #include "background_worker/background_worker_private.h"
@@ -267,6 +269,7 @@ DocumentDBSharedMemoryRequest(void)
 	RequestAddinShmemSpace(VersionCacheShmemSize());
 	RequestAddinShmemSpace(FileCursorShmemSize());
 	RequestAddinShmemSpace(BackgroundWorkerJobStatsShmemSize());
+	RequestAddinShmemSpace(BackendTelemetryShmemSize());
 }
 
 
@@ -278,6 +281,7 @@ DocumentDBSharedMemoryInit(void)
 	InitializeVersionCache();
 	InitializeFileCursorShmem();
 	InitializeBackgroundWorkerJobStatsShmem();
+	InitializeBackendTelemetryShmem();
 
 	if (prev_shmem_startup_hook != NULL)
 	{

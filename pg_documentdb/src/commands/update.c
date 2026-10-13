@@ -103,6 +103,7 @@
 #include "io/pgbsonsequence.h"
 #include "utils/error_utils.h"
 #include "utils/feature_counter.h"
+#include "utils/udf_trace_context.h"
 #include "utils/query_utils.h"
 #include "utils/version_utils.h"
 #include "utils/index_utils.h"
@@ -661,6 +662,7 @@ PerformUpdateCore(Datum *databaseNameDatum, pgbson *updateSpec,
 				  TupleDesc resultTupDesc, WriteMode writeMode,
 				  MemoryContext allocContext)
 {
+	ProcessUdfTraceContextAtEntry(updateSpec, "update");
 	ThrowIfServerOrTransactionReadOnly();
 	bson_iter_t updateCommandIter;
 	PgbsonInitIterator(updateSpec, &updateCommandIter);

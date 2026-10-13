@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/telemetry/metrics.rs
  *
@@ -45,6 +46,7 @@ impl AuthenticationOutcome {
 /// exporter can receive the shared instrument kinds, units, and descriptions.
 pub fn describe_metrics() {
     describe_authentication_metrics();
+    describe_trace_context_metrics();
     metrics::describe_histogram!(
         metric_names::OPERATION_DURATION,
         metrics::Unit::Seconds,
@@ -254,6 +256,14 @@ pub fn record_gateway_metrics(
     record_phase(
         "postgres_commit",
         request_tracker.get_interval_elapsed_time(RequestIntervalKind::PostgresCommitTransaction),
+    );
+}
+
+fn describe_trace_context_metrics() {
+    metrics::describe_counter!(
+        metric_names::UDF_TRACE_CONTEXT_SKIPPED,
+        metrics::Unit::Count,
+        "Sampled UDF contexts omitted because context or command limits prevented propagation"
     );
 }
 

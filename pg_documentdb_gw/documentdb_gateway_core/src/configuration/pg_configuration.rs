@@ -1,12 +1,21 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_core/src/configuration/pg_configuration.rs
  *
  *-------------------------------------------------------------------------
  */
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::SystemTime,
+};
 
 use arc_swap::ArcSwap;
 use bson::{rawbson, RawBson};
@@ -15,10 +24,13 @@ use tokio::{
     task::JoinHandle,
     time::{Duration, Instant},
 };
+use tokio_postgres::Row;
 
 use crate::{
     configuration::{
-        dynamic::{parse_cluster_version, ClusterVersion, POSTGRES_RECOVERY_KEY},
+        dynamic::{
+            parse_binary_version, parse_cluster_version, ClusterVersion, POSTGRES_RECOVERY_KEY,
+        },
         DynamicConfiguration, SetupConfiguration, ENABLE_REQUEST_METRICS_KEY,
         MAX_REQUEST_TIMEOUT_DEFAULT_SEC, MAX_REQUEST_TIMEOUT_SEC_KEY,
         TRANSACTION_TIMEOUT_DEFAULT_SEC, TRANSACTION_TIMEOUT_SEC_KEY,
@@ -44,11 +56,17 @@ struct PgConfigurationInner {
     pool_manager: Arc<PoolManager>,
     instance_kind: String,
     enable_pg_file_settings_refresh: bool,
+    udf_trace_context_enabled: bool,
+}
+
+struct LoadedConfiguration {
+    values: HashMap<String, String>,
+    udf_trace_context_version: Option<i32>,
 }
 
 impl PgConfigurationInner {
     /// Loads configurations from the database and config file using the provided connection.
-    async fn load_configurations(&self) -> Result<HashMap<String, String>> {
+    async fn load_configurations(&self) -> Result<LoadedConfiguration> {
         let mut configs = HashMap::new();
 
         match Self::load_host_config(&self.dynamic_config_path).await {
@@ -78,6 +96,9 @@ impl PgConfigurationInner {
                 Vec::new()
             }
         };
+
+        // Capability must come from the loaded binary, never from a file-setting override.
+        let udf_trace_context_version = self.loaded_udf_trace_context_version(&pg_config_rows);
 
         // Fetch most up-to-date switch-related values from pg_file_settings for settings that are set there. pg_settings may have stale
         // values if pg_reload_conf() failed or if 030-user-supplied-server-parameters.conf was updated after the gateway started. Then
@@ -148,7 +169,23 @@ impl PgConfigurationInner {
         configs.insert(POSTGRES_RECOVERY_KEY.to_owned(), in_recovery.to_string());
 
         tracing::info!("Dynamic configurations loaded: {configs:?}");
-        Ok(configs)
+        Ok(LoadedConfiguration {
+            values: configs,
+            udf_trace_context_version,
+        })
+    }
+
+    fn loaded_udf_trace_context_version(&self, rows: &[Row]) -> Option<i32> {
+        rows.iter().find_map(|row| {
+            let name: &str = row.get(0);
+            if self.settings_prefixes.iter().any(|prefix| {
+                name.strip_prefix(prefix.as_str()) == Some("udf_trace_context_version")
+            }) {
+                row.get::<_, &str>(1).parse().ok()
+            } else {
+                None
+            }
+        })
     }
 
     async fn load_host_config(dynamic_config_path: &str) -> Result<HostConfig> {
@@ -167,6 +204,7 @@ pub struct PgConfiguration {
     last_update_at: ArcSwap<Instant>,
     topology_bson: ArcSwap<RawBson>,
     cluster_version: ArcSwap<Option<ClusterVersion>>,
+    udf_trace_context_supported: AtomicBool,
     refresh_task: Option<JoinHandle<()>>,
     watch_task: Option<JoinHandle<()>>,
 }
@@ -233,15 +271,30 @@ impl PgConfiguration {
             enable_pg_file_settings_refresh: setup_configuration
                 .enable_pg_file_settings_refresh()
                 .unwrap_or(false),
+            udf_trace_context_enabled: setup_configuration
+                .telemetry_settings()
+                .udf_trace_context_enabled(),
         };
 
-        let values = ArcSwap::from_pointee(inner.load_configurations().await?);
+        let loaded = inner.load_configurations().await?;
+        let values = ArcSwap::from_pointee(loaded.values);
         let last_update_at = ArcSwap::from_pointee(Instant::now());
         let topology_bson = ArcSwap::from_pointee(
             Self::load_topology(&inner.pool_manager, &inner.instance_kind).await,
         );
         let cluster_version =
             ArcSwap::from_pointee(parse_cluster_version(&topology_bson.load_full()));
+        let udf_trace_context_supported = supports_udf_trace_context(
+            loaded.udf_trace_context_version,
+            &topology_bson.load_full(),
+        );
+        if inner.udf_trace_context_enabled
+            && (!cfg!(feature = "postgres-udf-trace-context") || !udf_trace_context_supported)
+        {
+            return Err(DocumentDBError::bad_value(
+                "UDF trace context requires capability version 1, matching extension schema and binary versions, and a compatible gateway build; restart with matched builds and new backend connections".to_owned(),
+            ));
+        }
 
         let mut configuration = Arc::new(Self {
             inner,
@@ -249,6 +302,7 @@ impl PgConfiguration {
             last_update_at,
             topology_bson,
             cluster_version,
+            udf_trace_context_supported: AtomicBool::new(udf_trace_context_supported),
             refresh_task: None,
             watch_task: None,
         });
@@ -286,10 +340,18 @@ impl PgConfiguration {
             }
         };
 
-        self.values.store(Arc::new(new_config));
         let new_topology =
             Self::load_topology(&self.inner.pool_manager, &self.inner.instance_kind).await;
+        if !supports_udf_trace_context(new_config.udf_trace_context_version, &new_topology) {
+            // A capability loss cannot be repaired by reusing already-open backend connections.
+            self.udf_trace_context_supported
+                .store(false, Ordering::Relaxed);
+            if self.inner.udf_trace_context_enabled {
+                tracing::error!("UDF trace context capability was lost; restart with matched builds and new backend connections");
+            }
+        }
         let parsed_version = parse_cluster_version(&new_topology);
+        self.values.store(Arc::new(new_config.values));
         self.topology_bson.store(Arc::new(new_topology));
         self.cluster_version.store(Arc::new(parsed_version));
         self.last_update_at.store(Arc::new(Instant::now()));
@@ -374,7 +436,17 @@ impl PgConfiguration {
     }
 }
 
+fn supports_udf_trace_context(capability: Option<i32>, topology: &RawBson) -> bool {
+    capability == Some(1)
+        && parse_cluster_version(topology)
+            .is_some_and(|version| Some(version) == parse_binary_version(topology))
+}
+
 impl DynamicConfiguration for PgConfiguration {
+    fn supports_udf_trace_context(&self) -> bool {
+        self.udf_trace_context_supported.load(Ordering::Relaxed)
+    }
+
     fn get_str(&self, key: &str) -> Option<String> {
         self.values.load_full().get(key).cloned()
     }
@@ -449,6 +521,36 @@ impl Drop for PgConfiguration {
 
         if let Some(watch_task) = &self.watch_task {
             watch_task.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod udf_trace_context_tests {
+    use bson::rawbson;
+
+    use crate::configuration::pg_configuration::supports_udf_trace_context;
+
+    #[test]
+    fn requires_explicit_capability_and_matching_actual_binary() {
+        assert!(supports_udf_trace_context(
+            Some(1),
+            &rawbson!({ "documentdb_versions": ["1.1-0", "1.1.0"] })
+        ));
+        for topology in [
+            rawbson!({ "documentdb_versions": ["1.1-0"] }),
+            rawbson!({ "documentdb_versions": ["1.1-0", "1.0.0"] }),
+            rawbson!({ "documentdb_versions": ["1.1-0", "1.1-0"] }),
+            rawbson!({ "documentdb_versions": ["1.1-0", "1.1.0.extra"] }),
+            rawbson!({ "documentdb_versions": ["invalid", "1.1.0"] }),
+            rawbson!({ "documentdb_versions": ["1.1-0", 1] }),
+            rawbson!({}),
+        ] {
+            assert!(!supports_udf_trace_context(Some(1), &topology));
+        }
+        let topology = rawbson!({ "documentdb_versions": ["1.1-0", "1.1.0"] });
+        for capability in [None, Some(0), Some(2)] {
+            assert!(!supports_udf_trace_context(capability, &topology));
         }
     }
 }

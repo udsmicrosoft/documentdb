@@ -1,0 +1,28 @@
+[package]
+name = "documentdb_backend_telemetry_exporter"
+description = "Bounded native backend telemetry collection and OTLP export for DocumentDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+hex.workspace = true
+opentelemetry-proto.workspace = true
+tonic.workspace = true
+
+[lints]
+workspace = true

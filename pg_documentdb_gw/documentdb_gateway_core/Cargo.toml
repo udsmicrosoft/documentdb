@@ -14,6 +14,7 @@ default = []
 runtime-benchmarks = []
 # Compiles request span creation and inbound W3C parent extraction.
 request-tracing = []
+postgres-udf-trace-context = ["request-tracing"]
 
 [dependencies]
 arc-swap.workspace = true

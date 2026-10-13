@@ -16,6 +16,7 @@
 #include "configs/config_initialization.h"
 #include "vector/vector_configs.h"
 #include "index_am/documentdb_rum.h"
+#include "utils/udf_trace_context.h"
 
 /*
  * Externally defined GUC constants
@@ -233,9 +234,44 @@ static struct config_enum_entry rum_load_options[4] = {
 	{ NULL, 0, false }
 };
 
+static int UdfTraceContextVersion = UDF_TRACE_CONTEXT_VERSION;
+#define DEFAULT_UDF_TRACE_CONTEXT_LOG_LIMIT_PER_SECOND 100
+int UdfTraceContextLogLimitPerSecond = DEFAULT_UDF_TRACE_CONTEXT_LOG_LIMIT_PER_SECOND;
+
+/* Telemetry remains operator opt-in, not a rollout flag that becomes default-on. */
+bool EnableBackendTelemetry = false;
+bool EnableBackendTelemetryStorage = false;
+
 void
 InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 {
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_backend_telemetry", newGucPrefix),
+		gettext_noop("Records bounded sampled local single-batch Find spans."),
+		NULL, &EnableBackendTelemetry, false,
+		PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_backend_telemetry_storage", newGucPrefix),
+		gettext_noop("Allocates bounded backend telemetry storage at server startup."),
+		NULL, &EnableBackendTelemetryStorage, false,
+		PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.udf_trace_context_version", newGucPrefix),
+		gettext_noop("Command-BSON trace context capability of the loaded binary."),
+		NULL, &UdfTraceContextVersion, UDF_TRACE_CONTEXT_VERSION,
+		UDF_TRACE_CONTEXT_VERSION, UDF_TRACE_CONTEXT_VERSION,
+		PGC_INTERNAL, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.udf_trace_context_log_limit_per_second", newGucPrefix),
+		gettext_noop(
+			"Maximum sampled context log records per backend per second; zero suppresses all records."),
+		NULL, &UdfTraceContextLogLimitPerSecond,
+		DEFAULT_UDF_TRACE_CONTEXT_LOG_LIMIT_PER_SECOND, 0, 10000,
+		PGC_SUSET, 0, NULL, NULL, NULL);
+
 	DefineCustomStringVariable(
 		psprintf("%s.localhost_connection_string", prefix),
 		gettext_noop("Sets the hostname (and potentially other parameters "

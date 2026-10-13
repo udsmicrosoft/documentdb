@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_core/src/configuration/dynamic.rs
  *
@@ -69,8 +70,28 @@ pub fn parse_cluster_version(topology: &RawBson) -> Option<ClusterVersion> {
     Some(ClusterVersion::new(major, minor, build))
 }
 
+/// Parses the actual binary version, the second topology entry, in `major.minor.build` format.
+#[must_use]
+pub fn parse_binary_version(topology: &RawBson) -> Option<ClusterVersion> {
+    let versions = topology.as_document()?.get("documentdb_versions").ok()??;
+    let version = versions.as_array()?.into_iter().nth(1)?.ok()?;
+    let mut parts = version.as_str()?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let build = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ClusterVersion::new(major, minor, build))
+}
+
 /// Used for configurations which can change during runtime.
 pub trait DynamicConfiguration: Send + Sync + Debug {
+    /// Returns a cached, explicitly advertised command-BSON capability.
+    fn supports_udf_trace_context(&self) -> bool {
+        false
+    }
+
     fn get_str(&self, key: &str) -> Option<String>;
     fn get_bool(&self, key: &str, default: bool) -> bool;
     fn get_i32(&self, key: &str, default: i32) -> i32;

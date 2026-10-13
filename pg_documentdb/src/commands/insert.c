@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/commands/insert.c
  *
@@ -45,6 +46,7 @@
 #include "utils/error_utils.h"
 #include "utils/guc_utils.h"
 #include "utils/version_utils.h"
+#include "utils/udf_trace_context.h"
 #include "utils/documentdb_errors.h"
 #include "api_hooks.h"
 #include "schema_validation/schema_validation.h"
@@ -1239,9 +1241,10 @@ CommandInsertCore(PG_FUNCTION_ARGS, WriteMode writeMode, MemoryContext allocCont
 		ereport(ERROR, (errmsg("insert document cannot be NULL")));
 	}
 
+	pgbson *insertSpec = PG_GETARG_PGBSON(1);
+	ProcessUdfTraceContextAtEntry(insertSpec, "insert");
 	ThrowIfServerOrTransactionReadOnly();
 
-	pgbson *insertSpec = PG_GETARG_PGBSON(1);
 	Datum databaseNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
 
 	pgbsonsequence *insertDocs = PG_GETARG_MAYBE_NULL_PGBSON_SEQUENCE(2);

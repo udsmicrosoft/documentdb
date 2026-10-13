@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_core/src/testing/mod.rs
  *
@@ -18,6 +19,7 @@ pub mod telemetry;
 
 pub use connection_context::{
     test_connection_context, test_connection_context_with_authentication_manager,
+    test_connection_context_with_telemetry_settings,
 };
 pub use dynamic_configuration::TestDynamicConfiguration;
 pub use env_guard::EnvGuard;
