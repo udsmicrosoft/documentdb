@@ -9,6 +9,8 @@
 
 pub(crate) mod config;
 mod consts;
+#[cfg(all(test, feature = "postgres-udf-trace-context"))]
+mod udf_trace_context_tests;
 
 use std::{
     borrow::Cow,
@@ -20,8 +22,11 @@ use std::{
 use documentdb_gateway_core::{
     error::{DocumentDBError, Result},
     telemetry::{
+        consts::{labels, metric_names},
         context_propagation::{install_trace_context_bridge, TraceContextBridge},
-        describe_metrics, TelemetrySettings,
+        describe_metrics,
+        trace_context::{self, ActiveTraceContext, ActiveTraceContextHook},
+        TelemetrySettings,
     },
 };
 use metrics_exporter_opentelemetry::Recorder;
@@ -57,6 +62,15 @@ pub struct TelemetryManager {
 }
 
 impl TelemetryManager {
+    /// Resolves whether command-BSON transport was explicitly requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or unsupported command-BSON propagation settings.
+    pub fn udf_trace_context_requested(options: Option<&serde_json::Value>) -> Result<bool> {
+        config::udf_trace_context_requested(options)
+    }
+
     /// Initializes enabled OTLP signals and installs their process-wide bridges.
     ///
     /// # Errors
@@ -98,6 +112,15 @@ impl TelemetryManager {
             global::set_tracer_provider(provider.clone());
             global::set_text_map_propagator(TraceContextPropagator::new());
             let _ = install_trace_context_bridge(&OTEL_TRACE_CONTEXT_BRIDGE);
+            if config.tracing().udf_trace_context_enabled()
+                && !trace_context::install_active_trace_context_hook(
+                    &OTEL_ACTIVE_TRACE_CONTEXT_HOOK,
+                )
+            {
+                return Err(DocumentDBError::bad_value(
+                    "An active trace-context provider is already installed".to_owned(),
+                ));
+            }
         }
 
         Ok(Self {
@@ -282,6 +305,49 @@ fn create_tracer_provider(
 struct OpenTelemetryTraceContextBridge;
 
 static OTEL_TRACE_CONTEXT_BRIDGE: OpenTelemetryTraceContextBridge = OpenTelemetryTraceContextBridge;
+
+#[derive(Debug)]
+struct OpenTelemetryActiveTraceContextHook;
+
+static OTEL_ACTIVE_TRACE_CONTEXT_HOOK: OpenTelemetryActiveTraceContextHook =
+    OpenTelemetryActiveTraceContextHook;
+
+impl ActiveTraceContextHook for OpenTelemetryActiveTraceContextHook {
+    fn current_context(&self) -> Option<ActiveTraceContext> {
+        // Filtering out execution instrumentation must not revive an enclosing request parent.
+        if tracing::Span::current().metadata()?.name() != "postgres.execute" {
+            return None;
+        }
+        current_sampled_trace_context()
+    }
+}
+
+fn current_sampled_trace_context() -> Option<ActiveTraceContext> {
+    let context = tracing::Span::current().context();
+    let span = context.span();
+    sampled_trace_context(span.span_context())
+}
+
+fn sampled_trace_context(span_context: &SpanContext) -> Option<ActiveTraceContext> {
+    if !span_context.is_valid() || !span_context.is_sampled() {
+        return None;
+    }
+    let parent = format!(
+        "00-{}-{}-{:02x}",
+        span_context.trace_id(),
+        span_context.span_id(),
+        span_context.trace_flags().to_u8()
+    );
+    let context = ActiveTraceContext::new(parent, Some(span_context.trace_state().header()));
+    if context.is_none() {
+        metrics::counter!(
+            metric_names::UDF_TRACE_CONTEXT_SKIPPED,
+            labels::TRACE_CONTEXT_SKIP_REASON => "invalid_context"
+        )
+        .increment(1);
+    }
+    context
+}
 
 impl TraceContextBridge for OpenTelemetryTraceContextBridge {
     fn set_parent(

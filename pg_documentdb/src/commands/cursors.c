@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/commands/cursors.c
  *
@@ -44,6 +45,7 @@
 #include "commands/commands_common.h"
 #include "planner/documents_custom_planner.h"
 #include "infrastructure/cursor_store.h"
+#include "infrastructure/backend_telemetry.h"
 #include "customscan/bson_custom_scan.h"
 
 
@@ -340,7 +342,8 @@ static PersistentTupleDestReceiver * CreatePersistentTupleDestReceiver(
 static void DrainStatementViaExecutor(PlannedStmt *queryPlan, ParamListInfo paramList,
 									  const char *sourceText, DestReceiver *destReceiver,
 									  MemoryContext currentContext,
-									  UpdateCustomScanState updateFunc, bool drainQuery);
+									  UpdateCustomScanState updateFunc, bool drainQuery,
+									  BackendFindSpan *telemetrySpan);
 
 const char NodeId[] = "nodeId";
 uint32_t NodeIdLength = 7;
@@ -392,7 +395,7 @@ DrainSingleResultQuery(Query *query)
 	bool drainQuery = true;
 	DrainStatementViaExecutor(queryPlan, paramListInfo, sourceText,
 							  (DestReceiver *) receiver, currentContext, stateFunc,
-							  drainQuery);
+							  drainQuery, NULL);
 
 	return receiver->singleResult;
 }
@@ -461,7 +464,7 @@ DrainStreamingQuery(HTAB *cursorMap, Query *query, int batchSize,
 		bool drainQuery = batchSize > 0;
 		DrainStatementViaExecutor(queryPlan, paramListInfo, sourceText,
 								  (DestReceiver *) receiver, currentContext, stateFunc,
-								  drainQuery);
+								  drainQuery, NULL);
 
 		TerminationReason reason = drainQuery ? receiver->terminationReason :
 								   TerminationReason_BatchSizeLimit;
@@ -892,7 +895,7 @@ DrainDynamicStreamingCursor(QueryCursorPlanResult *planResult,
 	bool drainQuery = batchSize > 0;
 	DrainStatementViaExecutor(planResult->queryPlan, NULL, planResult->queryString,
 							  (DestReceiver *) receiver, CurrentMemoryContext, stateFunc,
-							  drainQuery);
+							  drainQuery, NULL);
 
 	*numRowsFetchedOut = (int64) receiver->base.numRowsFetched;
 
@@ -1029,7 +1032,8 @@ PlanForcedPersistentQuery(Query *query, bool isHoldCursor)
 void
 CreateAndDrainSingleBatchQuery(const char *cursorName, Query *query,
 							   int batchSize, int32_t *numIterations, uint32_t
-							   accumulatedSize, pgbson_array_writer *arrayWriter)
+							   accumulatedSize, pgbson_array_writer *arrayWriter,
+							   BackendFindSpan *telemetrySpan)
 {
 	/* Set up cursor flags */
 	bool closeCursor = true;
@@ -1076,7 +1080,11 @@ CreateAndDrainSingleBatchQuery(const char *cursorName, Query *query,
 	UpdateCustomScanState stateFunc = NULL;
 	bool drainQuery = true;
 	DrainStatementViaExecutor(queryPlan, paramList, sourceText, (DestReceiver *) receiver,
-							  currentContext, stateFunc, drainQuery);
+							  currentContext, stateFunc, drainQuery, telemetrySpan);
+	if (telemetrySpan != NULL)
+	{
+		telemetrySpan->returnedDocuments = receiver->base.numRowsFetched;
+	}
 }
 
 
@@ -1233,7 +1241,7 @@ CreateAndDrainPersistedQueryWithFiles(const char *cursorName,
 	bool drainQuery = true;
 	DrainStatementViaExecutor(result->queryPlan, result->paramList, result->queryString,
 							  (DestReceiver *) receiver,
-							  currentContext, stateFunc, drainQuery);
+							  currentContext, stateFunc, drainQuery, NULL);
 
 	/* return the continuation state */
 	return receiver->continuationState;
@@ -1250,7 +1258,8 @@ void
 CreateAndDrainPointReadQuery(const char *cursorName, Query *query,
 							 int32_t *numIterations, uint32_t
 							 accumulatedSize,
-							 pgbson_array_writer *arrayWriter)
+							 pgbson_array_writer *arrayWriter,
+							 BackendFindSpan *telemetrySpan)
 {
 	/* Set up cursor flags */
 	int cursorOptions = CURSOR_OPT_BINARY;
@@ -1290,7 +1299,11 @@ CreateAndDrainPointReadQuery(const char *cursorName, Query *query,
 	bool drainQuery = true;
 	DrainStatementViaExecutor(queryPlan, paramList, sourceText,
 							  (DestReceiver *) receiver, currentContext, stateFunc,
-							  drainQuery);
+							  drainQuery, telemetrySpan);
+	if (telemetrySpan != NULL)
+	{
+		telemetrySpan->returnedDocuments = receiver->base.numRowsFetched;
+	}
 }
 
 
@@ -1775,7 +1788,8 @@ static void
 DrainStatementViaExecutor(PlannedStmt *queryPlan, ParamListInfo paramList, const
 						  char *sourceText,
 						  DestReceiver *destReceiver, MemoryContext currentContext,
-						  UpdateCustomScanState updateFunc, bool drainQuery)
+						  UpdateCustomScanState updateFunc, bool drainQuery,
+						  BackendFindSpan *telemetrySpan)
 {
 	ScanDirection scanDirection = ForwardScanDirection;
 	QueryEnvironment *queryEnv = create_queryEnv();
@@ -1790,7 +1804,8 @@ DrainStatementViaExecutor(PlannedStmt *queryPlan, ParamListInfo paramList, const
 	QueryDesc *queryDesc = CreateQueryDesc(queryPlan, sourceText,
 										   GetActiveSnapshot(), InvalidSnapshot,
 										   (DestReceiver *) destReceiver, paramList,
-										   queryEnv, 0);
+										   queryEnv,
+										   telemetrySpan != NULL ? INSTRUMENT_ROWS : 0);
 
 	ExecutorStart(queryDesc, eflags);
 
@@ -1806,6 +1821,10 @@ DrainStatementViaExecutor(PlannedStmt *queryPlan, ParamListInfo paramList, const
 	}
 
 	ExecutorFinish(queryDesc);
+	if (telemetrySpan != NULL)
+	{
+		CaptureBackendFindExecution(telemetrySpan, queryDesc);
+	}
 	ExecutorEnd(queryDesc);
 
 	FreeQueryDesc(queryDesc);

@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway/src/main.rs
  *
@@ -117,24 +118,30 @@ fn main() {
     runtime.block_on(start_gateway(setup_configuration));
 }
 
-async fn start_gateway(mut setup_configuration: DocumentDBSetupConfiguration) {
-    let enable_v2_runtime = setup_configuration.enable_v2_runtime();
-
-    // Initialize the telemetry adapter before constructing the tracing subscriber.
-    // The manager owns provider resources and flushes them during shutdown.
-    let telemetry_manager = match TelemetryManager::init_telemetry(
-        setup_configuration.telemetry_provider_options(),
-        None,
-    ) {
+fn initialize_telemetry(
+    setup_configuration: &mut DocumentDBSetupConfiguration,
+) -> Option<TelemetryManager> {
+    match TelemetryManager::init_telemetry(setup_configuration.telemetry_provider_options(), None) {
         Ok(manager) => {
             setup_configuration.set_telemetry_settings(manager.settings());
             Some(manager)
         }
         Err(e) => {
             eprintln!("Failed to initialize telemetry: {e}");
+            setup_configuration.set_telemetry_settings(
+                setup_configuration
+                    .telemetry_settings()
+                    .with_udf_trace_context(false),
+            );
             None
         }
-    };
+    }
+}
+
+async fn start_gateway(mut setup_configuration: DocumentDBSetupConfiguration) {
+    let enable_v2_runtime = setup_configuration.enable_v2_runtime();
+    // Initialize providers before the subscriber, and retain them through shutdown.
+    let telemetry_manager = initialize_telemetry(&mut setup_configuration);
 
     bootstrap::init_tracing_with_telemetry(telemetry_manager.as_ref());
 
@@ -227,4 +234,80 @@ async fn start_gateway(mut setup_configuration: DocumentDBSetupConfiguration) {
     }
 
     shutdown_telemetry(telemetry_manager);
+}
+
+#[cfg(test)]
+mod tests {
+    use documentdb_gateway_core::telemetry::TelemetrySettings;
+    use serde_json::json;
+
+    use super::*;
+
+    fn assert_telemetry_failure_falls_back(udf_trace_context_enabled: bool) {
+        for metrics_enabled in [false, true] {
+            let mut configuration = DocumentDBSetupConfiguration {
+                telemetry_provider_options: Some(json!({
+                    "Metrics": {
+                        "Enabled": metrics_enabled,
+                        "OtlpEndpoint": "http://[invalid"
+                    },
+                    "Tracing": {
+                        "Enabled": true,
+                        "UdfTraceContextEnabled": udf_trace_context_enabled,
+                        "OtlpEndpoint": "http://[invalid"
+                    }
+                })),
+                telemetry_settings: TelemetrySettings::new(metrics_enabled)
+                    .with_udf_trace_context(udf_trace_context_enabled),
+                ..Default::default()
+            };
+            assert_eq!(
+                TelemetryManager::udf_trace_context_requested(
+                    configuration.telemetry_provider_options()
+                )
+                .expect("carrier selection should be valid"),
+                udf_trace_context_enabled
+            );
+
+            assert!(initialize_telemetry(&mut configuration).is_none());
+            assert!(!configuration
+                .telemetry_settings()
+                .udf_trace_context_enabled());
+            assert_eq!(
+                configuration.telemetry_settings().request_metrics_enabled(),
+                metrics_enabled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_failure_preserves_unselected_fallback() {
+        assert_telemetry_failure_falls_back(false);
+    }
+
+    #[cfg(feature = "postgres-udf-trace-context")]
+    #[tokio::test]
+    async fn telemetry_failure_disables_selected_propagation() {
+        assert_telemetry_failure_falls_back(true);
+    }
+
+    #[test]
+    fn successful_telemetry_initialization_publishes_settings() {
+        let mut configuration = DocumentDBSetupConfiguration {
+            telemetry_provider_options: Some(json!({
+                "Metrics": { "Enabled": false },
+                "Tracing": { "Enabled": false, "UdfTraceContextEnabled": false }
+            })),
+            telemetry_settings: TelemetrySettings::new(true),
+            ..Default::default()
+        };
+
+        let manager = initialize_telemetry(&mut configuration)
+            .expect("disabled telemetry should initialize successfully");
+        assert_eq!(configuration.telemetry_settings(), manager.settings());
+        assert!(!configuration.telemetry_settings().request_metrics_enabled());
+        assert!(!configuration
+            .telemetry_settings()
+            .udf_trace_context_enabled());
+    }
 }

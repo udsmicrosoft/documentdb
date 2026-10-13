@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/configs/feature_flag_configs.c
  *
@@ -180,6 +181,8 @@ int IndexBuildFailurePoint = DEFAULT_INDEX_BUILD_FAILURE_POINT;
 bool ReportParallelPlanInCursorContinuation =
 	DEFAULT_REPORT_PARALLEL_PLAN_IN_CURSOR_CONTINUATION;
 
+bool TestUdfTraceContext = false;
+
 void
 InitializeTestConfigurations(const char *prefix, const char *newGucPrefix)
 {
@@ -189,6 +192,11 @@ InitializeTestConfigurations(const char *prefix, const char *newGucPrefix)
 			"Whether to use a single local retry table instead of per-collection retry tables."),
 		NULL, &EnableLocalRetryTable, DEFAULT_ENABLE_LOCAL_RETRY_TABLE,
 		PGC_USERSET, GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomBoolVariable(
+		psprintf("%s.test_udf_trace_context", newGucPrefix),
+		gettext_noop("Reports bounded trace identifiers at UDF entry for tests only."),
+		NULL, &TestUdfTraceContext, false,
+		PGC_SUSET, GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		psprintf("%s.next_collection_id", newGucPrefix),

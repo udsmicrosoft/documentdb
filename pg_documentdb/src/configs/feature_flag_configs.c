@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/configs/feature_flag_configs.c
  *
@@ -634,11 +635,22 @@ bool IndexBuildsScheduledOnBgWorker = DEFAULT_INDEX_BUILDS_SCHEDULED_ON_BGWORKER
 bool EnableDeadIndexEntryMarkingByTTLTask =
 	DEFAULT_ENABLE_DEAD_INDEX_ENTRY_MARKING_BY_TTL_TASK;
 
+/* Added on v1.2, pending stabilization */
+#define DEFAULT_ENABLE_UDF_TRACE_CONTEXT false
+bool EnableUdfTraceContext = DEFAULT_ENABLE_UDF_TRACE_CONTEXT;
+
 /* FEATURE FLAGS END */
 
 void
 InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix)
 {
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_udf_trace_context", newGucPrefix),
+		gettext_noop(
+			"Enables bounded validation and server logging of sampled command-BSON trace context."),
+		NULL, &EnableUdfTraceContext, DEFAULT_ENABLE_UDF_TRACE_CONTEXT,
+		PGC_SUSET, 0, NULL, NULL, NULL);
+
 	DefineCustomBoolVariable(
 		psprintf("%s.enableVectorHNSWIndex", prefix),
 		gettext_noop(

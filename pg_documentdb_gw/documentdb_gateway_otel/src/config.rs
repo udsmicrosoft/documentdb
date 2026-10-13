@@ -29,6 +29,52 @@ fn env_var<T: std::str::FromStr>(var: &str) -> Option<T> {
     env::var(var).ok().and_then(|value| value.parse().ok())
 }
 
+fn resolve_udf_trace_context(
+    option: Option<bool>,
+    environment: std::result::Result<String, env::VarError>,
+) -> Result<bool> {
+    if let Some(enabled) = option {
+        return Ok(enabled);
+    }
+    match environment {
+        Ok(value) => value.parse::<bool>().map_err(|error| {
+            DocumentDBError::bad_value(format!(
+                "DOCUMENTDB_UDF_TRACE_CONTEXT_ENABLED must be true or false: {error}"
+            ))
+        }),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => Err(DocumentDBError::bad_value(
+            "DOCUMENTDB_UDF_TRACE_CONTEXT_ENABLED must be true or false".to_owned(),
+        )),
+    }
+}
+
+/// Resolves whether the UDF carrier was explicitly selected.
+///
+/// # Errors
+///
+/// Returns an error for an invalid setting or an enabled carrier without tracing support.
+pub fn udf_trace_context_requested(options: Option<&Value>) -> Result<bool> {
+    let option = options
+        .and_then(|options| options.get("Tracing"))
+        .and_then(|tracing| tracing.get("UdfTraceContextEnabled"))
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                DocumentDBError::bad_value("UdfTraceContextEnabled must be a boolean".to_owned())
+            })
+        })
+        .transpose()?;
+    let requested = resolve_udf_trace_context(
+        option,
+        env::var(env_vars::DOCUMENTDB_UDF_TRACE_CONTEXT_ENABLED),
+    )?;
+    if requested {
+        TelemetryConfig::new(options)?;
+    }
+    Ok(requested)
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(rename_all = "PascalCase")]
 struct TelemetryOptions {
@@ -54,6 +100,7 @@ struct TracingOptions {
     otlp_endpoint: Option<String>,
     sampler_ratio: Option<f64>,
     export_timeout_ms: Option<u64>,
+    udf_trace_context_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +126,7 @@ impl TelemetryConfig {
             service_name: options.service_name,
             service_version: options.service_version,
             metrics: MetricsConfig::new(options.metrics.as_ref()),
-            tracing: TracingConfig::new(options.tracing.as_ref()),
+            tracing: TracingConfig::new(options.tracing.as_ref())?,
         })
     }
 
@@ -111,6 +158,7 @@ impl TelemetryConfig {
 
     pub(crate) fn settings(&self) -> TelemetrySettings {
         TelemetrySettings::new(self.metrics.enabled())
+            .with_udf_trace_context(self.tracing.udf_trace_context_enabled())
     }
 }
 
@@ -167,17 +215,31 @@ pub struct TracingConfig {
     otlp_endpoint: Option<String>,
     sampler_ratio: Option<f64>,
     export_timeout_ms: Option<u64>,
+    udf_trace_context_enabled: bool,
 }
 
 impl TracingConfig {
-    fn new(options: Option<&TracingOptions>) -> Self {
+    fn new(options: Option<&TracingOptions>) -> Result<Self> {
         let options = options.cloned().unwrap_or_default();
-        Self {
+        let udf_trace_context_enabled = resolve_udf_trace_context(
+            options.udf_trace_context_enabled,
+            env::var(env_vars::DOCUMENTDB_UDF_TRACE_CONTEXT_ENABLED),
+        )?;
+        let config = Self {
             enabled: options.enabled,
             otlp_endpoint: options.otlp_endpoint,
             sampler_ratio: options.sampler_ratio,
             export_timeout_ms: options.export_timeout_ms,
+            udf_trace_context_enabled,
+        };
+        if udf_trace_context_enabled
+            && (!cfg!(feature = "postgres-udf-trace-context") || !config.enabled())
+        {
+            return Err(DocumentDBError::bad_value(
+                "UDF trace context requires the postgres-udf-trace-context build feature and enabled tracing".to_owned(),
+            ));
         }
+        Ok(config)
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -229,6 +291,10 @@ impl TracingConfig {
             .or_else(|| env_var(env_vars::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT))
             .or_else(|| env_var(env_vars::OTEL_EXPORTER_OTLP_TIMEOUT))
             .unwrap_or(DEFAULT_EXPORT_TIMEOUT_MS)
+    }
+
+    pub(crate) const fn udf_trace_context_enabled(&self) -> bool {
+        self.udf_trace_context_enabled
     }
 }
 
@@ -307,6 +373,38 @@ mod tests {
     }
 
     #[test]
+    fn shipped_setup_allows_metric_environment_and_explicit_override() {
+        for enabled in [false, true] {
+            let _guard = EnvGuard::set(env_vars::OTEL_METRICS_ENABLED, &enabled.to_string());
+            let mut setup: Value =
+                serde_json::from_str(include_str!("../../SetupConfiguration.json")).unwrap();
+            let options = setup.get_mut("TelemetryOptions").unwrap();
+            let config = TelemetryConfig::new(Some(options)).unwrap();
+            assert_eq!(config.metrics().enabled(), enabled);
+
+            options["Metrics"]["Enabled"] = json!(!enabled);
+            let config = TelemetryConfig::new(Some(options)).unwrap();
+            assert_eq!(config.metrics().enabled(), !enabled);
+        }
+    }
+
+    #[test]
+    fn shipped_setup_allows_trace_environment_and_explicit_override() {
+        for enabled in [false, true] {
+            let _guard = EnvGuard::set(env_vars::OTEL_TRACES_ENABLED, &enabled.to_string());
+            let mut setup: Value =
+                serde_json::from_str(include_str!("../../SetupConfiguration.json")).unwrap();
+            let options = setup.get_mut("TelemetryOptions").unwrap();
+            let config = TelemetryConfig::new(Some(options)).unwrap();
+            assert_eq!(config.tracing().enabled(), enabled);
+
+            options["Tracing"]["Enabled"] = json!(!enabled);
+            let config = TelemetryConfig::new(Some(options)).unwrap();
+            assert_eq!(config.tracing().enabled(), !enabled);
+        }
+    }
+
+    #[test]
     fn settings_are_provider_neutral() {
         let options = json!({
             "Metrics": { "Enabled": true },
@@ -321,6 +419,55 @@ mod tests {
     fn invalid_configuration_is_rejected() {
         let options = json!({ "Metrics": "invalid" });
         TelemetryConfig::new(Some(&options)).expect_err("configuration should be rejected");
+    }
+
+    #[test]
+    fn udf_carrier_is_opt_in_and_requires_tracing_support() {
+        let options = json!({
+            "Tracing": { "Enabled": true, "UdfTraceContextEnabled": false }
+        });
+        assert!(!TelemetryConfig::new(Some(&options))
+            .unwrap()
+            .settings()
+            .udf_trace_context_enabled());
+        let disabled = json!({
+            "Tracing": { "Enabled": false, "UdfTraceContextEnabled": true }
+        });
+        TelemetryConfig::new(Some(&disabled)).unwrap_err();
+        let options = json!({
+            "Tracing": { "Enabled": true, "UdfTraceContextEnabled": true }
+        });
+        let result = TelemetryConfig::new(Some(&options));
+        if cfg!(feature = "postgres-udf-trace-context") {
+            assert!(result.unwrap().settings().udf_trace_context_enabled());
+        } else {
+            result.unwrap_err();
+        }
+    }
+
+    #[test]
+    fn invalid_udf_carrier_environment_is_rejected() {
+        resolve_udf_trace_context(None, Ok("invalid".to_owned())).unwrap_err();
+        assert!(!resolve_udf_trace_context(Some(false), Ok("invalid".to_owned())).unwrap());
+        assert!(resolve_udf_trace_context(None, Ok("true".to_owned())).unwrap());
+        assert!(!resolve_udf_trace_context(None, Err(env::VarError::NotPresent)).unwrap());
+    }
+
+    #[test]
+    fn carrier_selection_validates_support_without_changing_unselected_fallback() {
+        assert!(!udf_trace_context_requested(Some(&json!({ "Metrics": "invalid" }))).unwrap());
+        udf_trace_context_requested(Some(&json!({
+            "Tracing": { "Enabled": false, "UdfTraceContextEnabled": true }
+        })))
+        .unwrap_err();
+        let selected = udf_trace_context_requested(Some(&json!({
+            "Tracing": { "Enabled": true, "UdfTraceContextEnabled": true }
+        })));
+        if cfg!(feature = "postgres-udf-trace-context") {
+            assert!(selected.unwrap());
+        } else {
+            selected.unwrap_err();
+        }
     }
 
     #[test]

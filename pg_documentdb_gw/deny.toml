@@ -14,6 +14,6 @@ external-default-features = "allow"
 allow-workspace = true
 # List of crates to deny
 deny = [
-    # allow mongodb rust driver only for integration testing
-    { crate = "mongodb", wrappers = ["documentdb_tests"] },
+    # Allow the driver for shared fixtures and the adapter's trace-context tests.
+    { crate = "mongodb", wrappers = ["documentdb_gateway_otel", "documentdb_tests"] },
 ]

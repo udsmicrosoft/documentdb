@@ -9,6 +9,10 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+postgres-udf-trace-context = ["documentdb_gateway_core/postgres-udf-trace-context"]
+
 [dependencies]
 documentdb_gateway_core.workspace = true
 metrics.workspace = true
@@ -21,6 +25,14 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+bson.workspace = true
+documentdb_tests.workspace = true
+mongodb.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tokio.workspace = true
+tokio-util.workspace = true
 
 [lints]
 workspace = true

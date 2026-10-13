@@ -19,6 +19,7 @@ pub mod consts;
 pub mod context_propagation;
 pub mod event_id;
 pub mod metrics;
+pub mod trace_context;
 pub mod utils;
 
 // Re-export commonly used types

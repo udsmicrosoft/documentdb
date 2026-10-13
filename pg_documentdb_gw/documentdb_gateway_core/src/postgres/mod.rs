@@ -1,11 +1,13 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_core/src/postgres/mod.rs
  *
  *-------------------------------------------------------------------------
  */
 
+mod command_trace_context;
 pub mod conn_mgmt;
 mod data_client;
 pub(crate) mod document;

@@ -19,6 +19,7 @@ pub mod span_fields {
 
 // Environment variables used for configuration
 pub mod env_vars {
+    pub const DOCUMENTDB_UDF_TRACE_CONTEXT_ENABLED: &str = "DOCUMENTDB_UDF_TRACE_CONTEXT_ENABLED";
     pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_METRICS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT";

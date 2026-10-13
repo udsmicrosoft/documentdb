@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/commands/find_and_modify.c
  *
@@ -28,6 +29,7 @@
 #include "query/query_operator.h"
 #include "sharding/sharding.h"
 #include "utils/feature_counter.h"
+#include "utils/udf_trace_context.h"
 #include "utils/version_utils.h"
 #include "schema_validation/schema_validation.h"
 #include "operators/bson_expression.h"
@@ -154,7 +156,9 @@ command_find_and_modify(PG_FUNCTION_ARGS)
 	}
 
 	Datum databaseNameDatum = PG_ARGISNULL(0) ? (Datum) 0 : PG_GETARG_DATUM(0);
-	pgbson *message = PgbsonDeduplicateFields(PG_GETARG_PGBSON(1));
+	pgbson *command = PG_GETARG_PGBSON(1);
+	ProcessUdfTraceContextAtEntry(command, "findAndModify");
+	pgbson *message = PgbsonDeduplicateFields(command);
 
 	text *transactionId = !PG_ARGISNULL(2) ? PG_GETARG_TEXT_P(2) : NULL;
 

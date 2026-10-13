@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/commands/aggregation_cursors.c
  *
@@ -25,12 +26,14 @@
 #include <utils/documentdb_errors.h>
 #include <utils/feature_counter.h>
 #include "utils/version_utils.h"
+#include "utils/udf_trace_context.h"
 #include <io/bson_core.h>
 #include <commands/cursor_private.h>
 #include "commands/parse_error.h"
 #include <aggregation/bson_aggregation_pipeline.h>
 #include "aggregation/aggregation_commands.h"
 #include "infrastructure/cursor_store.h"
+#include "infrastructure/backend_telemetry.h"
 #include <utils/query_utils.h>
 #include "metadata/collection.h"
 #include "api_hooks.h"
@@ -254,8 +257,12 @@ static Datum HandleRemoteUnshardedFirstPage(text *database, pgbson *querySpec,
 											MongoCollection *collection);
 static Datum HandleLocalFirstPageRequest(text *database, pgbson *querySpec,
 										 int64_t cursorId, QueryData *queryData,
-										 QueryKind queryKind, Query *query);
+										 QueryKind queryKind, Query *query,
+										 BackendFindSpan *telemetrySpan);
 static bool CanDispatchRemoteUnshardedFirstPage(MongoCollection *collection);
+static Datum FindCursorFirstPageWithTrace(text *database, pgbson *findSpec,
+										  int64_t cursorId, const
+										  UdfTraceIdentifiers *parent);
 
 static int64_t GenerateCursorId(int64_t inputValue);
 
@@ -329,6 +336,8 @@ command_aggregate_cursor_first_page(PG_FUNCTION_ARGS)
 	pgbson *aggregationSpec = PG_GETARG_PGBSON(1);
 	int64_t cursorId = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT64(2);
 
+	ProcessUdfTraceContextAtEntry(aggregationSpec, "aggregate");
+	aggregationSpec = RemoveUdfTraceContext(aggregationSpec);
 	Datum response = aggregate_cursor_first_page(database, aggregationSpec, cursorId);
 
 	PG_RETURN_DATUM(response);
@@ -394,7 +403,7 @@ aggregate_cursor_first_page(text *database, pgbson *aggregationSpec,
 	Query *query = ApplyParsedAggregationQuery(plan);
 
 	return HandleLocalFirstPageRequest(database, aggregationSpec, cursorId,
-									   &queryData, QueryKind_Aggregate, query);
+									   &queryData, QueryKind_Aggregate, query, NULL);
 }
 
 
@@ -409,13 +418,25 @@ command_find_cursor_first_page(PG_FUNCTION_ARGS)
 	pgbson *findSpec = PG_GETARG_PGBSON(1);
 	int64_t cursorId = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT64(2);
 
-	Datum response = find_cursor_first_page(database, findSpec, cursorId);
+	UdfTraceIdentifiers identifiers;
+	bool hasParent = ProcessUdfTraceContextForSpan(findSpec, "find", &identifiers);
+	findSpec = RemoveUdfTraceContext(findSpec);
+	Datum response = FindCursorFirstPageWithTrace(database, findSpec, cursorId,
+												  hasParent ? &identifiers : NULL);
 	PG_RETURN_DATUM(response);
 }
 
 
 Datum
 find_cursor_first_page(text *database, pgbson *findSpec, int64_t cursorId)
+{
+	return FindCursorFirstPageWithTrace(database, findSpec, cursorId, NULL);
+}
+
+
+static Datum
+FindCursorFirstPageWithTrace(text *database, pgbson *findSpec, int64_t cursorId,
+							 const UdfTraceIdentifiers *parent)
 {
 	ReportFeatureUsage(FEATURE_COMMAND_FIND_CURSOR_FIRST_PAGE);
 
@@ -450,8 +471,34 @@ find_cursor_first_page(text *database, pgbson *findSpec, int64_t cursorId)
 
 	Query *query = ApplyParsedFindQuery(plan, cursorParams);
 
-	return HandleLocalFirstPageRequest(database, findSpec, cursorId, &queryData,
-									   QueryKind_Find, query);
+	bool supported = collection != NULL && collection->viewDefinition == NULL &&
+					 queryData.cursorTopology == CursorTopology_LocalUnsharded &&
+					 (queryData.cursorKind == QueryCursorType_SingleBatch ||
+					  queryData.cursorKind == QueryCursorType_PointRead);
+	BackendFindSpan *span = supported ?
+							BeginBackendFindSpan(parent, collection->relationId) : NULL;
+	if (span == NULL)
+	{
+		return HandleLocalFirstPageRequest(database, findSpec, cursorId, &queryData,
+										   QueryKind_Find, query, NULL);
+	}
+
+	Datum response = (Datum) 0;
+	PG_TRY();
+	{
+		response = HandleLocalFirstPageRequest(database, findSpec, cursorId, &queryData,
+											   QueryKind_Find, query, span);
+	}
+	PG_CATCH();
+	{
+		EndBackendFindSpan(span, geterrcode());
+		pfree(span);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	EndBackendFindSpan(span, ERRCODE_SUCCESSFUL_COMPLETION);
+	pfree(span);
+	return response;
 }
 
 
@@ -487,7 +534,7 @@ list_collections_first_page(text *database, pgbson *listCollectionsSpec)
 	int64_t cursorId = 0;
 	Datum response = HandleLocalFirstPageRequest(
 		database, listCollectionsSpec, cursorId, &queryData,
-		QueryKind_ListCollections, query);
+		QueryKind_ListCollections, query, NULL);
 	return response;
 }
 
@@ -524,7 +571,7 @@ list_indexes_first_page(text *database, pgbson *listIndexesSpec)
 	int64_t cursorId = 0;
 	Datum response = HandleLocalFirstPageRequest(
 		database, listIndexesSpec, cursorId, &queryData,
-		QueryKind_ListIndexes, query);
+		QueryKind_ListIndexes, query, NULL);
 	return response;
 }
 
@@ -577,6 +624,8 @@ command_cursor_get_more(PG_FUNCTION_ARGS)
 	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *getMoreSpec = PG_GETARG_PGBSON(1);
 	pgbson *cursorSpec = PG_GETARG_PGBSON(2);
+
+	ProcessUdfTraceContextAtEntry(getMoreSpec, "getMore");
 
 	/* See sql/udfs/commands_crud/query_cursors_aggregate--latest.sql */
 	AttrNumber maxOutAttrNum = 2;
@@ -1002,6 +1051,8 @@ command_distinct_query(PG_FUNCTION_ARGS)
 	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *distinctSpec = PG_GETARG_PGBSON(1);
 
+	ProcessUdfTraceContextAtEntry(distinctSpec, "distinct");
+
 	bool setStatementTimeout = true;
 	Query *query = GenerateDistinctQuery(database, distinctSpec, setStatementTimeout);
 
@@ -1031,6 +1082,7 @@ command_count_query(PG_FUNCTION_ARGS)
 
 	text *database = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_P(0);
 	pgbson *countSpec = PG_GETARG_PGBSON(1);
+	ProcessUdfTraceContextAtEntry(countSpec, "count");
 
 	bool setStatementTimeout = true;
 	Query *query = GenerateCountQuery(database, countSpec, setStatementTimeout);
@@ -1421,7 +1473,8 @@ HandleRemoteUnshardedFirstPage(text *database, pgbson *querySpec, int64_t cursor
 static LocalFirstPageResult
 HandleLocalFirstPageRequestCore(text *database, pgbson *querySpec, int64_t cursorId,
 								QueryData *queryData, QueryKind queryKind, Query *query,
-								bool useFileBasedPersistentCursors)
+								bool useFileBasedPersistentCursors,
+								BackendFindSpan *telemetrySpan)
 {
 	pgbson_writer writer;
 	pgbson_writer cursorDoc;
@@ -1450,7 +1503,7 @@ HandleLocalFirstPageRequestCore(text *database, pgbson *querySpec, int64_t curso
 			CreateAndDrainSingleBatchQuery("singleBatchCursor", query,
 										   queryData->batchSize,
 										   &numIterations,
-										   accumulatedSize, &arrayWriter);
+										   accumulatedSize, &arrayWriter, telemetrySpan);
 			queryFullyDrained = true;
 			continuationDoc = NULL;
 			cursorId = 0;
@@ -1537,7 +1590,7 @@ HandleLocalFirstPageRequestCore(text *database, pgbson *querySpec, int64_t curso
 
 			CreateAndDrainPointReadQuery("pointReadCursor", query,
 										 &numIterations,
-										 accumulatedSize, &arrayWriter);
+										 accumulatedSize, &arrayWriter, telemetrySpan);
 			queryFullyDrained = true;
 			continuationDoc = NULL;
 			break;
@@ -1630,7 +1683,8 @@ HandleLocalFirstPageRequestCore(text *database, pgbson *querySpec, int64_t curso
 
 static Datum
 HandleLocalFirstPageRequest(text *database, pgbson *querySpec, int64_t cursorId,
-							QueryData *queryData, QueryKind queryKind, Query *query)
+							QueryData *queryData, QueryKind queryKind, Query *query,
+							BackendFindSpan *telemetrySpan)
 {
 	/* See sql/udfs/commands_crud/query_cursors_aggregate--latest.sql */
 	AttrNumber maxOutAttrNum = 4;
@@ -1639,7 +1693,7 @@ HandleLocalFirstPageRequest(text *database, pgbson *querySpec, int64_t cursorId,
 	LocalFirstPageResult firstPageResult =
 		HandleLocalFirstPageRequestCore(database, querySpec, cursorId, queryData,
 										queryKind, query,
-										UseFileBasedPersistedCursors);
+										UseFileBasedPersistedCursors, telemetrySpan);
 	return FormFinalCursorResultTuple(firstPageResult.resultDocument,
 									  firstPageResult.continuationDoc,
 									  firstPageResult.persistConnection,
@@ -2742,7 +2796,7 @@ command_cursor_dynamic_drain_page(PG_FUNCTION_ARGS)
 		LocalFirstPageResult firstPageResult =
 			HandleLocalFirstPageRequestCore(database, querySpec, cursorId,
 											&queryData, queryKind, dynQuery,
-											useFileBasedPersistentCursors);
+											useFileBasedPersistentCursors, NULL);
 		pageBson = firstPageResult.resultDocument;
 		continuationOut = firstPageResult.continuationDoc;
 		if (continuationOut != NULL)

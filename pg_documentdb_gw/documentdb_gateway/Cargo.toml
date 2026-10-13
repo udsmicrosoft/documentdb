@@ -18,9 +18,13 @@ assets = [
 ]
 
 [features]
-default = ["request-tracing"]
+default = ["request-tracing", "postgres-udf-trace-context"]
 mimalloc = ["dep:mimalloc"]
 request-tracing = ["documentdb_gateway_core/request-tracing"]
+postgres-udf-trace-context = [
+ "request-tracing",
+ "documentdb_gateway_otel/postgres-udf-trace-context",
+]
 
 [dependencies]
 documentdb_gateway_core.workspace = true

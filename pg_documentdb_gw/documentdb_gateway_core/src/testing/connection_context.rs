@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * documentdb_gateway_core/src/testing/connection_context.rs
  *
@@ -36,11 +37,10 @@ pub async fn test_connection_context(
     dynamic_configuration: Arc<dyn DynamicConfiguration>,
     telemetry_provider: Option<Box<dyn TelemetryProvider>>,
 ) -> ConnectionContext {
-    test_connection_context_with_authentication_manager(
-        metrics_enabled,
+    test_connection_context_with_telemetry_settings(
+        TelemetrySettings::new(metrics_enabled),
         dynamic_configuration,
         telemetry_provider,
-        AuthenticationManager::new(),
     )
     .await
 }
@@ -51,7 +51,41 @@ pub async fn test_connection_context_with_authentication_manager(
     telemetry_provider: Option<Box<dyn TelemetryProvider>>,
     authentication_manager: AuthenticationManager,
 ) -> ConnectionContext {
-    let setup_configuration = test_setup_configuration(metrics_enabled);
+    build_test_connection_context(
+        TelemetrySettings::new(metrics_enabled),
+        dynamic_configuration,
+        telemetry_provider,
+        authentication_manager,
+    )
+    .await
+}
+
+/// Builds a test connection context with the supplied telemetry settings.
+///
+/// # Panics
+///
+/// Panics if the test connection pools or TLS provider cannot be initialized.
+pub async fn test_connection_context_with_telemetry_settings(
+    telemetry_settings: TelemetrySettings,
+    dynamic_configuration: Arc<dyn DynamicConfiguration>,
+    telemetry_provider: Option<Box<dyn TelemetryProvider>>,
+) -> ConnectionContext {
+    build_test_connection_context(
+        telemetry_settings,
+        dynamic_configuration,
+        telemetry_provider,
+        AuthenticationManager::new(),
+    )
+    .await
+}
+
+async fn build_test_connection_context(
+    telemetry_settings: TelemetrySettings,
+    dynamic_configuration: Arc<dyn DynamicConfiguration>,
+    telemetry_provider: Option<Box<dyn TelemetryProvider>>,
+    authentication_manager: AuthenticationManager,
+) -> ConnectionContext {
+    let setup_configuration = test_setup_configuration(telemetry_settings);
     let query_catalog = create_query_catalog();
     let application_name = setup_configuration.application_name().to_owned();
     let postgres_system_user = setup_configuration.postgres_system_user.clone();
@@ -147,7 +181,7 @@ async fn test_tls_provider() -> TlsProvider {
         .clone()
 }
 
-fn test_setup_configuration(metrics_enabled: bool) -> DocumentDBSetupConfiguration {
+fn test_setup_configuration(telemetry_settings: TelemetrySettings) -> DocumentDBSetupConfiguration {
     let system_user = std::env::var("PostgresSystemUser")
         .unwrap_or_else(|_| whoami::username().unwrap_or_default());
 
@@ -162,7 +196,7 @@ fn test_setup_configuration(metrics_enabled: bool) -> DocumentDBSetupConfigurati
         },
         postgres_system_user: system_user.clone(),
         postgres_data_user: system_user,
-        telemetry_settings: TelemetrySettings::new(metrics_enabled),
+        telemetry_settings,
         ..Default::default()
     }
 }

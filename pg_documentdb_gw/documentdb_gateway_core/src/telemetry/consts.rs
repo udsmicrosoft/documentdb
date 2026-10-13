@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/telemetry/consts.rs
  *
@@ -18,6 +19,7 @@ pub mod labels {
     pub const AUTHENTICATION_OUTCOME: &str = "docdb.authentication.outcome";
     pub const TRANSACTION_END_OUTCOME: &str = "docdb.transaction.end.outcome";
     pub const CURSOR_END_REASON: &str = "docdb.cursor.end.reason";
+    pub const TRACE_CONTEXT_SKIP_REASON: &str = "docdb.trace_context.skip.reason";
 }
 
 // Metric names shared by instrumentation and exporter metadata
@@ -33,6 +35,7 @@ pub mod metric_names {
     pub const RESPONSE_SIZE_TOTAL: &str = "docdb.gateway.response.size.total";
     pub const GATEWAY_STARTS: &str = "gateway.starts";
     pub const GATEWAY_STARTUP_DELAY_MS: &str = "gateway_startup_delay_ms";
+    pub const UDF_TRACE_CONTEXT_SKIPPED: &str = "docdb.gateway.udf_trace_context.skipped";
 
     // Gateway resources
     /// Gauge of logical sessions currently tracked by the gateway.

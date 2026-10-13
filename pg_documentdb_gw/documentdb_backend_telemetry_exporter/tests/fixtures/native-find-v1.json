@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "producer_instance_id": "0123456789abcdef0123456789abcdef",
+  "epoch": "fedcba9876543210fedcba9876543210",
+  "sequence": 1,
+  "trace_id": "11112222333344445555666677778888",
+  "span_id": "1122334455667788",
+  "parent_span_id": "8877665544332211",
+  "trace_flags": 1,
+  "operation": "Find",
+  "origin": "actual_execution",
+  "start_time_unix_ns": 1790872000123456789,
+  "end_time_unix_ns": 1790872000125802467,
+  "duration_ns": 2345678,
+  "outcome": "ok",
+  "error_class": null,
+  "collection_id": null,
+  "query_shape_id": null,
+  "query_shape_version": null,
+  "plan": null,
+  "work": null
+}
